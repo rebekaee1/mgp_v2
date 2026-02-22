@@ -82,24 +82,41 @@ class TourVisorClient:
         t0 = time.perf_counter()
         
         # Создаём новый клиент для каждого запроса (избегаем Event loop is closed)
-        try:
-            async with httpx.AsyncClient(timeout=30.0) as client:
-                response = await client.get(url, params=params)
+        # Fix M6+F8: Таймаут для actdetail/actualize — 30с (если оператор не ответил за 30с,
+        # ждать дольше бессмысленно; при ReadTimeout сработает retry P14 + fallback F2)
+        _timeout = 30.0 if endpoint in ("actdetail.php", "actualize.php") else 30.0
+        # Fix P14: Ретрай при ReadTimeout для actdetail/actualize
+        _max_attempts = 2 if endpoint in ("actdetail.php", "actualize.php") else 1
+        for _attempt in range(_max_attempts):
+            try:
+                async with httpx.AsyncClient(timeout=_timeout) as client:
+                    response = await client.get(url, params=params)
+                    elapsed_ms = int((time.perf_counter() - t0) * 1000)
+                    logger.info("🌐 TOURVISOR << %s  HTTP %s  %dms  size=%d bytes",
+                                endpoint, response.status_code, elapsed_ms, len(response.content))
+                    response.raise_for_status()
+                    data = response.json()
+                break  # Успешно — выходим из цикла
+            except httpx.ReadTimeout:
                 elapsed_ms = int((time.perf_counter() - t0) * 1000)
-                logger.info("🌐 TOURVISOR << %s  HTTP %s  %dms  size=%d bytes",
-                            endpoint, response.status_code, elapsed_ms, len(response.content))
-                response.raise_for_status()
-                data = response.json()
-        except httpx.HTTPStatusError as e:
-            elapsed_ms = int((time.perf_counter() - t0) * 1000)
-            logger.error("🌐 TOURVISOR !! %s  HTTP %s  %dms  error=%s",
-                         endpoint, e.response.status_code, elapsed_ms, str(e)[:200])
-            raise
-        except httpx.RequestError as e:
-            elapsed_ms = int((time.perf_counter() - t0) * 1000)
-            logger.error("🌐 TOURVISOR !! %s  NETWORK ERROR  %dms  error=%s",
-                         endpoint, elapsed_ms, str(e)[:200])
-            raise
+                if _attempt < _max_attempts - 1:
+                    logger.warning("⏱️ TOURVISOR TIMEOUT %s  %dms — retrying (attempt %d/%d)",
+                                   endpoint, elapsed_ms, _attempt + 1, _max_attempts)
+                    t0 = time.perf_counter()
+                    continue
+                logger.error("🌐 TOURVISOR !! %s  TIMEOUT  %dms  (all %d attempts failed)",
+                             endpoint, elapsed_ms, _max_attempts)
+                raise
+            except httpx.HTTPStatusError as e:
+                elapsed_ms = int((time.perf_counter() - t0) * 1000)
+                logger.error("🌐 TOURVISOR !! %s  HTTP %s  %dms  error=%s",
+                             endpoint, e.response.status_code, elapsed_ms, str(e)[:200])
+                raise
+            except httpx.RequestError as e:
+                elapsed_ms = int((time.perf_counter() - t0) * 1000)
+                logger.error("🌐 TOURVISOR !! %s  NETWORK ERROR  %dms  error=%s",
+                             endpoint, elapsed_ms, str(e)[:200])
+                raise
         
         # Логируем ключевые поля ответа
         preview = json.dumps(data, ensure_ascii=False, default=str)
@@ -120,6 +137,12 @@ class TourVisorClient:
         - "Wrong (obsolete) TourID." — tourid истёк
         - "no search results" в status.state — requestid не найден
         """
+        # Fix D1: Логируем top-level iserror (actdetail.php возвращает ошибки на верхнем уровне)
+        # НЕ бросаем исключение — dispatch обрабатывает fallback через F2
+        if data.get("iserror"):
+            logger.warning("🌐 TOURVISOR API ERROR [%s] (top-level iserror): %s",
+                           endpoint, data.get("errormessage", "unknown"))
+        
         # Проверка на errormessage (например, для actualize.php)
         if "data" in data:
             inner = data["data"]
@@ -417,10 +440,16 @@ class TourVisorClient:
         self,
         request_id: str,
         max_wait: int = 30,
-        poll_interval: float = 2.0
+        poll_interval: float = 1.0,  # Оптимизация: 2.0 → 1.0 сек
+        early_return_hotels: int = 5,  # Ранний возврат: минимум отелей
+        early_return_progress: int = 50  # Ранний возврат: минимум прогресса %
     ) -> Dict:
         """
-        Дождаться завершения поиска и вернуть результаты
+        Дождаться завершения поиска и вернуть результаты.
+        
+        Оптимизация: ранний возврат результатов когда найдено достаточно отелей
+        и прогресс поиска >50%. Это ускоряет ответ на 10-15 секунд, т.к. не ждём
+        медленных тур-операторов. Остальные туры попадут в continue_search.
         
         Raises:
             NoResultsError: Поиск завершён, но туры не найдены
@@ -436,18 +465,26 @@ class TourVisorClient:
                 raise  # requestid недействителен
             
             state = last_status.get("state")
+            hotels_found = last_status.get("hotelsfound", 0)
+            tours_found = last_status.get("toursfound", 0)
+            progress = last_status.get("progress", 0)
             
+            # Поиск завершён полностью
             if state == "finished":
-                # Проверяем есть ли результаты
-                hotels_found = last_status.get("hotelsfound", 0)
-                tours_found = last_status.get("toursfound", 0)
-                
                 if hotels_found == 0 or tours_found == 0:
                     raise NoResultsError(
                         f"Поиск завершён: найдено {hotels_found} отелей, {tours_found} туров",
                         filters_hint="Попробуйте расширить даты, увеличить бюджет или убрать фильтры"
                     )
-                
+                return await self.get_search_results(request_id)
+            
+            # Оптимизация: ранний возврат — достаточно отелей и прогресс >50%
+            if hotels_found >= early_return_hotels and progress >= early_return_progress:
+                elapsed = (datetime.now() - start).total_seconds()
+                logger.info(
+                    "⚡ EARLY RETURN  requestid=%s  hotels=%d  progress=%d%%  elapsed=%.1fs",
+                    request_id, hotels_found, progress, elapsed
+                )
                 return await self.get_search_results(request_id)
             
             await asyncio.sleep(poll_interval)

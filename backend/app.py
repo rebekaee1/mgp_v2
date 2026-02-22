@@ -11,12 +11,27 @@ import logging
 from flask import Flask, render_template, request, Response, jsonify, stream_with_context, g, send_from_directory
 from flask_cors import CORS
 from werkzeug.exceptions import HTTPException
-try:
-    # если запускают из папки backend (python app.py)
-    from yandex_handler import YandexGPTHandler
-except ImportError:
-    # если запускают из корня (python -m backend.app)
-    from backend.yandex_handler import YandexGPTHandler
+def _import_handler_class():
+    """Import handler class based on LLM_PROVIDER env variable."""
+    from dotenv import load_dotenv as _ld
+    _ld()
+    provider = os.getenv("LLM_PROVIDER", "yandex").lower().strip()
+    if provider == "openai":
+        try:
+            from openai_handler import OpenAIHandler
+            return OpenAIHandler, "openai"
+        except ImportError:
+            from backend.openai_handler import OpenAIHandler
+            return OpenAIHandler, "openai"
+    else:
+        try:
+            from yandex_handler import YandexGPTHandler
+            return YandexGPTHandler, "yandex"
+        except ImportError:
+            from backend.yandex_handler import YandexGPTHandler
+            return YandexGPTHandler, "yandex"
+
+_HandlerClass, _llm_provider = _import_handler_class()
 import json
 import queue
 import threading
@@ -145,22 +160,22 @@ def log(msg: str, level: str = "INFO"):
 # === УПРАВЛЕНИЕ СЕССИЯМИ ===
 # Thread-safe хранилище сессий с автоочисткой
 _handlers_lock = threading.Lock()
-_handlers: dict[str, dict] = {}  # session_id → {"handler": YandexGPTHandler, "last_active": float}
+_handlers: dict[str, dict] = {}  # session_id → {"handler": Handler, "last_active": float}
 SESSION_TTL_SECONDS = 30 * 60  # 30 минут неактивности → удаление
 
 
-def get_handler(session_id: str) -> YandexGPTHandler:
+def get_handler(session_id: str):
     """Получить или создать handler для сессии (thread-safe)"""
     with _handlers_lock:
         if session_id in _handlers:
             _handlers[session_id]["last_active"] = time.time()
             return _handlers[session_id]["handler"]
-        handler = YandexGPTHandler()
+        handler = _HandlerClass()
         # Подключаем диалоговый лог
         handler._dialogue_log_callback = lambda direction, content: _write_dialogue_log(session_id, direction, content)
         _handlers[session_id] = {"handler": handler, "last_active": time.time()}
-        logger.info("🆕 New session %s  (total sessions: %d)", session_id[:8], len(_handlers))
-        _write_dialogue_log(session_id, "SYSTEM", f"New session created (model: {handler.model})")
+        logger.info("🆕 New session %s  (provider: %s, total sessions: %d)", session_id[:8], _llm_provider, len(_handlers))
+        _write_dialogue_log(session_id, "SYSTEM", f"New session created (provider: {_llm_provider}, model: {handler.model})")
         return handler
 
 
