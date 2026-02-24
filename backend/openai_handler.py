@@ -98,6 +98,11 @@ class OpenAIHandler(YandexGPTHandler):
         self.openai_client = OpenAI(timeout=120.0, **client_kwargs)
         self.model = os.getenv("OPENAI_MODEL", "gpt-5-mini")
 
+        # Pinned context survives history trimming (tour cards summary)
+        self._pinned_context: Optional[str] = None
+        # Pinned search intent survives trimming (e.g. "без перелёта")
+        self._pinned_search_intent: Optional[str] = None
+
         # Build OpenAI-formatted tools from function_schemas.json
         self.openai_tools = self._build_openai_tools()
 
@@ -155,6 +160,20 @@ class OpenAIHandler(YandexGPTHandler):
         if self.instructions:
             messages.append({"role": "system", "content": self.instructions})
 
+        # Pinned context (tour cards summary — survives trimming)
+        if self._pinned_context:
+            messages.append({
+                "role": "system",
+                "content": self._pinned_context
+            })
+
+        # Pinned search intent (e.g. "без перелёта" — survives trimming)
+        if self._pinned_search_intent:
+            messages.append({
+                "role": "system",
+                "content": self._pinned_search_intent
+            })
+
         # Full history
         for item in self.full_history:
             role = item.get("role")
@@ -180,40 +199,43 @@ class OpenAIHandler(YandexGPTHandler):
 
     # ─── History Trimming (tool_call-aware) ───────────────────────────────
 
+    @staticmethod
+    def _group_into_blocks(messages):
+        """Group messages into atomic blocks: tool_call assistant + its tool results stay together."""
+        blocks = []
+        i = 0
+        while i < len(messages):
+            msg = messages[i]
+            if msg.get("role") == "assistant" and msg.get("tool_calls"):
+                block = [msg]
+                j = i + 1
+                while j < len(messages) and messages[j].get("role") == "tool":
+                    block.append(messages[j])
+                    j += 1
+                blocks.append(block)
+                i = j
+            else:
+                blocks.append([msg])
+                i += 1
+        return blocks
+
     def _trim_history(self):
         """
-        Override: trim history while preserving tool_call/tool_result pairs.
-
-        OpenAI API requires that every assistant message with tool_calls
-        is immediately followed by tool results for ALL those calls.
-        Splitting them causes HTTP 400 errors.
+        Trim history while preserving tool_call/tool_result pairs as atomic blocks.
+        Removes oldest non-system blocks until under the limit.
         """
         if len(self.full_history) <= self._max_history_len:
             return
 
         old_len = len(self.full_history)
-        keep_start = 2
-        keep_end = self._max_history_len - keep_start
-        tail = self.full_history[-keep_end:]
+        blocks = self._group_into_blocks(self.full_history)
 
-        # Remove orphaned tool messages at the start of tail
-        while tail and tail[0].get("role") == "tool":
-            tail.pop(0)
+        total = sum(len(b) for b in blocks)
+        while total > self._max_history_len and len(blocks) > 3:
+            removed = blocks.pop(1)
+            total -= len(removed)
 
-        # If tail starts with assistant + tool_calls without complete results, remove it
-        if (tail
-                and tail[0].get("role") == "assistant"
-                and tail[0].get("tool_calls")):
-            tc_ids = {tc["id"] for tc in tail[0].get("tool_calls", [])}
-            found_ids = set()
-            j = 1
-            while j < len(tail) and tail[j].get("role") == "tool":
-                found_ids.add(tail[j].get("tool_call_id"))
-                j += 1
-            if tc_ids != found_ids:
-                tail = tail[j:]
-
-        self.full_history = self.full_history[:keep_start] + tail
+        self.full_history = [msg for block in blocks for msg in block]
         logger.info(
             "✂️ TRIM full_history: %d → %d messages",
             old_len, len(self.full_history)
@@ -232,6 +254,7 @@ class OpenAIHandler(YandexGPTHandler):
             tools=self.openai_tools,
             temperature=0.2,
             max_tokens=4096,
+            extra_body={"reasoning_effort": "low"},
         )
 
     # ─── Main Chat Loop ──────────────────────────────────────────────────
@@ -253,6 +276,11 @@ class OpenAIHandler(YandexGPTHandler):
         # Add user message to history
         self.full_history.append({"role": "user", "content": user_message})
         self._trim_history()
+
+        # Detect and pin "без перелёта" intent so it survives trimming
+        if re.search(r'без\s*перел[её]т', user_message, re.IGNORECASE):
+            self._pinned_search_intent = "[ПАРАМЕТР КЛИЕНТА: тур БЕЗ ПЕРЕЛЁТА (departure=99). НЕ спрашивай город вылета.]"
+            logger.info("📌 Pinned search intent: без перелёта")
 
         logger.info(
             "👤 USER >> \"%s\"  full_history=%d  model=%s",
@@ -327,12 +355,12 @@ class OpenAIHandler(YandexGPTHandler):
                         len(self.full_history)
                     )
                     if len(self.full_history) > 8:
-                        head = self.full_history[:2]
-                        tail = self.full_history[-4:]
-                        # Remove orphaned tool messages at start of tail
-                        while tail and tail[0].get("role") == "tool":
-                            tail.pop(0)
-                        self.full_history = head + tail
+                        blocks = self._group_into_blocks(self.full_history)
+                        head_blocks = blocks[:1]
+                        tail_blocks = blocks[-3:] if len(blocks) > 3 else blocks[1:]
+                        self.full_history = [
+                            m for b in (head_blocks + tail_blocks) for m in b
+                        ]
                         logger.info(
                             "✅ History trimmed to %d messages",
                             len(self.full_history)
@@ -375,6 +403,21 @@ class OpenAIHandler(YandexGPTHandler):
                         logger.warning(
                             "⚠️ 403 GEO-BLOCK RETRY %d/2 — повтор через 3с",
                             geo_retries
+                        )
+                        await asyncio.sleep(3)
+                        continue
+
+                # Connection reset (OpenRouter drops long requests)
+                if any(kw in error_str for kw in (
+                    "ConnectionReset", "RemoteDisconnected",
+                    "Connection reset", "connection reset",
+                    "ConnectionError", "RemoteProtocolError",
+                )):
+                    timeout_retries += 1
+                    if timeout_retries < 2:
+                        logger.warning(
+                            "🔌 CONNECTION RESET RETRY %d/2 — повтор через 3с",
+                            timeout_retries
                         )
                         await asyncio.sleep(3)
                         continue
@@ -462,6 +505,18 @@ class OpenAIHandler(YandexGPTHandler):
                     "🔄 TOOL CALLS DONE  count=%d  continuing…",
                     len(message.tool_calls)
                 )
+
+                # Update pinned context when tour cards are available
+                if self._tourid_map:
+                    lines = ["[КОНТЕКСТ: текущие показанные туры]"]
+                    for pos, entry in sorted(self._tourid_map.items()):
+                        lines.append(
+                            f"{pos}. {entry.get('hotelname', '?')} "
+                            f"(tourid={entry['tourid']}, "
+                            f"hotelcode={entry.get('hotelcode', '?')})"
+                        )
+                    self._pinned_context = "\n".join(lines)
+
                 continue
 
             # ── Handle text response ──
@@ -644,38 +699,36 @@ class OpenAIHandler(YandexGPTHandler):
     def _cleanup_history(self):
         """
         Remove invalid message sequences from full_history.
-        Fixes orphaned tool messages and incomplete tool_call groups.
+        Uses block grouping to keep tool_call/tool_result pairs atomic.
         """
-        cleaned = []
-        i = 0
-        while i < len(self.full_history):
-            msg = self.full_history[i]
-
+        blocks = self._group_into_blocks(self.full_history)
+        cleaned_blocks = []
+        for block in blocks:
+            msg = block[0]
             if msg.get("role") == "tool":
-                # Only keep if previous is assistant with matching tool_calls
-                if (cleaned
-                        and cleaned[-1].get("role") == "assistant"
-                        and cleaned[-1].get("tool_calls")):
-                    tc_ids = {
-                        tc["id"]
-                        for tc in cleaned[-1]["tool_calls"]
-                    }
-                    if msg.get("tool_call_id") in tc_ids:
-                        cleaned.append(msg)
-                        i += 1
-                        continue
-                # Orphaned tool message — skip
                 logger.debug(
                     "🧹 CLEANUP: skipping orphaned tool message "
                     "tool_call_id=%s",
                     msg.get("tool_call_id", "?")
                 )
-                i += 1
                 continue
+            if msg.get("role") == "assistant" and msg.get("tool_calls"):
+                tc_ids = {tc["id"] for tc in msg["tool_calls"]}
+                found_ids = {
+                    m.get("tool_call_id")
+                    for m in block[1:]
+                    if m.get("role") == "tool"
+                }
+                if tc_ids != found_ids:
+                    logger.debug(
+                        "🧹 CLEANUP: removing incomplete tool_call block "
+                        "expected=%s found=%s",
+                        tc_ids, found_ids
+                    )
+                    continue
+            cleaned_blocks.append(block)
 
-            cleaned.append(msg)
-            i += 1
-
+        cleaned = [msg for block in cleaned_blocks for msg in block]
         if len(cleaned) != len(self.full_history):
             logger.info(
                 "🧹 CLEANUP: %d → %d messages (removed %d invalid)",
@@ -719,6 +772,8 @@ class OpenAIHandler(YandexGPTHandler):
         self.full_history = []
         self.input_list = []
         self._pending_tour_cards = []
+        self._pinned_context = None
+        self._pinned_search_intent = None
         self._last_departure_city = "Москва"
         self._last_requestid = None
         self._tourid_map = {}

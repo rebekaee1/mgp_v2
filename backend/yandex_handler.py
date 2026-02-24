@@ -81,6 +81,55 @@ def _fuzzy_hotel_match(queries, hotels: list, threshold: float = 0.65) -> list:
     return [h for _, h in scored]
 
 
+def _match_hotels_by_name(name_filter: str, hotels: list) -> list:
+    """Normalize-to-Latin hotel name matching.
+
+    Both user input and hotel names are transliterated to Latin so that
+    cross-script searches (Latin query vs Cyrillic hotel name and vice versa)
+    work reliably.  Flow: exact substring → fuzzy.
+    """
+    has_cyr = any('\u0400' <= c <= '\u04ff' for c in name_filter)
+    if has_cyr:
+        latin_variants = list(dict.fromkeys([
+            _transliterate(name_filter),
+            _transliterate(name_filter, _CYR_TO_LAT_ALT),
+        ]))
+    else:
+        latin_variants = [name_filter]
+
+    # Step 1: exact substring against original name + transliterated name
+    matched = []
+    for h in hotels:
+        h_name = h.get("name", "").lower()
+        h_name_lat = _transliterate(h_name)
+        if name_filter in h_name:
+            matched.append(h)
+        elif any(v in h_name_lat for v in latin_variants):
+            matched.append(h)
+
+    if matched:
+        return matched
+
+    # Step 2: fuzzy against transliterated hotel names
+    if len(name_filter) < 3:
+        return []
+
+    transliterated = []
+    orig_map = {}
+    for h in hotels:
+        h_lat_name = _transliterate(h.get("name", "")).lower()
+        entry = {**h, "name": h_lat_name}
+        transliterated.append(entry)
+        orig_map[id(entry)] = h
+
+    fuzzy_hits = _fuzzy_hotel_match(latin_variants, transliterated, threshold=0.60)
+    matched = [orig_map[id(fh)] for fh in fuzzy_hits if id(fh) in orig_map]
+    if matched:
+        logger.info("HOTEL-SEARCH normalize-to-latin fuzzy %s, found=%d", latin_variants, len(matched))
+
+    return matched
+
+
 def _is_self_moderation(text: str) -> bool:
     """
     Детектирует ответы самомодерации Yandex GPT.
@@ -1153,9 +1202,9 @@ class YandexGPTHandler:
         
         # Максимальный размер full_history (в сообщениях).
         # При превышении — обрезаем старые сообщения, оставляя последние.
-        # 30 сообщений: с учётом tool_call/tool_result в OpenAI handler
-        # один поиск = ~8 сообщений, полный цикл (каскад+поиск+консультация) = ~30.
-        self._max_history_len = 30
+        # 50 сообщений: с учётом tool_call/tool_result в OpenAI handler
+        # один поиск = ~8 сообщений, полный цикл (каскад+поиск+консультация+повторный поиск) = ~40-45.
+        self._max_history_len = 50
         
         # Счётчик пустых итераций подряд (для детекции зависаний)
         self._empty_iterations = 0
@@ -2493,31 +2542,31 @@ class YandexGPTHandler:
                     if args.get(f"hot{ht}") == 1:
                         hotel_types.append(ht)
                 
+                _hot_country = args.get("hotcountry")
+                _hot_region = args.get("hotregion")
                 hotels = await self.tourvisor.get_hotels(
-                    country_id=args.get("hotcountry"),
-                    region_id=args.get("hotregion"),
+                    country_id=_hot_country,
+                    region_id=_hot_region,
                     stars=args.get("hotstars"),
                     rating=args.get("hotrating"),
                     hotel_types=hotel_types if hotel_types else None
                 )
-                # ── Фильтруем по названию: exact substring → multi-variant fuzzy ──
                 name_filter = re.sub(r'[^\w\s]', '', args.get("name", ""), flags=re.UNICODE).lower().strip()
                 name_filter = re.sub(r'\s+', ' ', name_filter).strip()
 
                 if name_filter:
-                    matched = [h for h in hotels if name_filter in h.get("name", "").lower()]
+                    matched = _match_hotels_by_name(name_filter, hotels)
 
-                    if not matched and len(name_filter) >= 3:
-                        has_cyrillic = any('\u0400' <= c <= '\u04ff' for c in name_filter)
-                        if has_cyrillic:
-                            variants = list(dict.fromkeys([
-                                _transliterate(name_filter),
-                                _transliterate(name_filter, _CYR_TO_LAT_ALT),
-                            ]))
-                        else:
-                            variants = [name_filter]
-                        matched = _fuzzy_hotel_match(variants, hotels)
-                        logger.info("HOTEL-SEARCH fuzzy %s, found=%d", variants, len(matched))
+                    # Fallback: retry without region if nothing found
+                    if not matched and _hot_region:
+                        logger.info("HOTEL-SEARCH fallback: retrying without hotregion=%s", _hot_region)
+                        hotels_wide = await self.tourvisor.get_hotels(
+                            country_id=_hot_country,
+                            stars=args.get("hotstars"),
+                            rating=args.get("hotrating"),
+                            hotel_types=hotel_types if hotel_types else None
+                        )
+                        matched = _match_hotels_by_name(name_filter, hotels_wide)
 
                     hotels = matched
                 return hotels[:20]
