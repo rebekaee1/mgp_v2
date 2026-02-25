@@ -102,6 +102,8 @@ class OpenAIHandler(YandexGPTHandler):
         self._pinned_context: Optional[str] = None
         # Pinned search intent survives trimming (e.g. "без перелёта")
         self._pinned_search_intent: Optional[str] = None
+        # Collected cascade slots — injected as system message to prevent "forgetting"
+        self._collected_slots: Dict[str, str] = {}
 
         # Build OpenAI-formatted tools from function_schemas.json
         self.openai_tools = self._build_openai_tools()
@@ -174,6 +176,18 @@ class OpenAIHandler(YandexGPTHandler):
                 "content": self._pinned_search_intent
             })
 
+        # Collected cascade slots reminder (prevents model from re-asking known params)
+        if self._collected_slots:
+            slot_lines = [f"- {k}: {v}" for k, v in self._collected_slots.items()]
+            messages.append({
+                "role": "system",
+                "content": (
+                    "[СОБРАННЫЕ ПАРАМЕТРЫ КЛИЕНТА — НЕ переспрашивай]\n"
+                    + "\n".join(slot_lines)
+                    + "\nЕсли клиент НЕ меняет параметр — используй сохранённое значение."
+                )
+            })
+
         # Full history
         for item in self.full_history:
             role = item.get("role")
@@ -196,6 +210,62 @@ class OpenAIHandler(YandexGPTHandler):
                 })
 
         return messages
+
+    # ─── Slot Tracker ──────────────────────────────────────────────────────
+
+    _SLOT_PATTERNS = {
+        "Направление": [
+            (r'\b(?:турци[яюи]|египе?т|оаэ|эмират|таиланд|мальдив|греци|кипр|'
+             r'вьетнам|шри.?ланк|куб[аеу]|доминикан|индонези|бали|тунис|'
+             r'черногори|болгари|хорвати|абхази|росси|сочи|крым|анап|'
+             r'геленджик|калининград|кмв|марокк|израил|иордани|'
+             r'индия|китай|япони|южная корея|мексик|бразили)\w*', None),
+        ],
+        "Город вылета": [
+            (r'\b(?:москв|питер|спб|санкт.?петербург|екатеринбург|екб|казан[ьи]|'
+             r'новосибирск|нск|краснодар|красноярск|ростов|уф[аеы]|пермь?|'
+             r'челябинск|самар[аеу]|нижн\w+ новгород|сочи)\w*', None),
+            (r'без\s*перел[её]т', "без перелёта"),
+        ],
+        "Даты": [
+            (r'(\d{1,2}[./]\d{1,2}(?:[./]\d{2,4})?)', None),
+            (r'(\d{1,2})\s+(?:января|февраля|марта|апреля|мая|июня|июля|августа|'
+             r'сентября|октября|ноября|декабря)', None),
+        ],
+        "Длительность": [
+            (r'(\d+)\s*(?:ноч|ночей)', None),
+            (r'(\d+)\s*(?:дн|дней|день)', None),
+            (r'(?:на\s+)?(?:неделю|недельку)', "7 ночей"),
+            (r'(?:две\s+недели|2\s+недели)', "14 ночей"),
+        ],
+        "Состав": [
+            (r'(?:(\d+)\s*(?:взрослы|взр))', None),
+            (r'(?:вдво[её]м|с (?:мужем|женой|парнем|девушкой))', "2 взрослых"),
+        ],
+        "Питание": [
+            (r'(?:вс[её]\s*включен|all\s*inclusive|олл\s*инклюзив)', "всё включено"),
+            (r'(?:завтрак)', "завтраки"),
+            (r'(?:полупансион)', "полупансион"),
+            (r'(?:полный\s*пансион)', "полный пансион"),
+        ],
+        "Звёздность": [
+            (r'(\d)\s*(?:звёзд|звезд|★|\*)', None),
+            (r'\b(люб\w+)\b.*(?:звёзд|звезд|★|\*|категори|вариант)', "любая"),
+        ],
+    }
+
+    def _update_collected_slots(self, user_message: str):
+        """Extract and pin cascade parameters from user messages."""
+        text = user_message.lower().strip()
+        for slot_name, patterns in self._SLOT_PATTERNS.items():
+            for pattern, fixed_value in patterns:
+                m = re.search(pattern, text, re.IGNORECASE)
+                if m:
+                    value = fixed_value or m.group(0)
+                    self._collected_slots[slot_name] = value
+                    break
+        if self._collected_slots:
+            logger.debug("📌 SLOTS: %s", self._collected_slots)
 
     # ─── History Trimming (tool_call-aware) ───────────────────────────────
 
@@ -276,6 +346,9 @@ class OpenAIHandler(YandexGPTHandler):
         # Add user message to history
         self.full_history.append({"role": "user", "content": user_message})
         self._trim_history()
+
+        # Track collected cascade slots from user message
+        self._update_collected_slots(user_message)
 
         # Detect and pin "без перелёта" intent so it survives trimming
         if re.search(r'без\s*перел[её]т', user_message, re.IGNORECASE):
@@ -774,6 +847,7 @@ class OpenAIHandler(YandexGPTHandler):
         self._pending_tour_cards = []
         self._pinned_context = None
         self._pinned_search_intent = None
+        self._collected_slots = {}
         self._last_departure_city = "Москва"
         self._last_requestid = None
         self._tourid_map = {}

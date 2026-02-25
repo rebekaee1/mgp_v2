@@ -488,21 +488,36 @@ def _check_cascade_slots(full_history: List[Dict], args: Dict, is_follow_up: boo
     missing = []
     
     # ── Early pass: если args уже содержат ВСЕ критичные параметры — доверяем модели.
-    # Только для follow-up поисков (когда _last_search_params уже заполнен),
-    # чтобы модель не могла обойти QC, выдумав stars/meal на первом поиске.
     _dep = args.get("departure")
     _df = args.get("datefrom", "")
     _nf = args.get("nightsfrom")
     _ad = args.get("adults")
     _st = args.get("stars")
     _ml = args.get("meal")
-    if (is_follow_up
-            and _dep and isinstance(_dep, int) and _dep > 0
-            and _df and re.match(r'\d{2}\.\d{2}\.\d{4}', str(_df))
-            and _nf and isinstance(_nf, int) and _nf >= 3
-            and _ad and isinstance(_ad, int) and _ad > 0
-            and ((_st and isinstance(_st, int) and _st > 0)
-                 or (_ml and isinstance(_ml, int) and _ml > 0))):
+
+    _args_have_all_slots = (
+        _dep and isinstance(_dep, int) and _dep > 0
+        and _df and re.match(r'\d{2}\.\d{2}\.\d{4}', str(_df))
+        and _nf and isinstance(_nf, int) and _nf >= 3
+        and _ad and isinstance(_ad, int) and _ad > 0
+        and ((_st and isinstance(_st, int) and _st > 0)
+             or (_ml and isinstance(_ml, int) and _ml > 0))
+    )
+
+    if _args_have_all_slots and is_follow_up:
+        return (True, [])
+
+    # Trust model args when cascade has had enough dialogue turns (>=10 user+assistant msgs).
+    # This prevents false blocks when user confirms parameters implicitly
+    # (e.g. "да давай это число" confirming an example date).
+    _user_msg_count = sum(1 for m in full_history if m.get("role") == "user"
+                         and not m.get("content", "").startswith("Результаты")
+                         and not m.get("content", "").startswith("СИСТЕМНАЯ ОШИБКА")
+                         and not m.get("content", "").startswith("Пожалуйста, продолжи")
+                         and not m.get("content", "").startswith("Продолжи обработку")
+                         and not m.get("content", "").startswith("Ответь клиенту"))
+    if _args_have_all_slots and _user_msg_count >= 5:
+        logger.info("✅ CASCADE-TRUST: args have all slots + %d user messages — trusting model", _user_msg_count)
         return (True, [])
     
     # Собираем ВСЕ сообщения пользователя из истории (не только [-20:]),
