@@ -242,6 +242,13 @@ class OpenAIHandler(YandexGPTHandler):
             (r'(?:(\d+)\s*(?:взрослы|взр))', None),
             (r'(?:вдво[её]м|с (?:мужем|женой|парнем|девушкой))', "2 взрослых"),
         ],
+        "Дети": [
+            (r'(\d+)\s*(?:ребён|ребен|дет)', None),
+            (r'(?:без\s*детей)', "без детей"),
+        ],
+        "Возраст ребёнка": [
+            (r'^(\d{1,2})$', None),
+        ],
         "Питание": [
             (r'(?:вс[её]\s*включен|all\s*inclusive|олл\s*инклюзив)', "всё включено"),
             (r'(?:завтрак)', "завтраки"),
@@ -264,6 +271,19 @@ class OpenAIHandler(YandexGPTHandler):
                     value = fixed_value or m.group(0)
                     self._collected_slots[slot_name] = value
                     break
+
+        # Context-aware: bare "любой/любая/без разницы" → check what model asked
+        if re.match(r'^(?:любой|любая|любые|без разницы|все равно|всё равно|неважно|не важно)$', text):
+            last_assistant = ""
+            for msg in reversed(self.full_history):
+                if msg.get("role") == "assistant" and msg.get("content"):
+                    last_assistant = msg["content"].lower()
+                    break
+            if any(w in last_assistant for w in ("звёзд", "звезд", "категори", "★")):
+                self._collected_slots["Звёздность"] = "любая"
+            elif any(w in last_assistant for w in ("питани", "meal")):
+                self._collected_slots["Питание"] = "любое"
+
         if self._collected_slots:
             logger.debug("📌 SLOTS: %s", self._collected_slots)
 

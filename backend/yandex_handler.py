@@ -1508,6 +1508,9 @@ class YandexGPTHandler:
             error_msg = f"Ошибка: {str(e)}"
             logger.warning("🔧 FUNC CALL << %s  BUSINESS_ERROR  %dms  %s", name, elapsed_ms, error_msg)
             self._dialogue_log("ERROR", f"{name} -> {error_msg}")
+            if isinstance(e, NoResultsError) and name == "get_search_status":
+                self._search_awaiting_results = False
+                logger.info("🔄 _search_awaiting_results=False (0 results — no point calling get_search_results)")
             return {
                 "type": "function_call_output",
                 "call_id": call_id,
