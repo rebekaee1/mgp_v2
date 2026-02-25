@@ -777,6 +777,7 @@ class OpenAIHandler(YandexGPTHandler):
         self._last_departure_city = "Москва"
         self._last_requestid = None
         self._tourid_map = {}
+        self._tour_details_cache = {}
         self._last_search_params = {}
         self._user_stated_budget = None
         self._empty_iterations = 0

@@ -431,11 +431,12 @@ body {
     overflow: visible;
 }
 
-/* Typing status text for long waits */
+/* Typing status text */
 .typing-status {
     display: none;
     font-size: 12px;
     line-height: 1.4;
+    animation: statusFadeIn 0.3s ease-out;
     color: var(--mgp-text-muted);
     font-style: italic;
     animation: fadeIn 0.4s ease;
@@ -474,6 +475,11 @@ body {
         transform: translateY(-8px);
         background: var(--mgp-red);
     }
+}
+
+@keyframes statusFadeIn {
+    from { opacity: 0; transform: translateY(4px); }
+    to   { opacity: 1; transform: translateY(0); }
 }
 
 /* ============================================

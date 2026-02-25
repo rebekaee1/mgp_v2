@@ -39,6 +39,31 @@ import threading
 app = Flask(__name__, template_folder='templates', static_folder='static')
 CORS(app)
 
+from werkzeug.middleware.proxy_fix import ProxyFix
+app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_prefix=1)
+
+# === ИНИЦИАЛИЗАЦИЯ ИНФРАСТРУКТУРЫ (PostgreSQL, Redis) ===
+_infra_lock = threading.Lock()
+_infra_done = False
+
+def _init_infrastructure():
+    """Инициализация БД и Redis при первом запросе (lazy init, thread-safe)."""
+    global _infra_done
+    if _infra_done:
+        return
+    with _infra_lock:
+        if _infra_done:
+            return
+        try:
+            from config import settings
+            from database import init_db
+            from cache import init_cache
+            init_db(settings.database_url)
+            init_cache(settings.redis_url)
+        except Exception as e:
+            logging.getLogger("mgp_bot").warning("Infrastructure init: %s", e)
+        _infra_done = True
+
 # === ЛОГИРОВАНИЕ ===
 from datetime import datetime as _dt
 
@@ -196,6 +221,165 @@ def _cleanup_stale_sessions():
             logger.info("🧹 Cleaned up %d stale sessions (remaining: %d)", len(stale), len(_handlers))
 
 
+# === DB LOGGING (полный путь диалога для аналитики и личного кабинета) ===
+
+def _log_chat_to_db(session_id: str, user_message: str, reply: str,
+                     tour_cards: list, latency_ms: int = None,
+                     model_name: str = "unknown",
+                     ip_address: str = None, user_agent: str = None,
+                     history_snapshot: list = None):
+    """
+    Записать в PostgreSQL ПОЛНЫЙ ПУТЬ без исключений:
+    - КАЖДАЯ запись из history_snapshot (user, assistant, tool, синтетические retry)
+    - Последний assistant enriched с tour_cards + latency_ms
+    - Safety net: если handler.chat() вернул reply без append в history,
+      финальный ответ добавляется отдельно
+    """
+    try:
+        from database import get_db, is_db_available
+        if not is_db_available():
+            return
+        from models import Conversation, Message
+
+        with get_db() as db:
+            if db is None:
+                return
+
+            conv = db.query(Conversation).filter(
+                Conversation.session_id == session_id
+            ).first()
+
+            if conv is None:
+                ip_addr = ip_address
+                ua = user_agent
+                if ip_addr is None:
+                    try:
+                        ip_addr = request.remote_addr
+                        ua = request.headers.get('User-Agent', '')[:500]
+                    except RuntimeError:
+                        pass
+                conv = Conversation(
+                    session_id=session_id,
+                    llm_provider=_llm_provider,
+                    model=model_name,
+                    ip_address=ip_addr,
+                    user_agent=ua,
+                )
+                db.add(conv)
+                db.flush()
+
+            msg_count = 0
+            final_reply_in_snapshot = False
+
+            if history_snapshot:
+                last_idx = len(history_snapshot) - 1
+
+                for i, entry in enumerate(history_snapshot):
+                    role = entry.get("role", "")
+                    content = entry.get("content") or ""
+                    tc_data = entry.get("tool_calls")
+                    tc_id = entry.get("tool_call_id")
+                    is_last = (i == last_idx)
+
+                    is_final_reply = (
+                        is_last and role == "assistant"
+                        and not tc_data and content == reply
+                    )
+
+                    msg = Message(
+                        conversation_id=conv.id,
+                        role=role,
+                        content=content[:10000] if role != "tool" else content[:5000],
+                    )
+                    if tc_data:
+                        msg.tool_calls = tc_data
+                    if tc_id:
+                        msg.tool_call_id = tc_id
+
+                    if is_final_reply:
+                        if tour_cards:
+                            msg.tour_cards = tour_cards
+                        msg.latency_ms = latency_ms
+                        final_reply_in_snapshot = True
+
+                    db.add(msg)
+                    msg_count += 1
+
+                    if tc_data:
+                        _log_tour_searches(db, conv.id, tc_data)
+
+            if not final_reply_in_snapshot:
+                if not history_snapshot:
+                    db.add(Message(
+                        conversation_id=conv.id,
+                        role="user",
+                        content=user_message,
+                    ))
+                    msg_count += 1
+                fallback_msg = Message(
+                    conversation_id=conv.id,
+                    role="assistant",
+                    content=reply,
+                    latency_ms=latency_ms,
+                )
+                if tour_cards:
+                    fallback_msg.tour_cards = tour_cards
+                db.add(fallback_msg)
+                msg_count += 1
+
+            conv.message_count = (conv.message_count or 0) + msg_count
+            if tour_cards:
+                conv.tour_cards_shown = (conv.tour_cards_shown or 0) + len(tour_cards)
+                conv.search_count = (conv.search_count or 0) + 1
+
+    except Exception as e:
+        logger.debug("DB logging failed (non-critical): %s", e)
+
+
+def _log_tour_searches(db, conv_id, tool_calls_data):
+    """Извлечь параметры поисков туров из tool_calls и записать в tour_searches."""
+    try:
+        from models import TourSearch
+        for tc in tool_calls_data:
+            func = tc.get("function", {})
+            name = func.get("name", "")
+            if name not in ("search_tours", "get_hot_tours"):
+                continue
+            try:
+                args = json.loads(func.get("arguments", "{}"))
+            except (json.JSONDecodeError, TypeError):
+                continue
+
+            def _int(val):
+                if val is None or val == "":
+                    return None
+                try:
+                    return int(val)
+                except (ValueError, TypeError):
+                    return None
+
+            search = TourSearch(
+                conversation_id=conv_id,
+                search_type="hot" if name == "get_hot_tours" else "regular",
+                departure=_int(args.get("departure") or args.get("city")),
+                country=_int(args.get("country") or args.get("countries")),
+                regions=str(args.get("regions", "")) or None,
+                date_from=args.get("datefrom"),
+                date_to=args.get("dateto"),
+                nights_from=_int(args.get("nightsfrom")),
+                nights_to=_int(args.get("nightsto") or args.get("maxdays")),
+                adults=_int(args.get("adults")),
+                children=_int(args.get("children")),
+                stars=_int(args.get("stars")),
+                meal=_int(args.get("meal")),
+                price_from=_int(args.get("pricefrom")),
+                price_to=_int(args.get("priceto")),
+            )
+            db.add(search)
+    except Exception:
+        pass
+
+
 # Путь к новому фронтенду (frontend/) — абсолютный путь для корректной работы send_from_directory
 _FRONTEND_DIR = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "frontend"))
 
@@ -227,6 +411,7 @@ _last_cleanup = [0.0]  # mutable container for nonlocal access
 
 @app.before_request
 def _log_request_start():
+    _init_infrastructure()
     g._req_start = time.perf_counter()
     g.request_id = uuid.uuid4().hex[:8]
     logger.info("-> %s %s rid=%s ip=%s", request.method, request.path, g.request_id, request.remote_addr)
@@ -276,11 +461,17 @@ def chat():
     handler = get_handler(session_id)
     
     try:
-        # Запускаем async функцию
+        _hist_before = len(handler.full_history)
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         response = loop.run_until_complete(handler.chat(message))
         loop.close()
+        _new_entries = handler.full_history[_hist_before:]
+        
+        _latency_ms = int((time.perf_counter() - g._req_start) * 1000) if hasattr(g, '_req_start') else None
+        _log_chat_to_db(session_id, message, response, [],
+                        _latency_ms, model_name=getattr(handler, 'model', 'unknown'),
+                        history_snapshot=_new_entries)
         
         return jsonify({'response': response})
     except Exception as e:
@@ -324,18 +515,18 @@ def chat_v1():
     handler = get_handler(session_id)
 
     try:
+        _hist_before = len(handler.full_history)
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         reply = loop.run_until_complete(handler.chat(message))
         loop.close()
+        _new_entries = handler.full_history[_hist_before:]
 
-        # Забираем накопленные tour_cards
         tour_cards = list(handler._pending_tour_cards)
         handler._pending_tour_cards = []
 
         _write_dialogue_log(session_id, "ASSISTANT", reply)
 
-        # Логируем карточки туров (полные данные: цены, даты, отели, питание)
         if tour_cards:
             cards_summary_lines = []
             for i, card in enumerate(tour_cards, 1):
@@ -354,6 +545,11 @@ def chat_v1():
             _write_dialogue_log(session_id, "TOUR_CARDS", cards_text)
 
         log(f"✅ [v1] Ответ: {len(reply)} символов, {len(tour_cards)} карточек", "OK")
+
+        _latency_ms = int((time.perf_counter() - g._req_start) * 1000) if hasattr(g, '_req_start') else None
+        _log_chat_to_db(session_id, message, reply, tour_cards, _latency_ms,
+                        model_name=getattr(handler, 'model', 'unknown'),
+                        history_snapshot=_new_entries)
 
         return jsonify({
             'reply': reply,
@@ -377,7 +573,7 @@ def chat_stream():
     """Chat со streaming через SSE"""
     data = request.json
     message = data.get('message', '')
-    session_id = data.get('session_id', 'default')
+    session_id = data.get('conversation_id') or data.get('session_id', 'default')
     
     log(f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━", "INFO")
     log(f"📨 Новое сообщение от {session_id[:8]}...", "MSG")
@@ -391,6 +587,9 @@ def chat_stream():
         return jsonify({'error': 'Empty message'}), 400
     
     handler = get_handler(session_id)
+    _stream_ip = request.remote_addr
+    _stream_ua = request.headers.get('User-Agent', '')[:500]
+    _stream_start = time.perf_counter()
     log(f"📊 Модель: {handler.model}", "INFO")
     log(f"📊 История: {len(handler.input_list)} сообщений", "INFO")
     
@@ -424,18 +623,28 @@ def chat_stream():
         
         def run_chat():
             try:
+                _hist_before = len(handler.full_history)
                 loop = asyncio.new_event_loop()
                 asyncio.set_event_loop(loop)
-                log("🚀 Отправляю запрос в YandexGPT...", "INFO")
+                log("🚀 Отправляю запрос в LLM...", "INFO")
                 response = loop.run_until_complete(
                     handler.chat_stream(message, on_token=on_token)
                 )
                 loop.close()
+                _new_entries = handler.full_history[_hist_before:]
+                _tour_cards = getattr(handler, '_pending_tour_cards', []) or []
+                handler._pending_tour_cards = []
                 result['response'] = response
+                result['tour_cards'] = _tour_cards
                 log(f"✅ Ответ получен: {len(response)} символов, {token_count[0]} токенов", "OK")
                 log(f"   └─ \"{response[:150]}{'...' if len(response) > 150 else ''}\"", "OK")
-                # Логируем полный ответ ассистента
                 _write_dialogue_log(session_id, "ASSISTANT", response)
+                _stream_latency = int((time.perf_counter() - _stream_start) * 1000)
+                _log_chat_to_db(session_id, message, response, _tour_cards,
+                                latency_ms=_stream_latency,
+                                model_name=getattr(handler, 'model', 'unknown'),
+                                ip_address=_stream_ip, user_agent=_stream_ua,
+                                history_snapshot=_new_entries)
                 token_queue.put(('done', response))
             except Exception as e:
                 result['error'] = str(e)
@@ -490,6 +699,26 @@ def reset():
             _write_dialogue_log(session_id, "SYSTEM", "=== SESSION RESET ===")
     
     return jsonify({'status': 'ok'})
+
+
+@app.route('/api/health')
+def health():
+    """Health check для Docker healthcheck и мониторинга."""
+    checks = {"status": "ok"}
+    try:
+        from database import check_health as db_health
+        checks["postgres"] = "ok" if db_health() else "unavailable"
+    except Exception:
+        checks["postgres"] = "unavailable"
+    try:
+        from cache import check_health as cache_health
+        checks["redis"] = "ok" if cache_health() else "unavailable"
+    except Exception:
+        checks["redis"] = "unavailable"
+    with _handlers_lock:
+        checks["active_sessions"] = len(_handlers)
+    all_ok = checks.get("postgres") == "ok" and checks.get("redis") == "ok"
+    return jsonify(checks), 200 if all_ok else 503
 
 
 @app.route('/api/status')

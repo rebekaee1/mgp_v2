@@ -1,0 +1,38 @@
+# Secrets — НИКОГДА не должны попасть в образ
+.env
+**/*.env
+
+# Git
+.git
+.gitignore
+
+# Logs
+logs/
+**/*.log
+
+# Python cache (на ВСЕХ уровнях вложенности)
+**/__pycache__
+**/*.pyc
+**/*.pyo
+.pytest_cache
+.mypy_cache
+.ruff_cache
+
+# IDE
+.idea/
+.vscode/
+.cursor/
+
+# Docs (не нужны в образе; system_prompt.md и faq.md нужны — они НЕ исключены)
+ARCHITECTURE.md
+**/*.plan.md
+история*
+
+# OS
+**/.DS_Store
+
+# Venvs
+.venv/
+venv/
+env/
+node_modules/

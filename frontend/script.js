@@ -372,9 +372,6 @@
                         <a href="${escapeHtml(hotelLink)}" class="btn-book" target="_blank" rel="noopener">
                             ${bookBtnText}
                         </a>
-                        <button class="btn-details" data-action="book-tour" data-hotel-name="${escapeHtml(hotelName)}">
-                            Забронировать через чат
-                        </button>
                     </div>
                 </div>
             </div>
@@ -562,25 +559,68 @@
     // TYPING INDICATOR
     // ============================================
 
-    /** [M6] showTyping starts a delayed status message for long waits */
-    function showTyping() {
+    let _typingPhase = 0;
+    let _typingPhaseTimer = null;
+
+    function _detectMessageIntent(text) {
+        const t = (text || '').toLowerCase();
+
+        const searchPatterns = /(?:ищ[иу]|подбер|подобр|покажи|хочу\s+в\s|хотим|лет[иеё]м|поехал|на\s+\d+\s+нoc|нач[ао]л[ое]|серед|конц[еа]|из\s+москв|из\s+спб|из\s+питер|из\s+екб|горящ|срочно|улет[еи]ть|звёзд|звезд|всё\s+включ|все\s+включ|завтрак|полупанс|ночей|ночи|дней|взросл|ребён|детей|детьми|вдвоём|семьёй|бюджет|без\s+перел)/;
+        const consultPatterns = /(?:расскаж|подробн|пляж|бассейн|для\s+дет|что\s+вход|перел[её]т|рейс|сравни|стоит|цена|актуал|брониру|оформ|заброн|какой\s+отел|об\s+отел|отзыв|рейтинг|питани|инфраструктур|номер[аов]|территори|check.?in|заезд|wifi|wi-fi|спа|spa)/;
+        const cascadePatterns = /^(?:москв|спб|питер|екб|мск|из\s|да$|нет$|\d+\s*(?:взр|чел|лет|год)|вдвоём|семь|любой|без\s*разниц|всё\s*равно|\d+\s*звёзд|\d+\s*звезд|завтрак|полупанс|полный|всё\s+вкл|ребён|детей|дет[яи]|ночей|дней|неделю?|^(?:турци|египет|оаэ|таиланд|сочи|крым|анап)|начал|серед|конц)/;
+
+        if (searchPatterns.test(t) && t.length > 25) return 'search';
+        if (consultPatterns.test(t)) return 'consult';
+        if (cascadePatterns.test(t) || t.length < 25) return 'cascade';
+        return 'search';
+    }
+
+    const _typingMessages = {
+        cascade: [
+            { text: 'Обрабатываю...', delay: 1500 },
+            { text: 'Анализирую запрос...', delay: 5000 },
+        ],
+        search: [
+            { text: 'Обрабатываю запрос...', delay: 1500 },
+            { text: 'Ищу лучшие предложения...', delay: 4000 },
+            { text: 'Подбираю варианты, это может занять некоторое время...', delay: 20000 },
+        ],
+        consult: [
+            { text: 'Обрабатываю...', delay: 1500 },
+            { text: 'Ищу ответ на ваш вопрос...', delay: 4000 },
+        ],
+    };
+
+    function showTyping(userText) {
         isTyping = true;
+        _typingPhase = 0;
         elements.typingIndicator.classList.add('show');
-        
-        typingStatusTimer = setTimeout(() => {
-            setTypingStatus('Ищу лучшие предложения...');
-        }, CONFIG.typingStatusDelay);
-        
+
+        const intent = _detectMessageIntent(userText);
+        const phases = _typingMessages[intent] || _typingMessages.cascade;
+
+        function nextPhase() {
+            if (!isTyping || _typingPhase >= phases.length) return;
+            const phase = phases[_typingPhase];
+            setTypingStatus(phase.text);
+            _typingPhase++;
+            if (_typingPhase < phases.length) {
+                _typingPhaseTimer = setTimeout(nextPhase, phases[_typingPhase].delay);
+            }
+        }
+
+        _typingPhaseTimer = setTimeout(nextPhase, phases[0].delay);
         scrollToBottom();
     }
 
     function hideTyping() {
         isTyping = false;
         elements.typingIndicator.classList.remove('show');
-        if (typingStatusTimer) {
-            clearTimeout(typingStatusTimer);
-            typingStatusTimer = null;
+        if (_typingPhaseTimer) {
+            clearTimeout(_typingPhaseTimer);
+            _typingPhaseTimer = null;
         }
+        _typingPhase = 0;
         setTypingStatus('');
     }
 
@@ -607,7 +647,7 @@
         elements.sendBtn.disabled = true;
         lastFailedMessage = null;
 
-        showTyping();
+        showTyping(trimmedText);
 
         try {
             const response = await fetch(CONFIG.apiUrl, {

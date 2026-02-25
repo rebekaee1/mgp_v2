@@ -26,4 +26,12 @@ backend/.env
 # Logs / runtime
 *.log
 *.pid
+logs/
+
+# Alembic
+alembic/versions/__pycache__/
+
+# Docker
+pgdata/
+redisdata/
 

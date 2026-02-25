@@ -942,6 +942,9 @@ def _map_hotel_to_card(hotel: dict, departure_city: str = "Москва") -> dic
     # "Без перелёта" = departure=99 → flight_included=False, is_hotel_only=True
     is_no_flight = (departure_city == "Без перелёта") or bool(tour.get("noflight"))
 
+    tourid = tour.get("tourid")
+    hotel_link = f"https://mgp.ru/tours/#tvtourid={tourid}" if tourid else (hotel.get("fulldesclink") or "#")
+
     return {
         "hotel_name": hotel.get("hotelname") or "Отель",
         "hotel_stars": _safe_int(hotel.get("hotelstars")),
@@ -958,8 +961,8 @@ def _map_hotel_to_card(hotel: dict, departure_city: str = "Москва") -> dic
         "meal_description": meal_desc,        # Русское описание питания
         "room_type": tour.get("room") or "Standard",
         "image_url": hotel.get("picturelink"),
-        "hotel_link": hotel.get("fulldesclink") or "#",
-        "id": str(tour.get("tourid") or ""),
+        "hotel_link": hotel_link,
+        "id": str(tourid or ""),
         "departure_city": departure_city,
         "is_hotel_only": is_no_flight,
         "flight_included": not is_no_flight,
@@ -990,6 +993,9 @@ def _map_hot_tour_to_card(tour_data: dict) -> dict:
     meal_code = tour_data.get("meal") or ""
     meal_ru = _MEAL_CODE_TO_RU.get(meal_code.strip(), meal_code)
 
+    tourid = tour_data.get("tourid")
+    hotel_link = f"https://mgp.ru/tours/#tvtourid={tourid}" if tourid else (tour_data.get("fulldesclink") or "#")
+
     return {
         "hotel_name": tour_data.get("hotelname") or "Отель",
         "hotel_stars": _safe_int(tour_data.get("hotelstars")),
@@ -1006,8 +1012,8 @@ def _map_hot_tour_to_card(tour_data: dict) -> dict:
         "meal_description": meal_ru,          # Русское описание для фронтенда
         "room_type": "Standard",
         "image_url": tour_data.get("picturelink"),
-        "hotel_link": tour_data.get("fulldesclink") or "#",
-        "id": str(tour_data.get("tourid") or ""),
+        "hotel_link": hotel_link,
+        "id": str(tourid or ""),
         "departure_city": tour_data.get("departurename") or "Москва",
         "is_hotel_only": False,
         "flight_included": True,
@@ -1235,6 +1241,7 @@ class YandexGPTHandler:
         self._last_requestid: Optional[str] = None  # Последний реальный requestid из search_tours
         self._search_awaiting_results: bool = False   # True после search_tours, False после get_search_results
         self._tourid_map: Dict[int, Dict] = {}       # Позиция(1-based) → {tourid, hotelcode, hotelname}
+        self._tour_details_cache: Dict[str, Dict] = {}  # tourid → actdetail result (prefetched)
         
         # ── Fix C2: Кэш параметров последнего поиска ──
         # При смене страны/направления ("а если Египет?") модель часто теряет
@@ -1292,7 +1299,84 @@ class YandexGPTHandler:
             return first
         
         return None
-    
+
+    def _start_prefetch(self):
+        """Launch background thread to prefetch actdetail for top-3 displayed tours."""
+        if not self._tourid_map:
+            return
+        targets = []
+        for pos in sorted(self._tourid_map.keys())[:3]:
+            entry = self._tourid_map.get(pos)
+            if entry and entry["tourid"] not in self._tour_details_cache:
+                targets.append((entry["tourid"], entry.get("hotelname", "?")))
+        if not targets:
+            return
+        self._prefetch_tids = {t for t, _ in targets}
+        self._prefetch_failed: set = set()
+        logger.info("PREFETCH starting for %d tours: %s",
+                     len(targets), [(t, h) for t, h in targets])
+        import threading
+        t = threading.Thread(target=self._do_prefetch_sync, args=(targets,), daemon=True)
+        t.start()
+
+    def _do_prefetch_sync(self, targets):
+        """Run in a separate thread: fetch all tours in parallel, cache results."""
+        import asyncio as _aio
+
+        async def _fetch_all():
+            tasks = [self._fetch_one(tid, hotel) for tid, hotel in targets]
+            await _aio.gather(*tasks)
+
+        loop = _aio.new_event_loop()
+        try:
+            loop.run_until_complete(_fetch_all())
+        except Exception as e:
+            logger.warning("PREFETCH thread error: %s", str(e)[:120])
+        finally:
+            loop.close()
+
+    async def _fetch_one(self, tid: str, hotel: str):
+        """Fetch actdetail for a single tour and cache if valid."""
+        try:
+            result = await self.tourvisor.get_tour_details(tour_id=tid, timeout=15.0)
+            if isinstance(result, dict) and not result.get("iserror"):
+                self._tour_details_cache[tid] = result
+                logger.info("PREFETCH cached tourid=%s (%s)", tid, hotel)
+            else:
+                logger.warning("PREFETCH skipped tourid=%s — iserror", tid)
+                if hasattr(self, "_prefetch_failed"):
+                    self._prefetch_failed.add(tid)
+        except Exception as e:
+            logger.warning("PREFETCH failed tourid=%s: %s", tid, str(e)[:120])
+            if hasattr(self, "_prefetch_failed"):
+                self._prefetch_failed.add(tid)
+
+    def _wait_prefetch(self, tid: str, timeout: float = 25.0) -> bool:
+        """Poll cache until tid appears. Skip immediately if tid failed or not prefetched."""
+        if not hasattr(self, "_prefetch_tids"):
+            return False
+        if tid in self._tour_details_cache:
+            return False
+        if tid not in self._prefetch_tids:
+            return False
+        failed = getattr(self, "_prefetch_failed", set())
+        if tid in failed:
+            logger.info("PREFETCH SKIP tourid=%s — already marked failed", tid)
+            return False
+        import time
+        logger.info("PREFETCH POLL for tourid=%s (up to %.0fs)", tid, timeout)
+        t0 = time.time()
+        while time.time() - t0 < timeout:
+            if tid in self._tour_details_cache:
+                logger.info("PREFETCH POLL hit tourid=%s after %.1fs", tid, time.time() - t0)
+                return True
+            if tid in failed:
+                logger.info("PREFETCH POLL abort tourid=%s — marked failed after %.1fs", tid, time.time() - t0)
+                return False
+            time.sleep(0.3)
+        logger.warning("PREFETCH POLL timeout tourid=%s after %.0fs", tid, timeout)
+        return False
+
     def _append_history(self, role: str, content: str):
         """
         Fix P13: Добавляет сообщение в full_history с гарантией чередования ролей.
@@ -1343,13 +1427,26 @@ class YandexGPTHandler:
         return custom_tools + [web_search_tool]
     
     def _load_system_prompt(self) -> str:
-        """Загрузить системный промпт (теперь это instructions)"""
-        prompt_path = os.path.join(os.path.dirname(__file__), "..", "system_prompt.md")
+        """Загрузить системный промпт + FAQ базу знаний"""
+        base_dir = os.path.join(os.path.dirname(__file__), "..")
+        prompt_path = os.path.join(base_dir, "system_prompt.md")
+        faq_path = os.path.join(base_dir, "faq.md")
+
         try:
             with open(prompt_path, "r", encoding="utf-8") as f:
-                return f.read()
+                prompt = f.read()
         except FileNotFoundError:
-            return "Ты — AI-менеджер турагентства. Помогаешь клиентам найти и забронировать туры."
+            prompt = "Ты — AI-менеджер турагентства. Помогаешь клиентам найти и забронировать туры."
+
+        try:
+            with open(faq_path, "r", encoding="utf-8") as f:
+                faq = f.read()
+            prompt = prompt + "\n\n" + faq
+            logger.info("📖 FAQ loaded: %d chars from faq.md", len(faq))
+        except FileNotFoundError:
+            logger.warning("⚠️ faq.md not found — running without FAQ knowledge base")
+
+        return prompt
     
     async def _execute_function(self, name: str, arguments: str, call_id: str) -> Dict:
         """Выполнить функцию и вернуть результат в новом формате"""
@@ -1982,6 +2079,17 @@ class YandexGPTHandler:
                 logger.warning("⚠️ nightsfrom=%d > nightsto=%d, исправлено nightsfrom=%d", nf, nt, nt)
                 args["nightsfrom"] = nt
             
+            # ── Safety-net: hotels + stars conflict ──
+            # Если модель указала конкретные отели (hotels), stars не нужен —
+            # звёздность уже определена из get_dictionaries
+            if args.get("hotels") and args.get("stars"):
+                logger.info(
+                    "🛡️ SAFETY-NET: hotels=%s указан → убираем stars=%s, starsbetter=%s (звёздность из каталога)",
+                    args.get("hotels")[:40], args.get("stars"), args.get("starsbetter")
+                )
+                args.pop("stars", None)
+                args.pop("starsbetter", None)
+            
             # ── Fix P1: Safety-net для mealbetter ──
             # Если модель указала meal, но НЕ указала mealbetter → ставим mealbetter=0
             # (точное совпадение типа питания, а не "и лучше")
@@ -2099,6 +2207,13 @@ class YandexGPTHandler:
                     ", ".join(missing_params)
                 )
             
+            # ── Charter-only: скрываем регулярные рейсы для международных направлений ──
+            _country_code = _safe_int(args.get("country"))
+            _departure_code = _safe_int(args.get("departure"))
+            if _country_code != 47 and _departure_code != 99 and not args.get("hideregular"):
+                args["hideregular"] = 1
+                logger.info("✈️ CHARTER-ONLY: hideregular=1 (country=%s, international)", _country_code)
+            
             self._metrics["total_searches"] += 1
             request_id = await self.tourvisor.search_tours(
                 departure=args.get("departure"),
@@ -2140,8 +2255,9 @@ class YandexGPTHandler:
             
             # ── P13: Кэшируем requestid для валидации в get_search_status ──
             self._last_requestid = str(request_id)
-            # Инвалидируем tourid_map — новый поиск, старые tourid недействительны
+            # Инвалидируем tourid_map и prefetch cache — новый поиск, старые tourid недействительны
             self._tourid_map = {}
+            self._tour_details_cache = {}
             if args.get("priceto"):
                 self._user_stated_budget = int(args["priceto"])
             
@@ -2474,6 +2590,7 @@ class YandexGPTHandler:
                 logger.info("🗂️ TOURID-CACHE: сохранено %d позиций: %s",
                             len(self._tourid_map),
                             {k: v["tourid"] for k, v in self._tourid_map.items()})
+                self._start_prefetch()
 
             if not ai_hotels and int(args.get("page", 1)) > 1:
                 return {
@@ -2611,34 +2728,69 @@ class YandexGPTHandler:
                     return {"error": (
                         f"⛔ НЕВЕРНЫЙ tourid: '{_tid}'. Используй ЧИСЛОВОЙ tourid из результатов get_search_results."
                     )}
-            result = await self.tourvisor.get_tour_details(
-                tour_id=args["tourid"],
-                currency=args.get("currency", 0)
-            )
+            _tid_str = str(args["tourid"])
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(None, self._wait_prefetch, _tid_str)
+            if _tid_str in self._tour_details_cache:
+                logger.info("PREFETCH CACHE HIT tourid=%s — skipping API call", _tid_str)
+                result = self._tour_details_cache.pop(_tid_str)
+            else:
+                result = await self.tourvisor.get_tour_details(
+                    tour_id=args["tourid"],
+                    currency=args.get("currency", 0)
+                )
             
-            # Fix F2 + C4: При iserror от actdetail — пробуем до 2 альтернативных tourid
+            # Fix F2 + C4: При iserror от actdetail — сначала проверяем кэш, потом параллельный fallback
             if isinstance(result, dict) and result.get("iserror") and self._tourid_map:
                 current_tid = str(args["tourid"])
-                _fallback_tries = 0
+                # Check prefetch cache for any alternative
                 for pos, entry in sorted(self._tourid_map.items()):
                     alt_tid = entry["tourid"]
-                    if alt_tid != current_tid:
+                    if alt_tid != current_tid and alt_tid in self._tour_details_cache:
+                        logger.info("✅ ACTDETAIL FALLBACK from CACHE: tourid %s (%s)", alt_tid, entry.get("hotelname", "?"))
+                        result = self._tour_details_cache.pop(alt_tid)
+                        break
+
+                if isinstance(result, dict) and result.get("iserror"):
+                    alt_entries = [
+                        (pos, entry) for pos, entry in sorted(self._tourid_map.items())
+                        if entry["tourid"] != current_tid and entry["tourid"] not in self._tour_details_cache
+                    ][:3]
+                    if alt_entries:
                         logger.warning(
-                            "🔄 ACTDETAIL FALLBACK %d: tourid %s iserror → trying alt %s (pos %d, hotel=%s)",
-                            _fallback_tries + 1, current_tid, alt_tid, pos, entry.get("hotelname", "?")
+                            "🔄 ACTDETAIL PARALLEL FALLBACK: tourid %s iserror → trying %d alternatives",
+                            current_tid, len(alt_entries)
                         )
-                        try:
-                            alt_result = await self.tourvisor.get_tour_details(tour_id=alt_tid)
-                            if isinstance(alt_result, dict) and not alt_result.get("iserror"):
+
+                        async def _try_alt(pos, entry):
+                            tid = entry["tourid"]
+                            try:
+                                r = await self.tourvisor.get_tour_details(tour_id=tid, timeout=12.0)
+                                if isinstance(r, dict) and not r.get("iserror"):
+                                    return r
+                            except Exception as e:
+                                logger.warning("⚠️ FALLBACK alt %s (%s): %s", tid, entry.get("hotelname", "?"), str(e)[:80])
+                            return None
+
+                        tasks = [_try_alt(pos, entry) for pos, entry in alt_entries]
+                        results_alt = await asyncio.gather(*tasks, return_exceptions=False)
+                        for i, alt_result in enumerate(results_alt):
+                            if alt_result is not None:
+                                alt_tid = alt_entries[i][1]["tourid"]
                                 logger.info("✅ ACTDETAIL FALLBACK SUCCESS: alt tourid %s returned flight data", alt_tid)
                                 result = alt_result
                                 break
-                        except Exception as e:
-                            logger.warning("⚠️ ACTDETAIL FALLBACK FAILED: alt tourid %s → %s", alt_tid, str(e)[:100])
-                        _fallback_tries += 1
-                        if _fallback_tries >= 2:
-                            break
-            
+
+            if isinstance(result, dict) and result.get("iserror"):
+                result["_hint"] = (
+                    "Не удалось получить данные о перелёте от туроператора. "
+                    "Скажи клиенту: «К сожалению, туроператор сейчас не предоставляет "
+                    "информацию о рейсе. Детали перелёта можно уточнить у нашего менеджера "
+                    "по телефону: +7 (800) 555-35-35.» "
+                    "НЕ обещай «уточню/узнаю/свяжусь». НЕ вызывай get_tour_details повторно."
+                )
+                logger.warning("⚠️ ACTDETAIL ALL ATTEMPTS FAILED — manager hint added")
+
             # Fix C3: _hint для неполных данных о рейсе
             if isinstance(result, dict) and not result.get("iserror"):
                 _flights = result.get("data", {}).get("flights", []) if "data" in result else result.get("flights", [])
@@ -2655,7 +2807,20 @@ class YandexGPTHandler:
                                 "будут уточнены при бронировании. НЕ вызывай get_tour_details повторно."
                             )
                             logger.info("ℹ️ ACTDETAIL: неполные данные о рейсе (только даты) — добавлен _hint")
-            
+
+            # Trim alternative flights to reduce LLM token usage
+            if isinstance(result, dict) and not result.get("iserror"):
+                _container = result.get("data") if isinstance(result.get("data"), dict) else result
+                _all_flights = _container.get("flights") if isinstance(_container, dict) else None
+                if isinstance(_all_flights, list) and len(_all_flights) > 1:
+                    _default = _all_flights[0]
+                    for _f in _all_flights:
+                        if isinstance(_f, dict) and str(_f.get("isdefault")) in ("true", "True", "1"):
+                            _default = _f
+                            break
+                    _container["flights"] = [_default]
+                    logger.info("✂️ ACTDETAIL TRIMMED: %d → 1 flight option (removed alternatives)", len(_all_flights))
+
             return result
         
         elif name == "get_hotel_info":
@@ -3908,6 +4073,7 @@ class YandexGPTHandler:
         self._empty_iterations = 0
         self._pending_tour_cards = []
         self._last_departure_city = "Москва"
+        self._tour_details_cache = {}
         logger.info("🔄 HANDLER RESET  cleared %d messages from full_history", old_len)
 
 
