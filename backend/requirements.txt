@@ -21,6 +21,10 @@ alembic>=1.13.0,<2.0.0
 # === Cache (Redis) ===
 redis>=5.0.0,<6.0.0
 
+# === Authentication (Dashboard) ===
+PyJWT>=2.8.0,<3.0.0
+bcrypt>=4.1.0,<5.0.0
+
 # === Configuration ===
 pydantic-settings>=2.0.0,<3.0.0
 python-dotenv>=1.0.0,<2.0.0

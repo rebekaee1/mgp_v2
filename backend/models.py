@@ -1,6 +1,6 @@
 """
 ORM-модели для PostgreSQL — полное логирование диалогов, поисков и API-вызовов.
-Данные структурированы для будущего личного кабинета и аналитики.
+Данные структурированы для личного кабинета и аналитики.
 Совместимость: Optional[] для Python 3.9+.
 """
 
@@ -9,11 +9,13 @@ from datetime import datetime, timezone
 from typing import Optional, List
 
 from sqlalchemy import (
-    BigInteger, DateTime, Index, Integer, String, Text,
-    ForeignKey,
+    BigInteger, Boolean, DateTime, Index, Integer, JSON, String, Text,
+    ForeignKey, Uuid,
 )
-from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
+
+UUID = Uuid
+JSONB = JSON
 
 from database import Base
 
@@ -22,17 +24,106 @@ def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
+# ── Multi-tenancy models ─────────────────────────────────────────────────────
+
+class Company(Base):
+    """Компания-клиент, использующая AI-ассистента."""
+    __tablename__ = "companies"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(), primary_key=True, default=uuid.uuid4
+    )
+    name: Mapped[str] = mapped_column(String(128), nullable=False)
+    slug: Mapped[str] = mapped_column(String(64), unique=True, nullable=False)
+    logo_url: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow
+    )
+
+    users: Mapped[List["User"]] = relationship(
+        back_populates="company", cascade="all, delete-orphan"
+    )
+    assistants: Mapped[List["Assistant"]] = relationship(
+        back_populates="company", cascade="all, delete-orphan"
+    )
+
+
+class Assistant(Base):
+    """AI-ассистент, привязанный к компании. Хранит ключи API и конфиг виджета."""
+    __tablename__ = "assistants"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(), primary_key=True, default=uuid.uuid4
+    )
+    company_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(),
+        ForeignKey("companies.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    name: Mapped[str] = mapped_column(String(128), nullable=False)
+    tourvisor_login: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    tourvisor_pass: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    llm_provider: Mapped[str] = mapped_column(String(16), default="openai")
+    llm_api_key: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    llm_model: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    system_prompt: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    faq_content: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    widget_config: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow
+    )
+
+    company: Mapped["Company"] = relationship(back_populates="assistants")
+    conversations: Mapped[List["Conversation"]] = relationship(
+        back_populates="assistant"
+    )
+
+
+class User(Base):
+    """Пользователь ЛК (менеджер / администратор компании)."""
+    __tablename__ = "users"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(), primary_key=True, default=uuid.uuid4
+    )
+    company_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(),
+        ForeignKey("companies.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    email: Mapped[str] = mapped_column(String(255), unique=True, nullable=False)
+    password_hash: Mapped[str] = mapped_column(String(255), nullable=False)
+    name: Mapped[str] = mapped_column(String(128), nullable=False)
+    role: Mapped[str] = mapped_column(String(16), default="admin")
+    last_login_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow
+    )
+
+    company: Mapped["Company"] = relationship(back_populates="users")
+
+
+# ── Chat / Analytics models ──────────────────────────────────────────────────
+
 class Conversation(Base):
     """
     Сессия чата. 1 conversation = 1 conversation_id от фронтенда.
-    Хранит мета-данные для аналитики и будущего личного кабинета.
+    Хранит мета-данные для аналитики и личного кабинета.
     """
     __tablename__ = "conversations"
 
     id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+        UUID(), primary_key=True, default=uuid.uuid4
     )
     session_id: Mapped[str] = mapped_column(String(64), unique=True, nullable=False)
+    assistant_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(),
+        ForeignKey("assistants.id", ondelete="SET NULL"),
+        nullable=True,
+    )
     llm_provider: Mapped[str] = mapped_column(String(16), nullable=False)
     model: Mapped[str] = mapped_column(String(64), nullable=False)
     ip_address: Mapped[Optional[str]] = mapped_column(String(45), nullable=True)
@@ -48,6 +139,9 @@ class Conversation(Base):
         DateTime(timezone=True), default=_utcnow, onupdate=_utcnow
     )
 
+    assistant: Mapped[Optional["Assistant"]] = relationship(
+        back_populates="conversations"
+    )
     messages: Mapped[List["Message"]] = relationship(
         back_populates="conversation", cascade="all, delete-orphan"
     )
@@ -58,6 +152,7 @@ class Conversation(Base):
     __table_args__ = (
         Index("ix_conversations_started", "started_at"),
         Index("ix_conversations_status", "status"),
+        Index("ix_conversations_assistant", "assistant_id", "started_at"),
     )
 
 
@@ -69,9 +164,9 @@ class Message(Base):
     """
     __tablename__ = "messages"
 
-    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     conversation_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True),
+        UUID(),
         ForeignKey("conversations.id", ondelete="CASCADE"),
         nullable=False,
     )
@@ -101,9 +196,9 @@ class TourSearch(Base):
     """
     __tablename__ = "tour_searches"
 
-    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     conversation_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True),
+        UUID(),
         ForeignKey("conversations.id", ondelete="CASCADE"),
         nullable=False,
     )
@@ -144,9 +239,9 @@ class ApiCall(Base):
     """
     __tablename__ = "api_calls"
 
-    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     conversation_id: Mapped[Optional[uuid.UUID]] = mapped_column(
-        UUID(as_uuid=True), nullable=True
+        UUID(), nullable=True
     )
     service: Mapped[str] = mapped_column(String(16), nullable=False)
     endpoint: Mapped[str] = mapped_column(String(128), nullable=False)

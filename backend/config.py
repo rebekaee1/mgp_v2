@@ -48,6 +48,11 @@ class Settings(BaseSettings):
     rate_limit_per_ip: int = 30
     rate_limit_per_session: int = 10
 
+    # --- Dashboard Auth ---
+    jwt_secret: str = "change-me-in-production-please"
+    jwt_access_minutes: int = 30
+    jwt_refresh_days: int = 7
+
 
 @lru_cache
 def get_settings() -> Settings:

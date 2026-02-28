@@ -37,7 +37,13 @@ import queue
 import threading
 
 app = Flask(__name__, template_folder='templates', static_folder='static')
-CORS(app)
+CORS(app, resources={
+    r"/api/*": {"origins": "*"},
+})
+
+from dashboard_api import auth_bp, dash_bp
+app.register_blueprint(auth_bp)
+app.register_blueprint(dash_bp)
 
 from werkzeug.middleware.proxy_fix import ProxyFix
 app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_prefix=1)
@@ -227,7 +233,8 @@ def _log_chat_to_db(session_id: str, user_message: str, reply: str,
                      tour_cards: list, latency_ms: int = None,
                      model_name: str = "unknown",
                      ip_address: str = None, user_agent: str = None,
-                     history_snapshot: list = None):
+                     history_snapshot: list = None,
+                     assistant_id: str = None):
     """
     Записать в PostgreSQL ПОЛНЫЙ ПУТЬ без исключений:
     - КАЖДАЯ запись из history_snapshot (user, assistant, tool, синтетические retry)
@@ -258,12 +265,19 @@ def _log_chat_to_db(session_id: str, user_message: str, reply: str,
                         ua = request.headers.get('User-Agent', '')[:500]
                     except RuntimeError:
                         pass
+                _aid = None
+                if assistant_id:
+                    try:
+                        _aid = uuid.UUID(assistant_id) if isinstance(assistant_id, str) else assistant_id
+                    except (ValueError, AttributeError):
+                        pass
                 conv = Conversation(
                     session_id=session_id,
                     llm_provider=_llm_provider,
                     model=model_name,
                     ip_address=ip_addr,
                     user_agent=ua,
+                    assistant_id=_aid,
                 )
                 db.add(conv)
                 db.flush()
@@ -306,7 +320,7 @@ def _log_chat_to_db(session_id: str, user_message: str, reply: str,
                     msg_count += 1
 
                     if tc_data:
-                        _log_tour_searches(db, conv.id, tc_data)
+                        _log_tour_searches(db, conv.id, tc_data, tour_cards=tour_cards)
 
             if not final_reply_in_snapshot:
                 if not history_snapshot:
@@ -336,7 +350,7 @@ def _log_chat_to_db(session_id: str, user_message: str, reply: str,
         logger.debug("DB logging failed (non-critical): %s", e)
 
 
-def _log_tour_searches(db, conv_id, tool_calls_data):
+def _log_tour_searches(db, conv_id, tool_calls_data, tour_cards=None):
     """Извлечь параметры поисков туров из tool_calls и записать в tour_searches."""
     try:
         from models import TourSearch
@@ -358,9 +372,28 @@ def _log_tour_searches(db, conv_id, tool_calls_data):
                 except (ValueError, TypeError):
                     return None
 
+            tours_found = None
+            hotels_found = None
+            min_price = None
+            if tour_cards:
+                tours_found = len(tour_cards)
+                hotel_names = {c.get("hotel_name") for c in tour_cards if c.get("hotel_name")}
+                hotels_found = len(hotel_names) if hotel_names else None
+                prices = [c.get("price") for c in tour_cards if c.get("price")]
+                min_price = min(prices) if prices else None
+
+            if name == "get_hot_tours":
+                stype = "hot"
+            elif _int(args.get("departure")) == 99:
+                stype = "without_flight"
+            elif args.get("hotels"):
+                stype = "hotel"
+            else:
+                stype = "regular"
+
             search = TourSearch(
                 conversation_id=conv_id,
-                search_type="hot" if name == "get_hot_tours" else "regular",
+                search_type=stype,
                 departure=_int(args.get("departure") or args.get("city")),
                 country=_int(args.get("country") or args.get("countries")),
                 regions=str(args.get("regions", "")) or None,
@@ -374,6 +407,9 @@ def _log_tour_searches(db, conv_id, tool_calls_data):
                 meal=_int(args.get("meal")),
                 price_from=_int(args.get("pricefrom")),
                 price_to=_int(args.get("priceto")),
+                tours_found=tours_found,
+                hotels_found=hotels_found,
+                min_price=min_price,
             )
             db.add(search)
     except Exception:
@@ -494,6 +530,7 @@ def chat_v1():
     data = request.json
     message = data.get('message', '')
     conversation_id = data.get('conversation_id', str(uuid.uuid4()))
+    assistant_id = data.get('assistant_id')
 
     if not message:
         return jsonify({
@@ -549,7 +586,8 @@ def chat_v1():
         _latency_ms = int((time.perf_counter() - g._req_start) * 1000) if hasattr(g, '_req_start') else None
         _log_chat_to_db(session_id, message, reply, tour_cards, _latency_ms,
                         model_name=getattr(handler, 'model', 'unknown'),
-                        history_snapshot=_new_entries)
+                        history_snapshot=_new_entries,
+                        assistant_id=assistant_id)
 
         return jsonify({
             'reply': reply,
@@ -574,6 +612,7 @@ def chat_stream():
     data = request.json
     message = data.get('message', '')
     session_id = data.get('conversation_id') or data.get('session_id', 'default')
+    _stream_assistant_id = data.get('assistant_id')
     
     log(f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━", "INFO")
     log(f"📨 Новое сообщение от {session_id[:8]}...", "MSG")
@@ -644,7 +683,8 @@ def chat_stream():
                                 latency_ms=_stream_latency,
                                 model_name=getattr(handler, 'model', 'unknown'),
                                 ip_address=_stream_ip, user_agent=_stream_ua,
-                                history_snapshot=_new_entries)
+                                history_snapshot=_new_entries,
+                                assistant_id=_stream_assistant_id)
                 token_queue.put(('done', response))
             except Exception as e:
                 result['error'] = str(e)

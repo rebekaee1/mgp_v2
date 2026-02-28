@@ -122,16 +122,20 @@ class TourVisorClient:
                     continue
                 logger.error("🌐 TOURVISOR !! %s  TIMEOUT  %dms  (all %d attempts failed)",
                              endpoint, elapsed_ms, _max_attempts)
+                self._log_api_call(endpoint, 0, 0, elapsed_ms, error="ReadTimeout")
                 raise
             except httpx.HTTPStatusError as e:
                 elapsed_ms = int((time.perf_counter() - t0) * 1000)
                 logger.error("🌐 TOURVISOR !! %s  HTTP %s  %dms  error=%s",
                              endpoint, e.response.status_code, elapsed_ms, str(e)[:200])
+                self._log_api_call(endpoint, e.response.status_code, 0, elapsed_ms,
+                                   error=str(e)[:500])
                 raise
             except httpx.RequestError as e:
                 elapsed_ms = int((time.perf_counter() - t0) * 1000)
                 logger.error("🌐 TOURVISOR !! %s  NETWORK ERROR  %dms  error=%s",
                              endpoint, elapsed_ms, str(e)[:200])
+                self._log_api_call(endpoint, 0, 0, elapsed_ms, error=str(e)[:500])
                 raise
         
         # Логируем ключевые поля ответа
@@ -139,6 +143,9 @@ class TourVisorClient:
         if len(preview) > 500:
             preview = preview[:500] + "…"
         logger.debug("🌐 TOURVISOR << %s  body=%s", endpoint, preview)
+        
+        # --- Запись в api_calls (PostgreSQL) ---
+        self._log_api_call(endpoint, response.status_code, len(response.content), elapsed_ms)
         
         # Проверяем на ошибки API (HTTP 200, но есть errormessage)
         self._check_api_error(data, endpoint)
@@ -154,6 +161,29 @@ class TourVisorClient:
         
         return data
     
+    @staticmethod
+    def _log_api_call(endpoint: str, status_code: int, response_bytes: int,
+                      latency_ms: int, error: str = None):
+        """Record external API call in PostgreSQL (fire-and-forget)."""
+        try:
+            from database import get_db, is_db_available
+            if not is_db_available():
+                return
+            from models import ApiCall
+            with get_db() as db:
+                if db is None:
+                    return
+                db.add(ApiCall(
+                    service="tourvisor",
+                    endpoint=endpoint,
+                    response_code=status_code,
+                    response_bytes=response_bytes,
+                    latency_ms=latency_ms,
+                    error=error,
+                ))
+        except Exception:
+            pass
+
     def _check_api_error(self, data: Dict, endpoint: str):
         """
         Проверить ответ на ошибки API

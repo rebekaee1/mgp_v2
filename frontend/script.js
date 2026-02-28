@@ -10,10 +10,14 @@
     // ============================================
     // CONFIGURATION
     // ============================================
+    const _scriptTag = document.currentScript || document.querySelector('script[data-assistant-id]');
+    const _assistantId = _scriptTag ? _scriptTag.getAttribute('data-assistant-id') : null;
+
     const CONFIG = {
         apiUrl: (window.location.port === '5555' || window.location.protocol === 'file:')
             ? 'http://127.0.0.1:8080/api/v1/chat' 
             : window.location.origin + '/api/v1/chat',
+        assistantId: _assistantId,
         botName: 'MGP AI',
         typingDelay: 500,
         messageDelay: 100,
@@ -657,7 +661,8 @@
                 },
                 body: JSON.stringify({
                     message: trimmedText,
-                    conversation_id: conversationId
+                    conversation_id: conversationId,
+                    assistant_id: CONFIG.assistantId
                 })
             });
 

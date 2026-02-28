@@ -23,31 +23,38 @@ class Base(DeclarativeBase):
 
 def init_db(database_url: str) -> bool:
     """
-    Инициализировать подключение к PostgreSQL.
+    Инициализировать подключение к БД (PostgreSQL или SQLite).
     Возвращает True если подключение успешно.
     """
     global _engine, _SessionLocal, _db_available
 
+    is_sqlite = database_url.startswith("sqlite")
+
     try:
-        _engine = create_engine(
-            database_url,
+        kwargs = {} if is_sqlite else dict(
             pool_size=5,
             max_overflow=10,
             pool_pre_ping=True,
             pool_recycle=300,
-            echo=False,
         )
+        _engine = create_engine(database_url, echo=False, **kwargs)
+
         with _engine.connect() as conn:
             conn.execute(text("SELECT 1"))
 
+        if is_sqlite:
+            Base.metadata.create_all(_engine)
+            logger.info("SQLite database ready: %s", database_url)
+        else:
+            logger.info("PostgreSQL connected: %s", database_url.split("@")[-1])
+
         _SessionLocal = sessionmaker(bind=_engine, expire_on_commit=False)
         _db_available = True
-        logger.info("PostgreSQL connected: %s", database_url.split("@")[-1])
         return True
 
     except Exception as e:
         _db_available = False
-        logger.warning("PostgreSQL unavailable (%s) — running without DB", e)
+        logger.warning("Database unavailable (%s) — running without DB", e)
         return False
 
 

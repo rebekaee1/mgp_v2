@@ -35,3 +35,10 @@ alembic/versions/__pycache__/
 pgdata/
 redisdata/
 
+
+# Database
+*.db
+backend/dev.db
+
+# Dashboard build
+dashboard/dist/
