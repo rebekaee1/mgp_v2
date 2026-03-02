@@ -628,15 +628,21 @@ export default function Analytics() {
       items.push(`Топ-направление: ${destinations[0].name} (${destinations[0].value} поисков)`);
     }
     if (typesData?.avg_budget) {
-      items.push(`Средний бюджет: ${new Intl.NumberFormat('ru-RU').format(typesData.avg_budget)} ₽`);
+      items.push(`Средний бюджет клиентов: ${new Intl.NumberFormat('ru-RU').format(typesData.avg_budget)} ₽`);
     }
     if (typesData?.avg_nights) {
       const n = typesData.avg_nights;
       const word = n % 10 === 1 && n !== 11 ? 'ночь' : (n % 10 >= 2 && n % 10 <= 4 && (n < 10 || n > 20)) ? 'ночи' : 'ночей';
       items.push(`Средняя длительность: ${n} ${word}`);
     }
-    return items;
-  }, [destinations, typesData]);
+    if (bizData?.engagement_pct != null && bizData.engagement_pct > 0) {
+      items.push(`Вовлечённость: ${bizData.engagement_pct}% клиентов вели активный диалог`);
+    }
+    if (bizData?.after_hours_pct != null && bizData.after_hours_pct > 0) {
+      items.push(`${bizData.after_hours_pct}% обращений вне рабочих часов`);
+    }
+    return items.slice(0, 5);
+  }, [destinations, typesData, bizData]);
 
   return (
     <div className="space-y-6">

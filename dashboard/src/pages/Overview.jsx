@@ -1,6 +1,7 @@
-import { useState, useMemo } from 'react';
+import { useState, useMemo, useRef } from 'react';
+import { createPortal } from 'react-dom';
 import { useNavigate } from 'react-router-dom';
-import { MessageSquare, Search, Clock, MessagesSquare, ArrowRight, TrendingUp, Zap, Users, BookmarkCheck } from 'lucide-react';
+import { MessageSquare, Search, Clock, MessagesSquare, ArrowRight, TrendingUp, Zap, Users, BookmarkCheck, HelpCircle } from 'lucide-react';
 import { LineChart, Line, AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from 'recharts';
 import MetricCard, { CardSkeleton } from '../components/ui/MetricCard';
 import EmptyState from '../components/ui/EmptyState';
@@ -18,14 +19,52 @@ function getGreeting() {
   return 'Добрый вечер';
 }
 
+function FunnelHeader() {
+  const [show, setShow] = useState(false);
+  const ref = useRef(null);
+  return (
+    <div className="flex items-center gap-2 mb-3">
+      <h3 className="text-sm font-semibold text-text">Воронка конверсии</h3>
+      <span
+        ref={ref}
+        className="cursor-help"
+        onMouseEnter={() => setShow(true)}
+        onMouseLeave={() => setShow(false)}
+      >
+        <HelpCircle size={13} className="text-text-secondary/60 hover:text-primary transition-colors" />
+      </span>
+      {show && ref.current && createPortal(
+        <div
+          className="fixed z-[9999] pointer-events-none animate-fade-in"
+          style={{
+            top: ref.current.getBoundingClientRect().top - 8,
+            left: ref.current.getBoundingClientRect().left + ref.current.getBoundingClientRect().width / 2,
+            transform: 'translate(-50%, -100%)',
+          }}
+        >
+          <div className="flex flex-col items-center">
+            <div className="w-64 px-3.5 py-2.5 rounded-xl bg-[#1E293B] text-white text-[11px] leading-relaxed shadow-xl">
+              <p className="font-semibold mb-1">Как считается конверсия</p>
+              <p>Каждый этап показывает, какой % переходит на следующий шаг: от первого сообщения → поиск тура → показ карточек → запрос на бронь.</p>
+              <p className="mt-1 opacity-80">Общая конверсия = лиды / все диалоги.</p>
+            </div>
+            <div className="w-0 h-0 border-l-[6px] border-r-[6px] border-t-[6px] border-l-transparent border-r-transparent border-t-[#1E293B]" />
+          </div>
+        </div>,
+        document.body,
+      )}
+    </div>
+  );
+}
+
 function ConversionFunnel({ funnel }) {
   const steps = [
     { label: 'Все диалоги', value: funnel?.total || 0, color: 'bg-primary' },
     { label: 'Вовлечённые (2+ сообщ.)', value: funnel?.engaged || 0, color: 'bg-[#1A4FFF]' },
     { label: 'С поиском туров', value: funnel?.with_search || 0, color: 'bg-[#3B82F6]' },
-    { label: 'С результатами', value: funnel?.with_results || 0, color: 'bg-[#60A5FA]' },
-    { label: 'Запросы на бронь', value: funnel?.booking_intent || 0, color: 'bg-success' },
+    { label: 'Показаны карточки туров', value: funnel?.with_results || 0, color: 'bg-[#60A5FA]' },
     { label: 'Потенциальные лиды', value: funnel?.potential_leads || 0, color: 'bg-[#93C5FD]' },
+    { label: 'Запросы на бронь', value: funnel?.booking_intent || 0, color: 'bg-success' },
   ];
   const max = Math.max(...steps.map((s) => s.value), 1);
 
@@ -69,23 +108,30 @@ function ConversionFunnel({ funnel }) {
 
 function InsightCard({ insights, funnel, avgResponseMs }) {
   const items = useMemo(() => {
-    const fTotal = funnel?.total || 0;
-    const searchPct = fTotal > 0 ? Math.round((funnel.with_search / fTotal) * 100) : 0;
-    const cardsPct = fTotal > 0 ? Math.round((funnel.with_results / fTotal) * 100) : 0;
-    const bookingPct = insights?.booking_intent_pct ?? 0;
+    const result = [];
     const topDest = insights?.top_destination;
     const respSec = avgResponseMs ? (avgResponseMs / 1000).toFixed(1) : null;
     const afterHrs = insights?.after_hours_pct ?? 0;
+    const avgBudget = insights?.avg_budget;
+    const avgDur = insights?.avg_duration_minutes;
 
-    return [
-      { text: `${searchPct}% клиентов ищут туры через ассистента`, color: 'text-primary' },
-      { text: `${cardsPct}% запросов завершились показом предложений`, color: 'text-primary' },
-      { text: `${bookingPct}% клиентов проявляют интерес к бронированию`, color: 'text-success' },
-      { text: topDest ? `Самое популярное направление: ${topDest.name} (${topDest.count} поисков)` : 'Самое популярное направление: —', color: 'text-primary' },
-      { text: respSec ? `Среднее время ответа ассистента: ${respSec}с` : 'Среднее время ответа ассистента: —', color: 'text-primary' },
-      { text: `${afterHrs}% обращений поступают вне рабочего времени`, color: 'text-primary' },
-    ];
-  }, [insights, funnel, avgResponseMs]);
+    if (topDest) {
+      result.push({ text: `Самое популярное направление: ${topDest.name} (${topDest.count} поисков)`, color: 'text-primary' });
+    }
+    if (avgBudget) {
+      result.push({ text: `Средний бюджет клиентов: ${new Intl.NumberFormat('ru-RU').format(avgBudget)} ₽`, color: 'text-primary' });
+    }
+    if (respSec) {
+      result.push({ text: `Среднее время ответа ассистента: ${respSec}с`, color: 'text-primary' });
+    }
+    if (afterHrs > 0) {
+      result.push({ text: `${afterHrs}% обращений поступают вне рабочего времени`, color: 'text-primary' });
+    }
+    if (avgDur) {
+      result.push({ text: `Средняя длительность диалога: ${avgDur} мин`, color: 'text-primary' });
+    }
+    return result.slice(0, 5);
+  }, [insights, avgResponseMs]);
 
   return (
     <div className="bg-white rounded-2xl shadow-sm p-5 animate-fade-in-up stagger-6">
@@ -248,7 +294,7 @@ export default function Overview() {
         <div className="space-y-4">
           {/* Conversion funnel */}
           <div className="bg-white rounded-2xl shadow-sm p-5 animate-fade-in-up stagger-5">
-            <h3 className="text-sm font-semibold text-text mb-3">Воронка конверсии</h3>
+            <FunnelHeader />
             <ConversionFunnel funnel={funnel} />
           </div>
 

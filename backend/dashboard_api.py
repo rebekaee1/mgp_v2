@@ -130,13 +130,19 @@ def _assistant_ids(db) -> list[uuid.UUID]:
     return [r[0] for r in rows]
 
 
+def _apply_aids_filter(q, aids, entity=None):
+    """Always apply assistant_id filter — returns impossible condition if aids is empty."""
+    target = entity or Conversation
+    if aids:
+        return q.filter(target.assistant_id.in_(aids))
+    return q.filter(target.assistant_id == None)  # noqa: E711 — no assistants = no data
+
+
 def _conv_filter(q, period: str, assistant_ids: list):
     """Apply standard time + assistant_id filters to a Conversation query."""
     since = _period_start(period)
     q = q.filter(Conversation.started_at >= since)
-    if assistant_ids:
-        q = q.filter(Conversation.assistant_id.in_(assistant_ids))
-    return q
+    return _apply_aids_filter(q, assistant_ids)
 
 
 # ── Auth endpoints ────────────────────────────────────────────────────────────
@@ -244,8 +250,7 @@ def overview():
 
         def _conv_q(start):
             q = db.query(Conversation).filter(Conversation.started_at >= start)
-            if aids:
-                q = q.filter(Conversation.assistant_id.in_(aids))
+            q = _apply_aids_filter(q, aids)
             return q
 
         convs_now = _conv_q(since).count()
@@ -279,7 +284,7 @@ def overview():
 
         def _delta(now_val, prev_val):
             if prev_val == 0:
-                return 0
+                return 100.0 if now_val > 0 else 0
             return round((now_val - prev_val) / prev_val * 100, 1)
 
         # ── Funnel data ──
@@ -312,16 +317,22 @@ def overview():
                 sc = c.search_count or 0
                 tc = c.tour_cards_shown or 0
 
-                if umc >= 2:
+                is_engaged = umc >= 2
+                has_search = is_engaged and sc > 0
+                has_cards = has_search and tc > 0
+                is_lead = has_cards and umc >= 4
+                is_booking = is_lead and c.has_booking_intent
+
+                if is_engaged:
                     funnel["engaged"] += 1
-                if sc > 0:
+                if has_search:
                     funnel["with_search"] += 1
-                if tc > 0:
+                if has_cards:
                     funnel["with_results"] += 1
-                if c.has_booking_intent:
-                    funnel["booking_intent"] += 1
-                if umc >= 4 and tc > 0:
+                if is_lead:
                     funnel["potential_leads"] += 1
+                if is_booking:
+                    funnel["booking_intent"] += 1
 
                 if c.started_at and c.last_active_at:
                     diff = (c.last_active_at - c.started_at).total_seconds()
@@ -330,8 +341,9 @@ def overview():
                         duration_count += 1
 
                 if c.started_at:
-                    h = c.started_at.hour if hasattr(c.started_at, 'hour') else 12
-                    if h < 9 or h >= 18:
+                    h_utc = c.started_at.hour if hasattr(c.started_at, 'hour') else 12
+                    h_msk = (h_utc + 3) % 24
+                    if h_msk < 9 or h_msk >= 18:
                         after_hours += 1
 
             if convs_now > 0:
@@ -358,6 +370,16 @@ def overview():
                                            f"#{top_dest.country}"),
                 "count": top_dest.cnt,
             }
+
+        budget_row = db.query(
+            func.avg(TourSearch.price_to).label("avg_budget"),
+        ).filter(
+            TourSearch.conversation_id.in_(conv_ids_now),
+            TourSearch.price_to.isnot(None),
+            TourSearch.price_to > 0,
+        ).first()
+        if budget_row and budget_row.avg_budget:
+            insights["avg_budget"] = round(budget_row.avg_budget)
 
         return jsonify({
             "conversations": {"value": convs_now, "delta": _delta(convs_now, convs_prev)},
@@ -387,8 +409,7 @@ def overview_chart():
                 func.date(Conversation.started_at).label("date"),
                 func.count(Conversation.id).label("value"),
             ).filter(Conversation.started_at >= since)
-            if aids:
-                q = q.filter(Conversation.assistant_id.in_(aids))
+            q = _apply_aids_filter(q, aids)
             rows = q.group_by("date").order_by("date").all()
 
         elif metric == "messages":
@@ -397,8 +418,7 @@ def overview_chart():
                 func.count(Message.id).label("value"),
             ).join(Conversation, Message.conversation_id == Conversation.id
             ).filter(Conversation.started_at >= since)
-            if aids:
-                q = q.filter(Conversation.assistant_id.in_(aids))
+            q = _apply_aids_filter(q, aids)
             rows = q.group_by("date").order_by("date").all()
 
         elif metric == "booking_intents":
@@ -409,8 +429,7 @@ def overview_chart():
                 Conversation.started_at >= since,
                 Conversation.has_booking_intent == True,  # noqa: E712
             )
-            if aids:
-                q = q.filter(Conversation.assistant_id.in_(aids))
+            q = _apply_aids_filter(q, aids)
             rows = q.group_by("date").order_by("date").all()
 
         elif metric == "searches":
@@ -419,8 +438,7 @@ def overview_chart():
                 func.count(TourSearch.id).label("value"),
             ).join(Conversation, TourSearch.conversation_id == Conversation.id
             ).filter(Conversation.started_at >= since)
-            if aids:
-                q = q.filter(Conversation.assistant_id.in_(aids))
+            q = _apply_aids_filter(q, aids)
             rows = q.group_by("date").order_by("date").all()
         else:
             rows = []
@@ -465,8 +483,7 @@ def overview_recent():
 
         aids = _assistant_ids(db)
         q = db.query(Conversation).order_by(desc(Conversation.started_at))
-        if aids:
-            q = q.filter(Conversation.assistant_id.in_(aids))
+        q = _apply_aids_filter(q, aids)
         convs = q.limit(limit).all()
 
         result = []
@@ -478,8 +495,8 @@ def overview_recent():
 
             result.append({
                 "id": str(c.id),
-                "started_at": c.started_at.isoformat(),
-                "last_active_at": c.last_active_at.isoformat(),
+                "started_at": (c.started_at.isoformat() if c.started_at else None),
+                "last_active_at": (c.last_active_at.isoformat() if c.last_active_at else None),
                 "message_count": c.message_count,
                 "search_count": c.search_count,
                 "tour_cards_shown": c.tour_cards_shown,
@@ -497,8 +514,14 @@ def overview_recent():
 @dash_bp.route("/conversations", methods=["GET"])
 @require_auth
 def conversations_list():
-    page = max(int(request.args.get("page", 1)), 1)
-    per_page = min(int(request.args.get("per_page", 20)), 100)
+    try:
+        page = max(int(request.args.get("page", 1)), 1)
+    except (ValueError, TypeError):
+        page = 1
+    try:
+        per_page = min(int(request.args.get("per_page", 20)), 100)
+    except (ValueError, TypeError):
+        per_page = 20
     period = request.args.get("period", "all")
     search_text = request.args.get("search", "").strip()
     sort_by = request.args.get("sort_by", "started_at")
@@ -518,8 +541,7 @@ def conversations_list():
         col = SORT_COLS.get(sort_by, Conversation.started_at)
         order = asc(col) if sort_dir == "asc" else desc(col)
         q = db.query(Conversation).order_by(order)
-        if aids:
-            q = q.filter(Conversation.assistant_id.in_(aids))
+        q = _apply_aids_filter(q, aids)
 
         if period != "all":
             q = q.filter(Conversation.started_at >= _period_start(period))
@@ -573,8 +595,7 @@ def conversations_list():
         total = q.count()
 
         gq = db.query(Conversation.id)
-        if aids:
-            gq = gq.filter(Conversation.assistant_id.in_(aids))
+        gq = _apply_aids_filter(gq, aids)
         if period != "all":
             gq = gq.filter(Conversation.started_at >= _period_start(period))
 
@@ -611,8 +632,8 @@ def conversations_list():
 
             items.append({
                 "id": str(c.id),
-                "started_at": c.started_at.isoformat(),
-                "last_active_at": c.last_active_at.isoformat(),
+                "started_at": (c.started_at.isoformat() if c.started_at else None),
+                "last_active_at": (c.last_active_at.isoformat() if c.last_active_at else None),
                 "message_count": c.message_count,
                 "search_count": c.search_count,
                 "tour_cards_shown": c.tour_cards_shown,
@@ -669,8 +690,8 @@ def conversation_detail(conv_id):
         return jsonify({
             "id": str(conv.id),
             "session_id": conv.session_id,
-            "started_at": conv.started_at.isoformat(),
-            "last_active_at": conv.last_active_at.isoformat(),
+            "started_at": (conv.started_at.isoformat() if conv.started_at else None),
+            "last_active_at": (conv.last_active_at.isoformat() if conv.last_active_at else None),
             "llm_provider": conv.llm_provider,
             "model": conv.model,
             "ip_address": conv.ip_address,
@@ -708,6 +729,11 @@ def conversation_searches(conv_id):
             cid = uuid.UUID(conv_id)
         except (ValueError, AttributeError):
             return jsonify({"error": "Invalid ID"}), 400
+
+        aids = _assistant_ids(db)
+        conv = db.query(Conversation).filter(Conversation.id == cid).first()
+        if not conv or (aids and conv.assistant_id not in aids) or (not aids):
+            return jsonify({"error": "Not found"}), 404
 
         searches = db.query(TourSearch).filter(
             TourSearch.conversation_id == cid
@@ -762,8 +788,7 @@ def analytics_destinations():
             Conversation.started_at >= since,
             TourSearch.country.isnot(None),
         )
-        if aids:
-            q = q.filter(Conversation.assistant_id.in_(aids))
+        q = _apply_aids_filter(q, aids)
         rows = q.group_by(TourSearch.country).order_by(desc("count")).limit(20).all()
 
         return jsonify({
@@ -790,8 +815,7 @@ def analytics_departures():
             Conversation.started_at >= since,
             TourSearch.departure.isnot(None),
         )
-        if aids:
-            q = q.filter(Conversation.assistant_id.in_(aids))
+        q = _apply_aids_filter(q, aids)
         rows = q.group_by(TourSearch.departure).order_by(desc("count")).limit(20).all()
 
         return jsonify({
@@ -813,16 +837,14 @@ def analytics_search_params():
         base = db.query(TourSearch).join(
             Conversation, TourSearch.conversation_id == Conversation.id
         ).filter(Conversation.started_at >= since)
-        if aids:
-            base = base.filter(Conversation.assistant_id.in_(aids))
+        base = _apply_aids_filter(base, aids)
 
         stars_q = db.query(
             TourSearch.stars, func.count(TourSearch.id).label("count"),
         ).join(Conversation).filter(
             Conversation.started_at >= since, TourSearch.stars.isnot(None),
         )
-        if aids:
-            stars_q = stars_q.filter(Conversation.assistant_id.in_(aids))
+        stars_q = _apply_aids_filter(stars_q, aids)
         stars = stars_q.group_by(TourSearch.stars).order_by(TourSearch.stars).all()
 
         meal_q = db.query(
@@ -830,8 +852,7 @@ def analytics_search_params():
         ).join(Conversation).filter(
             Conversation.started_at >= since, TourSearch.meal.isnot(None),
         )
-        if aids:
-            meal_q = meal_q.filter(Conversation.assistant_id.in_(aids))
+        meal_q = _apply_aids_filter(meal_q, aids)
         meals = meal_q.group_by(TourSearch.meal).order_by(desc("count")).all()
 
         travelers_q = db.query(
@@ -840,8 +861,7 @@ def analytics_search_params():
         ).join(Conversation).filter(
             Conversation.started_at >= since, TourSearch.adults.isnot(None),
         )
-        if aids:
-            travelers_q = travelers_q.filter(Conversation.assistant_id.in_(aids))
+        travelers_q = _apply_aids_filter(travelers_q, aids)
         travelers = travelers_q.group_by(
             TourSearch.adults, TourSearch.children
         ).order_by(desc("count")).all()
@@ -863,8 +883,7 @@ def analytics_search_params():
                 TourSearch.price_to >= lo,
                 TourSearch.price_to < hi,
             )
-            if aids:
-                bq = bq.filter(Conversation.assistant_id.in_(aids))
+            bq = _apply_aids_filter(bq, aids)
             budgets.append({"range": label, "count": bq.scalar() or 0})
 
         combo_q = db.query(
@@ -875,8 +894,7 @@ def analytics_search_params():
             TourSearch.stars.isnot(None),
             TourSearch.meal.isnot(None),
         )
-        if aids:
-            combo_q = combo_q.filter(Conversation.assistant_id.in_(aids))
+        combo_q = _apply_aids_filter(combo_q, aids)
         combos = combo_q.group_by(TourSearch.stars, TourSearch.meal).all()
 
         avg_budget_q = db.query(
@@ -887,8 +905,7 @@ def analytics_search_params():
             TourSearch.price_to > 0,
             TourSearch.min_price > 0,
         )
-        if aids:
-            avg_budget_q = avg_budget_q.filter(Conversation.assistant_id.in_(aids))
+        avg_budget_q = _apply_aids_filter(avg_budget_q, aids)
         bp = avg_budget_q.first()
 
         return jsonify({
@@ -930,8 +947,7 @@ def analytics_response_times():
             Message.role == "assistant",
             Message.latency_ms.isnot(None),
         )
-        if aids:
-            q = q.filter(Conversation.assistant_id.in_(aids))
+        q = _apply_aids_filter(q, aids)
         raw = q.order_by(func.date(Message.created_at)).all()
 
         from collections import defaultdict
@@ -973,8 +989,7 @@ def analytics_search_types():
             func.count(TourSearch.id).label("count"),
         ).join(Conversation, TourSearch.conversation_id == Conversation.id
         ).filter(Conversation.started_at >= since)
-        if aids:
-            q = q.filter(Conversation.assistant_id.in_(aids))
+        q = _apply_aids_filter(q, aids)
         rows = q.group_by(TourSearch.search_type).all()
 
         nights_q = db.query(
@@ -983,12 +998,11 @@ def analytics_search_types():
             Conversation.started_at >= since,
             TourSearch.nights_from.isnot(None),
         )
-        if aids:
-            nights_q = nights_q.filter(Conversation.assistant_id.in_(aids))
+        nights_q = _apply_aids_filter(nights_q, aids)
         nights_rows = nights_q.all()
         if nights_rows:
             total_n = sum(
-                (r.nights_from + (r.nights_to or r.nights_from)) / 2
+                (r.nights_from + (r.nights_to if r.nights_to is not None else r.nights_from)) / 2
                 for r in nights_rows
             )
             avg_nights = round(total_n / len(nights_rows))
@@ -1002,8 +1016,7 @@ def analytics_search_types():
             TourSearch.price_to.isnot(None),
             TourSearch.price_to > 0,
         )
-        if aids:
-            budget_q = budget_q.filter(Conversation.assistant_id.in_(aids))
+        budget_q = _apply_aids_filter(budget_q, aids)
         budget_row = budget_q.first()
         avg_budget = (
             round(budget_row.avg_budget) if budget_row and budget_row.avg_budget
@@ -1041,8 +1054,7 @@ def analytics_travel_dates():
             TourSearch.date_from.isnot(None),
             TourSearch.date_from != "",
         )
-        if aids:
-            q = q.filter(Conversation.assistant_id.in_(aids))
+        q = _apply_aids_filter(q, aids)
 
         counts = {}
         for (date_str,) in q.all():
@@ -1075,8 +1087,7 @@ def analytics_business_metrics():
         since = _period_start(period)
 
         q = db.query(Conversation).filter(Conversation.started_at >= since)
-        if aids:
-            q = q.filter(Conversation.assistant_id.in_(aids))
+        q = _apply_aids_filter(q, aids)
 
         total_convs = q.count()
         if total_convs == 0:
@@ -1092,8 +1103,7 @@ def analytics_business_metrics():
         tours_offered = db.query(func.sum(Conversation.tour_cards_shown)).filter(
             Conversation.started_at >= since,
         )
-        if aids:
-            tours_offered = tours_offered.filter(Conversation.assistant_id.in_(aids))
+        tours_offered = _apply_aids_filter(tours_offered, aids)
         tours_offered = tours_offered.scalar() or 0
 
         conv_ids = [c.id for c in q.with_entities(Conversation.id).all()]
@@ -1123,8 +1133,9 @@ def analytics_business_metrics():
                 potential_leads += 1
 
             if c.started_at:
-                h = c.started_at.hour if hasattr(c.started_at, "hour") else 12
-                if h < 9 or h >= 18:
+                h_utc = c.started_at.hour if hasattr(c.started_at, "hour") else 12
+                h_msk = (h_utc + 3) % 24
+                if h_msk < 9 or h_msk >= 18:
                     after_hours += 1
 
         booking_count = q.filter(
@@ -1157,8 +1168,7 @@ def analytics_performance():
         since = _period_start(period)
 
         q = db.query(Conversation).filter(Conversation.started_at >= since)
-        if aids:
-            q = q.filter(Conversation.assistant_id.in_(aids))
+        q = _apply_aids_filter(q, aids)
 
         total_convs = q.count()
         agg = q.with_entities(
@@ -1243,14 +1253,13 @@ def analytics_demand():
             q = db.query(TourSearch).join(
                 Conversation, TourSearch.conversation_id == Conversation.id
             ).filter(Conversation.started_at >= since)
-            if aids:
-                q = q.filter(Conversation.assistant_id.in_(aids))
+            q = _apply_aids_filter(q, aids)
             return q
 
         nights_dist = {}
         for s in _base_q().filter(TourSearch.nights_from.isnot(None)).all():
-            nf = s.nights_from or 7
-            nt = s.nights_to or nf
+            nf = s.nights_from if s.nights_from is not None else 7
+            nt = s.nights_to if s.nights_to is not None else nf
             avg_n = round((nf + nt) / 2)
             nights_dist[avg_n] = nights_dist.get(avg_n, 0) + 1
         nights_data = sorted(
@@ -1292,8 +1301,7 @@ def analytics_operators():
             Conversation.started_at >= since,
             Message.tour_cards.isnot(None),
         )
-        if aids:
-            q = q.filter(Conversation.assistant_id.in_(aids))
+        q = _apply_aids_filter(q, aids)
 
         operators = {}
         total_cards = 0
@@ -1328,8 +1336,7 @@ def analytics_activity():
         q = db.query(Conversation.started_at).filter(
             Conversation.started_at >= since
         )
-        if aids:
-            q = q.filter(Conversation.assistant_id.in_(aids))
+        q = _apply_aids_filter(q, aids)
 
         heatmap = [[0] * 24 for _ in range(7)]
         day_counts = [0] * 7
@@ -1338,11 +1345,13 @@ def analytics_activity():
         for row in q.all():
             ts = row.started_at
             if ts:
-                dow = ts.weekday()
-                h = ts.hour if hasattr(ts, 'hour') else 12
-                heatmap[dow][h] += 1
+                h_utc = ts.hour if hasattr(ts, 'hour') else 12
+                h_msk = (h_utc + 3) % 24
+                dow_shift = 1 if (h_utc + 3) >= 24 else 0
+                dow = (ts.weekday() + dow_shift) % 7
+                heatmap[dow][h_msk] += 1
                 day_counts[dow] += 1
-                hour_counts[h] += 1
+                hour_counts[h_msk] += 1
 
         day_names = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
         return jsonify({
@@ -1690,8 +1699,7 @@ def export_conversations():
         since = _period_start(period)
 
         q = db.query(Conversation).filter(Conversation.started_at >= since)
-        if aids:
-            q = q.filter(Conversation.assistant_id.in_(aids))
+        q = _apply_aids_filter(q, aids)
         convs = q.order_by(Conversation.started_at.desc()).all()
 
         output = io.StringIO()

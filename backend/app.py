@@ -99,6 +99,8 @@ def _init_infrastructure():
             init_db(settings.database_url)
             init_cache(settings.redis_url)
             _backfill_booking_intent()
+            from scheduler import init_scheduler
+            init_scheduler(app)
         except Exception as e:
             logging.getLogger("mgp_bot").warning("Infrastructure init: %s", e)
         _infra_done = True
@@ -108,7 +110,10 @@ from datetime import datetime as _dt
 
 # Директория для логов
 _LOGS_DIR = os.path.join(os.path.dirname(__file__), "..", "logs")
-os.makedirs(_LOGS_DIR, exist_ok=True)
+try:
+    os.makedirs(_LOGS_DIR, exist_ok=True)
+except OSError:
+    _LOGS_DIR = "/tmp"
 
 # Файл диалогового лога (человекочитаемый markdown)
 _DIALOGUE_LOG_PATH = os.path.join(
@@ -202,10 +207,13 @@ def _setup_logging() -> logging.Logger:
 logger = _setup_logging()
 
 # Записываем заголовок диалогового лога
-with open(_DIALOGUE_LOG_PATH, "w", encoding="utf-8") as _f:
-    _f.write(f"# 📝 Диалоговый лог AI-Турменеджера МГП\n")
-    _f.write(f"**Дата:** {_dt.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
-    _f.write(f"---\n")
+try:
+    with open(_DIALOGUE_LOG_PATH, "w", encoding="utf-8") as _f:
+        _f.write(f"# 📝 Диалоговый лог AI-Турменеджера МГП\n")
+        _f.write(f"**Дата:** {_dt.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
+        _f.write(f"---\n")
+except OSError:
+    pass
 
 
 def log(msg: str, level: str = "INFO"):

@@ -1,6 +1,7 @@
 #!/bin/bash
 set -e
 
+mkdir -p /app/logs
 echo "=== MGP Backend starting ==="
 echo "DATABASE_URL = ${DATABASE_URL:+***configured***}"
 echo "REDIS_URL    = ${REDIS_URL:+***configured***}"

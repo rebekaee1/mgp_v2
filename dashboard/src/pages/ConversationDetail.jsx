@@ -316,7 +316,7 @@ export default function ConversationDetail() {
                           ? 'bg-warning-light text-warning'
                           : 'bg-primary-50 text-primary'
                       }`}>
-                        {s.search_type === 'hot' ? 'Горящий' : 'Обычный'}
+                        {{ regular: 'Обычный', hot: 'Горящий', hotel: 'По отелю', without_flight: 'Без перелёта' }[s.search_type] || 'Обычный'}
                       </span>
                       <span className="text-text-secondary text-[10px]">{formatDate(s.created_at)}</span>
                     </div>

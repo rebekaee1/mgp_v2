@@ -29,6 +29,10 @@ bcrypt>=4.2.0,<5.0.0
 pydantic-settings>=2.7.0,<3.0.0
 python-dotenv>=1.0.0,<2.0.0
 
-# === Scheduling (Rosstat daily fetch, stats aggregation) ===
+# === Scheduling (sync, stats aggregation) ===
 APScheduler>=3.10.0,<4.0.0
 python-dateutil>=2.9.0,<3.0.0
+
+# === Remote DB Sync ===
+# Uses sshpass+ssh subprocess for SSH tunneling (no Python dependency needed)
+# sshpass must be installed on the host: apt install sshpass

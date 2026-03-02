@@ -12,14 +12,18 @@ services:
       -c shared_buffers=${PG_SHARED_BUFFERS:-64MB}
       -c work_mem=4MB
       -c maintenance_work_mem=32MB
-      -c effective_cache_size=256MB
-      -c max_connections=20
-      -c wal_buffers=4MB
+      -c effective_cache_size=${PG_EFFECTIVE_CACHE:-256MB}
+      -c max_connections=${PG_MAX_CONN:-20}
+      -c wal_buffers=2MB
       -c checkpoint_completion_target=0.9
       -c random_page_cost=1.1
       -c log_min_duration_statement=1000
     volumes:
       - pgdata:/var/lib/postgresql/data
+    deploy:
+      resources:
+        limits:
+          memory: 384M
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-mgp}"]
       interval: 10s
@@ -45,6 +49,10 @@ services:
       --save 300 10
     volumes:
       - redisdata:/data
+    deploy:
+      resources:
+        limits:
+          memory: 96M
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 10s
@@ -67,8 +75,14 @@ services:
     env_file:
       - .env
     environment:
-      DATABASE_URL: postgresql://${POSTGRES_USER:-mgp}:${POSTGRES_PASSWORD:-changeme}@postgres:5432/${POSTGRES_DB:-mgp}
-      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-mgp}:${POSTGRES_PASSWORD:-changeme}@postgres:5432/${POSTGRES_DB:-mgp}
+      REDIS_URL: redis://redis:6379/0
+    volumes:
+      - ./logs:/app/logs
+    deploy:
+      resources:
+        limits:
+          memory: 512M
     depends_on:
       postgres:
         condition: service_healthy
@@ -90,6 +104,10 @@ services:
     restart: unless-stopped
     ports:
       - "${APP_PORT:-80}:80"
+    deploy:
+      resources:
+        limits:
+          memory: 96M
     depends_on:
       - backend
     logging:
