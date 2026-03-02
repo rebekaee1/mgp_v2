@@ -1478,14 +1478,33 @@ def widget_logo_upload():
         if size > _MAX_LOGO_SIZE:
             return jsonify({"error": "Максимальный размер файла — 2 МБ"}), 400
 
+        header = file.read(16)
+        file.seek(0)
+        _MAGIC = {
+            b"\x89PNG": "png",
+            b"\xff\xd8\xff": "jpg",
+            b"RIFF": "webp",
+        }
+        detected = None
+        for magic, fmt in _MAGIC.items():
+            if header.startswith(magic):
+                detected = fmt
+                break
+        if detected is None or (detected == "webp" and b"WEBP" not in header[:16]):
+            return jsonify({"error": "Файл не является допустимым изображением"}), 400
+
         os.makedirs(_LOGO_DIR, exist_ok=True)
 
         for old in os.listdir(_LOGO_DIR):
             if old.startswith(str(assistant.id)):
                 os.remove(os.path.join(_LOGO_DIR, old))
 
-        filename = f"{assistant.id}.{ext}"
+        from werkzeug.utils import secure_filename as _sf
+        safe_ext = _sf(ext) or "png"
+        filename = f"{assistant.id}.{safe_ext}"
         filepath = os.path.join(_LOGO_DIR, filename)
+        if not os.path.abspath(filepath).startswith(os.path.abspath(_LOGO_DIR)):
+            return jsonify({"error": "Invalid path"}), 400
         file.save(filepath)
 
         logo_url = f"/static/logos/{filename}"

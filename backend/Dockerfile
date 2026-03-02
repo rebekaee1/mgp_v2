@@ -17,7 +17,13 @@ COPY faq.md /app/faq.md
 COPY backend/entrypoint.sh /app/entrypoint.sh
 RUN chmod +x /app/entrypoint.sh
 
+RUN groupadd -r appuser && useradd -r -g appuser -d /app -s /sbin/nologin appuser && \
+    mkdir -p /app/logs /app/backend/static/logos && \
+    chown -R appuser:appuser /app
+
 WORKDIR /app/backend
+
+USER appuser
 
 EXPOSE 8080
 

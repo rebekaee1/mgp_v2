@@ -37,8 +37,12 @@ import queue
 import threading
 
 app = Flask(__name__, template_folder='templates', static_folder='static')
+
+_cors_origins = os.getenv("CORS_ORIGINS", "").strip()
+_allowed_origins = [o.strip() for o in _cors_origins.split(",") if o.strip()] if _cors_origins else ["*"]
+
 CORS(app, resources={
-    r"/api/*": {"origins": "*"},
+    r"/api/*": {"origins": _allowed_origins},
 })
 
 from dashboard_api import auth_bp, dash_bp
@@ -606,10 +610,17 @@ def _log_request_start():
     g.request_id = uuid.uuid4().hex[:8]
     logger.info("-> %s %s rid=%s ip=%s", request.method, request.path, g.request_id, request.remote_addr)
 
+    from cache import rate_limit_check
+    from config import settings
+    ip = request.remote_addr
+
+    if request.path in ('/api/auth/login', '/api/auth/refresh'):
+        auth_key = f"rl:auth:{ip}:{int(time.time()) // 300}"
+        if not rate_limit_check(auth_key, 10, 300):
+            return jsonify({"error": "Too many login attempts. Try again in 5 minutes."}), 429
+
     if request.path.startswith(('/api/chat', '/api/v1/chat')):
-        from cache import rate_limit_check
-        from config import settings
-        ip_key = f"rl:ip:{request.remote_addr}:{int(time.time()) // 60}"
+        ip_key = f"rl:ip:{ip}:{int(time.time()) // 60}"
         if not rate_limit_check(ip_key, settings.rate_limit_per_ip, 60):
             return jsonify({"error": "Rate limit exceeded"}), 429
 

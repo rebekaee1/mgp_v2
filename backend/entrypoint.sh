@@ -1,7 +1,14 @@
 #!/bin/bash
 set -e
 
-mkdir -p /app/logs
+mkdir -p /app/logs 2>/dev/null || true
+
+# Copy SSH sync key with correct ownership (mounted as root:root from host)
+if [ -f /opt/lk-aimpact/sync_key ]; then
+    cp /opt/lk-aimpact/sync_key /tmp/sync_key 2>/dev/null && chmod 600 /tmp/sync_key
+    export MGP_SSH_KEY_PATH=/tmp/sync_key
+fi
+
 echo "=== MGP Backend starting ==="
 echo "DATABASE_URL = ${DATABASE_URL:+***configured***}"
 echo "REDIS_URL    = ${REDIS_URL:+***configured***}"

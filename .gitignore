@@ -22,6 +22,9 @@ yarn-error.log*
 .env
 *.env
 backend/.env
+sync_key
+sync_key.pub
+credentials.txt
 
 # Logs / runtime
 *.log

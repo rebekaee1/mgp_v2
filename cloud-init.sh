@@ -4,6 +4,9 @@ set -eu
 # ===================================================================
 # Cloud-init для Timeweb Cloud — ЛК AIMpact
 # Ubuntu 24.04, 2GB RAM, 30GB NVMe, Москва MSK-1
+#
+# ВАЖНО: Все секреты передаются через переменные окружения Timeweb
+# или вручную в .env после клонирования. НЕ ХРАНИТЬ СЕКРЕТЫ ЗДЕСЬ.
 # ===================================================================
 
 export DEBIAN_FRONTEND=noninteractive
@@ -43,7 +46,7 @@ apt-get install -y -qq \
 echo ">>> Installing Docker..."
 install -m 0755 -d /etc/apt/keyrings
 curl -fsSL https://download.docker.com/linux/ubuntu/gpg \
-    | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+    | gpg --batch --yes --dearmor -o /etc/apt/keyrings/docker.gpg
 chmod a+r /etc/apt/keyrings/docker.gpg
 
 echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" \
@@ -127,21 +130,22 @@ fi
 mkdir -p "$APP_DIR/logs"
 
 # -------------------------------------------------------------------
-# 9. Create .env with ALL values (2GB RAM config)
+# 9. Create .env — ЗАПОЛНИ ВРУЧНУЮ!
 # -------------------------------------------------------------------
 GENERATED_PG_PASS=$(openssl rand -hex 16)
 GENERATED_JWT=$(openssl rand -hex 32)
 
-cat > "$APP_DIR/.env" <<ENVEOF
+if [ ! -f "$APP_DIR/.env" ]; then
+    cat > "$APP_DIR/.env" <<ENVEOF
 # === LLM Provider ===
 LLM_PROVIDER=openai
-OPENAI_API_KEY=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
+OPENAI_API_KEY=REPLACE_ME
 OPENAI_MODEL=openai/gpt-5-mini
 OPENAI_BASE_URL=https://openrouter.ai/api/v1
 
 # === TourVisor API ===
-TOURVISOR_AUTH_LOGIN=online@mgp.ru
-TOURVISOR_AUTH_PASS=1mFIsdqQ473m
+TOURVISOR_AUTH_LOGIN=REPLACE_ME
+TOURVISOR_AUTH_PASS=REPLACE_ME
 TOURVISOR_BASE_URL=https://tourvisor.ru/xml
 
 # === PostgreSQL ===
@@ -161,22 +165,25 @@ SESSION_TTL_SECONDS=1800
 JWT_SECRET=${GENERATED_JWT}
 
 # === Auto-Seed ===
-SEED_ADMIN_EMAIL=admin@mgp-tour.ru
-SEED_ADMIN_PASSWORD=MgpAdmin2026!
-SEED_COMPANY_NAME=МГП Тур
-SEED_COMPANY_SLUG=mgp-tour
+SEED_ADMIN_EMAIL=REPLACE_ME
+SEED_ADMIN_PASSWORD=REPLACE_ME
+SEED_COMPANY_NAME=REPLACE_ME
+SEED_COMPANY_SLUG=REPLACE_ME
 
 # === MGP Bot Sync ===
 SYNC_MGP_ENABLED=true
 SYNC_MGP_INTERVAL_MINUTES=5
-MGP_SSH_HOST=72.56.88.193
+MGP_SSH_HOST=REPLACE_ME
 MGP_SSH_PORT=22
 MGP_SSH_USER=root
-MGP_SSH_PASSWORD=g3hkZUVwH7*9kr
+MGP_SSH_PASSWORD=REPLACE_ME
 MGP_PG_USER=mgp
-MGP_PG_PASSWORD=bb10ea795c50b0273cd26c5efa328342
+MGP_PG_PASSWORD=REPLACE_ME
 MGP_PG_DB=mgp
 MGP_PG_PORT=5432
+
+# === CORS ===
+CORS_ORIGINS=REPLACE_ME
 
 # === Resource Tuning (2GB RAM) ===
 PG_SHARED_BUFFERS=64MB
@@ -187,28 +194,11 @@ GUNICORN_WORKERS=2
 GUNICORN_THREADS=4
 APP_PORT=80
 ENVEOF
-
-chmod 600 "$APP_DIR/.env"
-echo ">>> .env created"
-
-# Save credentials
-cat > /root/credentials.txt <<CREDEOF
-============================================
-  LK AIMpact — Credentials
-  $(date -u)
-============================================
-  Dashboard:       http://<SERVER_IP>/dashboard/
-  Admin Email:     admin@mgp-tour.ru
-  Admin Password:  MgpAdmin2026!
-
-  PG Password:     ${GENERATED_PG_PASS}
-  JWT Secret:      ${GENERATED_JWT}
-
-  Files:           /opt/lk-aimpact/
-  Logs:            /opt/lk-aimpact/logs/
-============================================
-CREDEOF
-chmod 600 /root/credentials.txt
+    chmod 600 "$APP_DIR/.env"
+    echo ">>> .env created — FILL IN SECRETS MANUALLY: nano $APP_DIR/.env"
+else
+    echo ">>> .env already exists, skipping"
+fi
 
 # -------------------------------------------------------------------
 # 10. Log rotation
@@ -237,29 +227,22 @@ echo "0 3 * * 0 root docker system prune -f >> /var/log/docker-prune.log 2>&1" \
     > /etc/cron.d/docker-prune
 
 # -------------------------------------------------------------------
-# 13. Build and start
+# 13. Build and start (only if .env is filled)
 # -------------------------------------------------------------------
 if [ -f "$APP_DIR/docker-compose.yml" ]; then
-    echo ">>> Building and starting..."
-    cd "$APP_DIR"
-    docker compose up -d --build 2>&1 | tail -50
-    echo ">>> Waiting 30s for startup..."
-    sleep 30
-    echo ">>> Containers:"
-    docker compose ps
-    curl -sf http://localhost/api/health || echo ">>> Health check pending..."
-else
-    echo ">>> No docker-compose.yml — clone repo manually and run:"
-    echo "    cd $APP_DIR && docker compose up -d --build"
+    if grep -q "REPLACE_ME" "$APP_DIR/.env" 2>/dev/null; then
+        echo ">>> .env contains REPLACE_ME placeholders!"
+        echo ">>> Fill in secrets first: nano $APP_DIR/.env"
+        echo ">>> Then run: cd $APP_DIR && docker compose up -d --build"
+    else
+        echo ">>> Building and starting..."
+        cd "$APP_DIR"
+        docker compose up -d --build 2>&1 | tail -50
+        echo ">>> Waiting 30s for startup..."
+        sleep 30
+        docker compose ps
+        curl -sf http://localhost/api/health || echo ">>> Health check pending..."
+    fi
 fi
 
-echo ""
-echo "=================================================="
-echo "  SERVER DEPLOYED!"
-echo "=================================================="
-echo "  Dashboard: http://<SERVER_IP>/dashboard/"
-echo "  Login:     admin@mgp-tour.ru / MgpAdmin2026!"
-echo "  Creds:     cat /root/credentials.txt"
-echo "  Logs:      cd /opt/lk-aimpact && docker compose logs -f"
-echo "=================================================="
 echo "=== Cloud-init finished at $(date -u) ==="

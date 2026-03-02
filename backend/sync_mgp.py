@@ -61,7 +61,7 @@ def _find_free_port() -> int:
 
 @contextmanager
 def remote_pg_connection():
-    """Open SSH tunnel via sshpass+ssh subprocess → remote PostgreSQL.
+    """Open SSH tunnel via ssh key (preferred) or sshpass fallback → remote PostgreSQL.
     Yields a psycopg3 connection."""
     ssh_host = _get_env("MGP_SSH_HOST", "")
     if not ssh_host:
@@ -69,6 +69,7 @@ def remote_pg_connection():
     ssh_port = _get_env("MGP_SSH_PORT", "22")
     ssh_user = _get_env("MGP_SSH_USER", "root")
     ssh_pass = _get_env("MGP_SSH_PASSWORD", "")
+    ssh_key = _get_env("MGP_SSH_KEY_PATH", "/tmp/sync_key")
     remote_pg_port = _get_env("MGP_PG_PORT", "5432")
     pg_user = _get_env("MGP_PG_USER", "mgp")
     pg_pass = _get_env("MGP_PG_PASSWORD", "mgp")
@@ -76,18 +77,33 @@ def remote_pg_connection():
 
     local_port = _find_free_port()
 
-    cmd = [
-        "sshpass", "-p", ssh_pass,
-        "ssh",
-        "-o", "StrictHostKeyChecking=no",
-        "-o", "ConnectTimeout=10",
-        "-o", "ServerAliveInterval=15",
-        "-o", "ServerAliveCountMax=3",
-        "-N",
-        "-L", f"{local_port}:127.0.0.1:{remote_pg_port}",
-        "-p", ssh_port,
-        f"{ssh_user}@{ssh_host}",
-    ]
+    use_key = os.path.isfile(ssh_key)
+    if use_key:
+        cmd = [
+            "ssh",
+            "-i", ssh_key,
+            "-o", "StrictHostKeyChecking=accept-new",
+            "-o", "ConnectTimeout=10",
+            "-o", "ServerAliveInterval=15",
+            "-o", "ServerAliveCountMax=3",
+            "-N",
+            "-L", f"{local_port}:127.0.0.1:{remote_pg_port}",
+            "-p", ssh_port,
+            f"{ssh_user}@{ssh_host}",
+        ]
+    else:
+        cmd = [
+            "sshpass", "-p", ssh_pass,
+            "ssh",
+            "-o", "StrictHostKeyChecking=accept-new",
+            "-o", "ConnectTimeout=10",
+            "-o", "ServerAliveInterval=15",
+            "-o", "ServerAliveCountMax=3",
+            "-N",
+            "-L", f"{local_port}:127.0.0.1:{remote_pg_port}",
+            "-p", ssh_port,
+            f"{ssh_user}@{ssh_host}",
+        ]
     tunnel_proc = subprocess.Popen(
         cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
     )
