@@ -1,21 +1,33 @@
-import { useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
+import { createPortal } from 'react-dom';
 import { X, MapPin, Star, Utensils, Calendar, Moon, Plane, Users, DollarSign } from 'lucide-react';
 
 export default function TourCardModal({ card, onClose }) {
+  const [visible, setVisible] = useState(false);
+  const closingRef = useRef(false);
   const stars = card.hotel_stars || card.stars || 0;
 
-  const handleKeyDown = useCallback((e) => {
-    if (e.key === 'Escape') onClose();
+  const handleClose = useCallback(() => {
+    if (closingRef.current) return;
+    closingRef.current = true;
+    setVisible(false);
+    document.body.style.overflow = '';
+    setTimeout(() => {
+      closingRef.current = false;
+      onClose();
+    }, 300);
   }, [onClose]);
 
   useEffect(() => {
-    document.addEventListener('keydown', handleKeyDown);
+    requestAnimationFrame(() => requestAnimationFrame(() => setVisible(true)));
     document.body.style.overflow = 'hidden';
+    const handler = (e) => { if (e.key === 'Escape') handleClose(); };
+    window.addEventListener('keydown', handler);
     return () => {
-      document.removeEventListener('keydown', handleKeyDown);
+      window.removeEventListener('keydown', handler);
       document.body.style.overflow = '';
     };
-  }, [handleKeyDown]);
+  }, [handleClose]);
 
   const details = [
     card.country && { icon: MapPin, label: 'Страна', value: card.country },
@@ -29,17 +41,19 @@ export default function TourCardModal({ card, onClose }) {
     card.room && { icon: DollarSign, label: 'Номер', value: card.room },
   ].filter(Boolean);
 
-  return (
+  const handleBackdrop = (e) => { if (e.target === e.currentTarget) handleClose(); };
+
+  return createPortal(
     <div
-      className="fixed inset-0 z-50 flex items-center justify-center p-4 animate-fade-in"
-      onClick={onClose}
+      className={`fixed inset-0 z-50 flex items-center justify-center p-4 transition-all duration-300 ease-out ${visible ? 'bg-black/40 backdrop-blur-sm' : 'bg-transparent backdrop-blur-0'}`}
+      onClick={handleBackdrop}
     >
-      <div className="absolute inset-0 bg-black/40 backdrop-blur-sm" />
       <div
-        className="relative bg-white rounded-2xl shadow-lg max-w-lg w-full overflow-hidden animate-slide-in"
-        onClick={(e) => e.stopPropagation()}
+        role="dialog"
+        aria-modal="true"
+        aria-label={card.hotel_name || 'Карточка тура'}
+        className={`relative bg-white rounded-2xl shadow-lg max-w-lg w-full overflow-hidden transition-all duration-300 ease-out ${visible ? 'scale-100 opacity-100 translate-y-0' : 'scale-95 opacity-0 translate-y-4'}`}
       >
-        {/* Header image */}
         {card.hotel_image && (
           <div className="relative h-48 bg-surface-sunken">
             <img
@@ -50,7 +64,7 @@ export default function TourCardModal({ card, onClose }) {
             />
             <div className="absolute inset-0 bg-gradient-to-t from-black/50 to-transparent" />
             <button
-              onClick={onClose}
+              onClick={handleClose}
               className="absolute top-3 right-3 w-8 h-8 rounded-full bg-white/90 backdrop-blur flex items-center justify-center text-text hover:bg-white transition-colors shadow-sm"
             >
               <X size={16} />
@@ -83,7 +97,7 @@ export default function TourCardModal({ card, onClose }) {
               )}
             </div>
             <button
-              onClick={onClose}
+              onClick={handleClose}
               className="w-8 h-8 rounded-full bg-surface-sunken flex items-center justify-center text-text-secondary hover:text-text transition-colors"
             >
               <X size={16} />
@@ -91,7 +105,6 @@ export default function TourCardModal({ card, onClose }) {
           </div>
         )}
 
-        {/* Price highlight */}
         {card.price && (
           <div className="px-5 py-3 bg-primary-50 border-y border-primary/10 flex items-center justify-between">
             <span className="text-xs text-text-secondary">Стоимость тура</span>
@@ -101,7 +114,6 @@ export default function TourCardModal({ card, onClose }) {
           </div>
         )}
 
-        {/* Details grid */}
         <div className="p-5">
           <div className="grid grid-cols-2 gap-3">
             {details.map((item, i) => (
@@ -116,13 +128,14 @@ export default function TourCardModal({ card, onClose }) {
           </div>
 
           <button
-            onClick={onClose}
+            onClick={handleClose}
             className="w-full mt-4 py-2.5 text-sm font-medium text-text-secondary bg-surface-sunken rounded-xl hover:bg-surface hover:text-text transition-colors"
           >
             Закрыть
           </button>
         </div>
       </div>
-    </div>
+    </div>,
+    document.body,
   );
 }

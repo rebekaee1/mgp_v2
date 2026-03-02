@@ -17,7 +17,7 @@ import {
 import api from '../lib/api';
 import { COUNTRY_NAMES, DEPARTURE_NAMES, MEAL_NAMES, STARS_LABELS, formatShortDate } from '../lib/constants';
 import {
-  MessageSquare, Clock, Globe, MapPin, Timer,
+  MessageSquare, Clock, Globe, MapPin, BookmarkCheck,
   Moon, Users, Building2, Calendar, Download, TrendingUp,
   Wallet, Plane, UserCheck, X,
 } from 'lucide-react';
@@ -94,7 +94,7 @@ function DetailModal({ open, onClose, title, data, nameKey, valueKey }) {
       className={`fixed inset-0 z-[9999] flex items-center justify-center p-4 transition-all duration-300 ease-out ${visible ? 'bg-black/40 backdrop-blur-sm' : 'bg-transparent backdrop-blur-0'}`}
       onClick={handleBackdrop}
     >
-      <div className={`bg-white rounded-3xl shadow-2xl w-full max-w-5xl max-h-[90vh] overflow-hidden transition-all duration-300 ease-out ${visible ? 'scale-100 opacity-100 translate-y-0' : 'scale-95 opacity-0 translate-y-4'}`}>
+      <div role="dialog" aria-modal="true" aria-label={title} className={`bg-white rounded-3xl shadow-2xl w-full max-w-5xl max-h-[90vh] overflow-hidden transition-all duration-300 ease-out ${visible ? 'scale-100 opacity-100 translate-y-0' : 'scale-95 opacity-0 translate-y-4'}`}>
         <div className="flex items-center justify-between px-8 py-5 border-b border-border/30">
           <div>
             <h2 className="text-lg font-bold text-text">{title}</h2>
@@ -288,7 +288,7 @@ function HeatmapGrid({ heatmap, dayNames }) {
 
   return (
     <div className="overflow-x-auto">
-      <div className="min-w-[600px] relative">
+      <div className="min-w-[600px]">
         <div className="flex gap-0.5 mb-1 ml-8">
           {hours.map((h) => (
             <div key={h} className="flex-1 text-center text-[9px] text-text-secondary">
@@ -304,14 +304,13 @@ function HeatmapGrid({ heatmap, dayNames }) {
               return (
                 <div
                   key={h}
-                  className="flex-1 h-5 rounded-sm transition-colors cursor-default"
+                  className="flex-1 h-5 rounded-sm transition-all cursor-default hover:ring-2 hover:ring-primary/40 hover:z-10 hover:scale-110"
                   style={{ backgroundColor: getColor(count) }}
                   onMouseEnter={(e) => {
                     const rect = e.currentTarget.getBoundingClientRect();
-                    const parent = e.currentTarget.closest('.min-w-\\[600px\\]').getBoundingClientRect();
                     setTip({
-                      x: rect.left - parent.left + rect.width / 2,
-                      y: rect.top - parent.top,
+                      x: rect.left + rect.width / 2,
+                      y: rect.top - 8,
                       day, hour: h, count,
                     });
                   }}
@@ -322,19 +321,20 @@ function HeatmapGrid({ heatmap, dayNames }) {
           </div>
         ))}
 
-        {tip && (
+        {tip && createPortal(
           <div
-            className="absolute z-50 pointer-events-none animate-fade-in"
-            style={{ left: tip.x, top: tip.y - 8, transform: 'translate(-50%, -100%)' }}
+            className="fixed z-[9999] pointer-events-none animate-fade-in"
+            style={{ left: tip.x, top: tip.y, transform: 'translate(-50%, -100%)' }}
           >
-            <div className="bg-text text-white rounded-xl px-3 py-2 shadow-lg text-center whitespace-nowrap">
-              <p className="text-[11px] font-semibold">{tip.day}, {tip.hour}:00</p>
-              <p className="text-[12px] font-bold">{tip.count} {pluralize(tip.count)}</p>
+            <div className="flex flex-col items-center">
+              <div className="bg-[#1E293B] text-white rounded-xl px-3 py-2 shadow-lg text-center whitespace-nowrap">
+                <p className="text-[11px] font-semibold">{tip.day}, {tip.hour}:00</p>
+                <p className="text-[12px] font-bold">{tip.count} {pluralize(tip.count)}</p>
+              </div>
+              <div className="w-0 h-0 border-l-[5px] border-r-[5px] border-t-[5px] border-l-transparent border-r-transparent border-t-[#1E293B]" />
             </div>
-            <div className="flex justify-center">
-              <div className="w-0 h-0 border-l-[5px] border-r-[5px] border-t-[5px] border-l-transparent border-r-transparent border-t-text" />
-            </div>
-          </div>
+          </div>,
+          document.body,
         )}
 
         <div className="flex items-center justify-end gap-1 mt-2">
@@ -404,48 +404,67 @@ function OperatorsChart({ data }) {
   );
 }
 
-function CombinationGrid({ combos }) {
-  if (!combos?.length) return <EmptyState title="Нет данных" description="" />;
+const ALL_STARS = [5, 4, 3, 2];
+const ALL_MEALS = [1, 2, 3, 4, 5, 6, 7, 8, 9];
+const MEAL_SHORT = { 1: 'RO', 2: 'BB', 3: 'HB', 4: 'FB', 5: 'AI', 6: 'UAI', 7: 'HB+', 8: 'FB+', 9: 'AI+' };
 
-  const starsSet = [...new Set(combos.map((c) => c.stars))].sort((a, b) => b - a);
-  const mealSet = [...new Set(combos.map((c) => c.meal))].sort((a, b) => a - b);
-  const maxVal = Math.max(...combos.map((c) => c.count), 1);
+function CombinationGrid({ combos }) {
+  const [tip, setTip] = useState(null);
 
   const lookup = {};
-  for (const c of combos) lookup[`${c.stars}-${c.meal}`] = c.count;
+  let maxVal = 1;
+  if (combos?.length) {
+    for (const c of combos) {
+      lookup[`${c.stars}-${c.meal}`] = c.count;
+      if (c.count > maxVal) maxVal = c.count;
+    }
+  }
 
   const getOpacity = (v) => {
     if (!v) return 0;
     return 0.15 + (v / maxVal) * 0.85;
   };
 
+  const pluralize = (n) => {
+    const mod = n % 10;
+    const mod100 = n % 100;
+    if (mod === 1 && mod100 !== 11) return 'запрос';
+    if (mod >= 2 && mod <= 4 && (mod100 < 12 || mod100 > 14)) return 'запроса';
+    return 'запросов';
+  };
+
   return (
-    <div className="overflow-x-auto">
+    <div className="overflow-x-auto relative">
       <table className="w-full text-xs">
         <thead>
           <tr>
             <th className="text-left text-text-secondary font-medium pb-2 pr-2"></th>
-            {mealSet.map((m) => (
-              <th key={m} className="text-center text-text-secondary font-medium pb-2 px-1 whitespace-nowrap">
-                {MEAL_NAMES[m] ? MEAL_NAMES[m].split(' ')[0] : `#${m}`}
+            {ALL_MEALS.map((m) => (
+              <th key={m} className="text-center text-text-secondary font-medium pb-2 px-0.5 whitespace-nowrap text-[10px]">
+                {MEAL_SHORT[m]}
               </th>
             ))}
           </tr>
         </thead>
         <tbody>
-          {starsSet.map((s) => (
+          {ALL_STARS.map((s) => (
             <tr key={s}>
-              <td className="text-text font-medium pr-2 py-1">{STARS_LABELS[s] || `${s}★`}</td>
-              {mealSet.map((m) => {
+              <td className="text-text font-medium pr-2 py-1 whitespace-nowrap">{STARS_LABELS[s] || `${s}★`}</td>
+              {ALL_MEALS.map((m) => {
                 const val = lookup[`${s}-${m}`] || 0;
                 return (
-                  <td key={m} className="text-center py-1 px-1">
+                  <td key={m} className="text-center py-1 px-0.5">
                     <div
-                      className="rounded-md px-2 py-1 font-semibold text-xs"
+                      className="rounded-md px-1.5 py-1 font-semibold text-xs cursor-default transition-all hover:ring-2 hover:ring-primary/40 hover:scale-105"
                       style={{
                         backgroundColor: val ? `rgba(0, 56, 255, ${getOpacity(val)})` : '#F1F5F9',
                         color: val && val / maxVal > 0.5 ? '#fff' : val ? '#0038FF' : '#94A3B8',
                       }}
+                      onMouseEnter={(e) => {
+                        const rect = e.currentTarget.getBoundingClientRect();
+                        setTip({ x: rect.left + rect.width / 2, y: rect.top - 8, stars: s, meal: m, count: val });
+                      }}
+                      onMouseLeave={() => setTip(null)}
                     >
                       {val || '—'}
                     </div>
@@ -456,6 +475,22 @@ function CombinationGrid({ combos }) {
           ))}
         </tbody>
       </table>
+
+      {tip && createPortal(
+        <div
+          className="fixed z-[9999] pointer-events-none animate-fade-in"
+          style={{ left: tip.x, top: tip.y, transform: 'translate(-50%, -100%)' }}
+        >
+          <div className="flex flex-col items-center">
+            <div className="bg-[#1E293B] text-white rounded-xl px-3 py-2 shadow-lg text-center whitespace-nowrap">
+              <p className="text-[11px] font-semibold">{STARS_LABELS[tip.stars]} × {MEAL_SHORT[tip.meal]} ({MEAL_NAMES[tip.meal]?.split('(')[0]?.trim()})</p>
+              <p className="text-[12px] font-bold">{tip.count ? `${tip.count} ${pluralize(tip.count)}` : 'Нет запросов'}</p>
+            </div>
+            <div className="w-0 h-0 border-l-[5px] border-r-[5px] border-t-[5px] border-l-transparent border-r-transparent border-t-[#1E293B]" />
+          </div>
+        </div>,
+        document.body,
+      )}
     </div>
   );
 }
@@ -584,19 +619,24 @@ export default function Analytics() {
   const nightsData = demandData?.nights_distribution || [];
   const groupData = demandData?.group_sizes || [];
 
+  const mskHour = new Date(new Date().toLocaleString('en-US', { timeZone: 'Europe/Moscow' })).getHours();
+  const updateLabel = mskHour >= 19 ? 'сегодня в 19:00' : mskHour >= 12 ? 'сегодня в 12:00' : 'вчера в 19:00';
+
   const topInsights = useMemo(() => {
     const items = [];
     if (destinations.length > 0) {
       items.push(`Топ-направление: ${destinations[0].name} (${destinations[0].value} поисков)`);
     }
-    if (operatorsData?.operators?.length > 0) {
-      items.push(`Лидер среди операторов: ${operatorsData.operators[0].operator} (${operatorsData.operators[0].share}%)`);
+    if (typesData?.avg_budget) {
+      items.push(`Средний бюджет: ${new Intl.NumberFormat('ru-RU').format(typesData.avg_budget)} ₽`);
     }
-    if (typesData?.avg_nights_from) {
-      items.push(`Средняя длительность: ${Math.round(typesData.avg_nights_from)}—${Math.round(typesData.avg_nights_to)} ночей`);
+    if (typesData?.avg_nights) {
+      const n = typesData.avg_nights;
+      const word = n % 10 === 1 && n !== 11 ? 'ночь' : (n % 10 >= 2 && n % 10 <= 4 && (n < 10 || n > 20)) ? 'ночи' : 'ночей';
+      items.push(`Средняя длительность: ${n} ${word}`);
     }
     return items;
-  }, [destinations, operatorsData, typesData]);
+  }, [destinations, typesData]);
 
   return (
     <div className="space-y-6">
@@ -655,17 +695,12 @@ export default function Analytics() {
         </div>
         <div className="animate-fade-in-up stagger-5 h-full">
           <MetricCard
-            title="Ср. длительность диалога"
-            tooltip="Среднее время диалога клиента с ассистентом — от первого до последнего сообщения. Считается по реальным timestamp'ам сообщений"
-            value={(() => {
-              const s = bizData?.avg_duration_seconds;
-              if (s == null) return '—';
-              if (s === 0) return '< 1 мин';
-              if (s < 60) return `${s} сек`;
-              if (s < 3600) return `${Math.round(s / 60)} мин`;
-              return `${Math.round(s / 3600 * 10) / 10} ч`;
-            })()}
-            icon={Timer}
+            title="Запросы на бронь"
+            tooltip="Количество диалогов, в которых клиент проявил интерес к бронированию тура — запрос контакта менеджера, подтверждение выбора или прямой запрос на оформление"
+            value={bizData?.booking_intents ?? '—'}
+            icon={BookmarkCheck}
+            valueColor={bizData?.booking_intents > 0 ? 'text-success' : undefined}
+            subtitle={bizData?.booking_intent_pct ? `${bizData.booking_intent_pct}% от обращений` : undefined}
           />
         </div>
         <div className="animate-fade-in-up stagger-6 h-full">
@@ -683,9 +718,12 @@ export default function Analytics() {
       {/* Quick insights */}
       {topInsights.length > 0 && (
         <div className="bg-white rounded-2xl shadow-sm p-4 animate-fade-in-up stagger-4">
-          <div className="flex items-center gap-2 mb-2">
-            <TrendingUp size={14} className="text-primary" />
-            <span className="text-xs font-semibold text-text">Ключевые выводы:</span>
+          <div className="flex items-center justify-between mb-2">
+            <div className="flex items-center gap-2">
+              <TrendingUp size={14} className="text-primary" />
+              <span className="text-xs font-semibold text-text">Ключевые выводы:</span>
+            </div>
+            <span className="text-[10px] text-text-secondary">Обновлено: {updateLabel}</span>
           </div>
           <div className="flex flex-wrap gap-2">
             {topInsights.map((t, i) => (
@@ -789,9 +827,9 @@ export default function Analytics() {
           {searchTypes.length ? (
             <div>
               <SimplePie data={searchTypes} nameKey="name" valueKey="value" />
-              {typesData?.avg_nights_from && (
+              {typesData?.avg_nights && (
                 <p className="text-xs text-text-secondary text-center mt-2">
-                  Средние ночи: {Math.round(typesData.avg_nights_from)}—{Math.round(typesData.avg_nights_to)}
+                  Средняя длительность: {typesData.avg_nights} {typesData.avg_nights % 10 === 1 && typesData.avg_nights !== 11 ? 'ночь' : (typesData.avg_nights % 10 >= 2 && typesData.avg_nights % 10 <= 4 && (typesData.avg_nights < 10 || typesData.avg_nights > 20)) ? 'ночи' : 'ночей'}
                 </p>
               )}
             </div>

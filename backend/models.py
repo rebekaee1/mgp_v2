@@ -9,13 +9,13 @@ from datetime import datetime, timezone
 from typing import Optional, List
 
 from sqlalchemy import (
-    BigInteger, Boolean, DateTime, Index, Integer, JSON, String, Text,
+    BigInteger, Boolean, DateTime, Index, Integer, String, Text,
     ForeignKey, Uuid,
 )
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 UUID = Uuid
-JSONB = JSON
 
 from database import Base
 
@@ -131,6 +131,9 @@ class Conversation(Base):
     message_count: Mapped[int] = mapped_column(Integer, default=0)
     search_count: Mapped[int] = mapped_column(Integer, default=0)
     tour_cards_shown: Mapped[int] = mapped_column(Integer, default=0)
+    has_booking_intent: Mapped[bool] = mapped_column(
+        Boolean, default=False, nullable=False, server_default="0"
+    )
     status: Mapped[str] = mapped_column(String(16), default="active")
     started_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow

@@ -7,16 +7,39 @@ export default function SearchModal({ open, onClose }) {
   const [query, setQuery] = useState('');
   const [results, setResults] = useState([]);
   const [loading, setLoading] = useState(false);
+  const [mounted, setMounted] = useState(false);
+  const [visible, setVisible] = useState(false);
+  const closingRef = useRef(false);
   const inputRef = useRef(null);
   const navigate = useNavigate();
+
+  const handleClose = useCallback(() => {
+    if (closingRef.current) return;
+    closingRef.current = true;
+    setVisible(false);
+    setTimeout(() => {
+      setMounted(false);
+      closingRef.current = false;
+      onClose();
+    }, 250);
+  }, [onClose]);
 
   useEffect(() => {
     if (open) {
       setQuery('');
       setResults([]);
+      setMounted(true);
+      requestAnimationFrame(() => requestAnimationFrame(() => setVisible(true)));
       setTimeout(() => inputRef.current?.focus(), 100);
     }
   }, [open]);
+
+  useEffect(() => {
+    if (!mounted) return;
+    const handler = (e) => { if (e.key === 'Escape') handleClose(); };
+    window.addEventListener('keydown', handler);
+    return () => window.removeEventListener('keydown', handler);
+  }, [mounted, handleClose]);
 
   const search = useCallback(async (q) => {
     if (!q || q.length < 2) {
@@ -42,25 +65,22 @@ export default function SearchModal({ open, onClose }) {
   }, [query, search]);
 
   const handleSelect = (conv) => {
-    onClose();
-    navigate(`/conversations/${conv.id}`);
+    handleClose();
+    setTimeout(() => navigate(`/conversations/${conv.id}`), 260);
   };
 
-  useEffect(() => {
-    const handleKey = (e) => {
-      if (e.key === 'Escape') onClose();
-    };
-    if (open) window.addEventListener('keydown', handleKey);
-    return () => window.removeEventListener('keydown', handleKey);
-  }, [open, onClose]);
-
-  if (!open) return null;
+  if (!mounted) return null;
 
   return (
-    <div className="fixed inset-0 z-[100] flex items-start justify-center pt-[15vh]" onClick={onClose}>
-      <div className="absolute inset-0 bg-text/20 backdrop-blur-sm" />
+    <div
+      className={`fixed inset-0 z-[100] flex items-start justify-center pt-[15vh] transition-all duration-250 ease-out ${visible ? 'bg-text/20 backdrop-blur-sm' : 'bg-transparent backdrop-blur-0'}`}
+      onClick={handleClose}
+    >
       <div
-        className="relative w-full max-w-lg bg-white rounded-2xl shadow-lg overflow-hidden animate-fade-in-up"
+        role="dialog"
+        aria-modal="true"
+        aria-label="Поиск по диалогам"
+        className={`relative w-full max-w-lg bg-white rounded-2xl shadow-lg overflow-hidden transition-all duration-250 ease-out ${visible ? 'scale-100 opacity-100 translate-y-0' : 'scale-95 opacity-0 -translate-y-4'}`}
         onClick={(e) => e.stopPropagation()}
       >
         <div className="flex items-center gap-3 px-4 py-3 border-b border-border">
@@ -73,7 +93,7 @@ export default function SearchModal({ open, onClose }) {
             className="flex-1 text-sm bg-transparent outline-none placeholder:text-text-secondary/60"
           />
           <kbd className="hidden sm:flex items-center text-[10px] text-text-secondary bg-surface-sunken px-1.5 py-0.5 rounded font-mono">ESC</kbd>
-          <button onClick={onClose} className="text-text-secondary hover:text-text transition-colors sm:hidden">
+          <button onClick={handleClose} className="text-text-secondary hover:text-text transition-colors sm:hidden">
             <X size={18} />
           </button>
         </div>

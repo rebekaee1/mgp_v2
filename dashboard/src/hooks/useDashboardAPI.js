@@ -1,25 +1,42 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
 import api from '../lib/api';
 
 export function useFetch(url, params = {}, deps = []) {
   const [data, setData] = useState(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
+  const abortRef = useRef(null);
+  const reqIdRef = useRef(0);
 
   const fetch = useCallback(async () => {
+    if (abortRef.current) abortRef.current.abort();
+    const controller = new AbortController();
+    abortRef.current = controller;
+    const id = ++reqIdRef.current;
+
     setLoading(true);
     setError(null);
     try {
-      const { data: res } = await api.get(url, { params });
-      setData(res);
+      const { data: res } = await api.get(url, { params, signal: controller.signal });
+      if (reqIdRef.current === id) {
+        setData(res);
+      }
     } catch (err) {
-      setError(err.response?.data?.error || err.message);
+      if (err?.name === 'CanceledError' || err?.code === 'ERR_CANCELED') return;
+      if (reqIdRef.current === id) {
+        setError(err.response?.data?.error || err.message);
+      }
     } finally {
-      setLoading(false);
+      if (reqIdRef.current === id) {
+        setLoading(false);
+      }
     }
   }, [url, JSON.stringify(params), ...deps]);
 
-  useEffect(() => { fetch(); }, [fetch]);
+  useEffect(() => {
+    fetch();
+    return () => { if (abortRef.current) abortRef.current.abort(); };
+  }, [fetch]);
 
   return { data, loading, error, refetch: fetch };
 }
@@ -36,14 +53,15 @@ export function useRecentConversations(limit = 5) {
   return useFetch('/dashboard/overview/recent', { limit }, [limit]);
 }
 
-export function useConversations(page, perPage, period, hasSearch, searchQuery, sortBy, sortDir) {
+export function useConversations(page, perPage, period, searchQuery, sortBy, sortDir, hasBooking, hasCards) {
   const params = { page, per_page: perPage };
   if (period !== 'all') params.period = period;
-  if (hasSearch !== undefined) params.has_search = hasSearch;
+  if (hasCards !== undefined) params.has_cards = hasCards;
+  if (hasBooking !== undefined) params.has_booking = hasBooking;
   if (searchQuery) params.search = searchQuery;
   if (sortBy) params.sort_by = sortBy;
   if (sortDir) params.sort_dir = sortDir;
-  return useFetch('/dashboard/conversations', params, [page, perPage, period, hasSearch, searchQuery, sortBy, sortDir]);
+  return useFetch('/dashboard/conversations', params, [page, perPage, period, searchQuery, sortBy, sortDir, hasBooking, hasCards]);
 }
 
 export function useConversationDetail(id) {

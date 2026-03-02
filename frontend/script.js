@@ -13,12 +13,16 @@
     const _scriptTag = document.currentScript || document.querySelector('script[data-assistant-id]');
     const _assistantId = _scriptTag ? _scriptTag.getAttribute('data-assistant-id') : null;
 
+    const _baseUrl = (window.location.port === '5555' || window.location.protocol === 'file:')
+        ? 'http://127.0.0.1:8080'
+        : window.location.origin;
+
     const CONFIG = {
-        apiUrl: (window.location.port === '5555' || window.location.protocol === 'file:')
-            ? 'http://127.0.0.1:8080/api/v1/chat' 
-            : window.location.origin + '/api/v1/chat',
+        apiUrl: _baseUrl + '/api/v1/chat',
+        configUrl: _baseUrl + '/api/widget/config',
         assistantId: _assistantId,
         botName: 'MGP AI',
+        botLogoUrl: null,
         typingDelay: 500,
         messageDelay: 100,
         maxVisibleCards: 3,
@@ -175,6 +179,89 @@
     }
 
     // ============================================
+    // DYNAMIC CONFIG
+    // ============================================
+
+    function darkenColor(hex, amount) {
+        hex = hex.replace('#', '');
+        const clamp = v => Math.max(0, Math.min(255, v));
+        const r = clamp(parseInt(hex.substring(0, 2), 16) - amount);
+        const g = clamp(parseInt(hex.substring(2, 4), 16) - amount);
+        const b = clamp(parseInt(hex.substring(4, 6), 16) - amount);
+        return '#' + [r, g, b].map(c => c.toString(16).padStart(2, '0')).join('');
+    }
+
+    function botAvatarHTML() {
+        if (CONFIG.botLogoUrl) {
+            return `<img src="${CONFIG.botLogoUrl}" alt="bot" style="width:100%;height:100%;object-fit:cover;border-radius:50%;">`;
+        }
+        return `<svg viewBox="0 0 24 24" fill="currentColor">
+            <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-1 17.93c-3.95-.49-7-3.85-7-7.93 0-.62.08-1.21.21-1.79L9 15v1c0 1.1.9 2 2 2v1.93zm6.9-2.54c-.26-.81-1-1.39-1.9-1.39h-1v-3c0-.55-.45-1-1-1H8v-2h2c.55 0 1-.45 1-1V7h2c1.1 0 2-.9 2-2v-.41c2.93 1.19 5 4.06 5 7.41 0 2.08-.8 3.97-2.1 5.39z"/>
+           </svg>`;
+    }
+
+    async function loadConfig() {
+        try {
+            const params = CONFIG.assistantId ? `?assistant_id=${CONFIG.assistantId}` : '';
+            const resp = await fetch(CONFIG.configUrl + params);
+            if (!resp.ok) return;
+            const cfg = await resp.json();
+            applyConfig(cfg);
+        } catch (e) {
+            console.warn('Widget config load failed, using defaults:', e);
+        }
+    }
+
+    function applyConfig(cfg) {
+        const root = document.documentElement;
+
+        if (cfg.primary_color) {
+            root.style.setProperty('--mgp-red', cfg.primary_color);
+            root.style.setProperty('--mgp-red-dark', darkenColor(cfg.primary_color, 30));
+            root.style.setProperty('--mgp-red-light', darkenColor(cfg.primary_color, -30));
+        }
+
+        if (cfg.title) {
+            const mainEl = document.querySelector('.chat-title-main');
+            if (mainEl) mainEl.textContent = cfg.title;
+        }
+        if (cfg.subtitle) {
+            const subEl = document.querySelector('.chat-title-sub');
+            if (subEl) subEl.textContent = cfg.subtitle;
+        }
+
+        if (cfg.logo_url) {
+            CONFIG.botLogoUrl = cfg.logo_url;
+            const logoContainer = document.querySelector('.chat-logo');
+            if (logoContainer) {
+                logoContainer.innerHTML = `<img src="${cfg.logo_url}" alt="logo" style="width:100%;height:100%;object-fit:cover;border-radius:50%;">`;
+            }
+        }
+
+        if (cfg.welcome_message) {
+            const welcomeBubble = document.querySelector('#chatMessages .message:first-child .message-bubble');
+            if (welcomeBubble) {
+                welcomeBubble.innerHTML = parseFormatting(escapeHtml(cfg.welcome_message));
+            }
+            const welcomeAvatar = document.querySelector('#chatMessages .message:first-child .message-avatar');
+            if (welcomeAvatar && CONFIG.botLogoUrl) {
+                welcomeAvatar.innerHTML = botAvatarHTML();
+            }
+        }
+
+        if (cfg.position === 'bottom-left') {
+            if (elements.launcher) {
+                elements.launcher.style.right = 'auto';
+                elements.launcher.style.left = '24px';
+            }
+            if (elements.widget) {
+                elements.widget.style.right = 'auto';
+                elements.widget.style.left = '24px';
+            }
+        }
+    }
+
+    // ============================================
     // CHAT TOGGLE
     // ============================================
     
@@ -223,10 +310,8 @@
         const isBot = role === 'bot' || role === 'assistant';
         const messageClass = isBot ? 'bot-message' : 'user-message';
         
-        const avatarSvg = isBot 
-            ? `<svg viewBox="0 0 24 24" fill="currentColor">
-                <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-1 17.93c-3.95-.49-7-3.85-7-7.93 0-.62.08-1.21.21-1.79L9 15v1c0 1.1.9 2 2 2v1.93zm6.9-2.54c-.26-.81-1-1.39-1.9-1.39h-1v-3c0-.55-.45-1-1-1H8v-2h2c.55 0 1-.45 1-1V7h2c1.1 0 2-.9 2-2v-.41c2.93 1.19 5 4.06 5 7.41 0 2.08-.8 3.97-2.1 5.39z"/>
-               </svg>`
+        const avatarInner = isBot 
+            ? botAvatarHTML()
             : `<svg viewBox="0 0 24 24" fill="currentColor">
                 <path d="M12 12c2.21 0 4-1.79 4-4s-1.79-4-4-4-4 1.79-4 4 1.79 4 4 4zm0 2c-2.67 0-8 1.34-8 4v2h16v-2c0-2.66-5.33-4-8-4z"/>
                </svg>`;
@@ -237,7 +322,7 @@
 
         return `
             <div class="message ${messageClass}">
-                <div class="message-avatar">${avatarSvg}</div>
+                <div class="message-avatar">${avatarInner}</div>
                 <div class="message-content">
                     <div class="message-bubble">${formattedContent}</div>
                 </div>
@@ -459,9 +544,7 @@
         const containerHtml = `
             <div class="message bot-message">
                 <div class="message-avatar">
-                    <svg viewBox="0 0 24 24" fill="currentColor">
-                        <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-1 17.93c-3.95-.49-7-3.85-7-7.93 0-.62.08-1.21.21-1.79L9 15v1c0 1.1.9 2 2 2v1.93zm6.9-2.54c-.26-.81-1-1.39-1.9-1.39h-1v-3c0-.55-.45-1-1-1H8v-2h2c.55 0 1-.45 1-1V7h2c1.1 0 2-.9 2-2v-.41c2.93 1.19 5 4.06 5 7.41 0 2.08-.8 3.97-2.1 5.39z"/>
-                    </svg>
+                    ${botAvatarHTML()}
                 </div>
                 <div class="message-content">
                     <div class="tour-cards-container" id="tourCardsContainer-${setId}">
@@ -704,9 +787,7 @@
         const html = `
             <div class="message bot-message">
                 <div class="message-avatar">
-                    <svg viewBox="0 0 24 24" fill="currentColor">
-                        <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-1 17.93c-3.95-.49-7-3.85-7-7.93 0-.62.08-1.21.21-1.79L9 15v1c0 1.1.9 2 2 2v1.93zm6.9-2.54c-.26-.81-1-1.39-1.9-1.39h-1v-3c0-.55-.45-1-1-1H8v-2h2c.55 0 1-.45 1-1V7h2c1.1 0 2-.9 2-2v-.41c2.93 1.19 5 4.06 5 7.41 0 2.08-.8 3.97-2.1 5.39z"/>
-                    </svg>
+                    ${botAvatarHTML()}
                 </div>
                 <div class="message-content">
                     <div class="message-bubble">
@@ -810,6 +891,8 @@
         });
 
         conversationId = generateUUID();
+
+        loadConfig();
 
         console.log('MGP Chat Widget initialized');
     }

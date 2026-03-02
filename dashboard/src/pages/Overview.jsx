@@ -1,6 +1,6 @@
 import { useState, useMemo } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { MessageSquare, Search, Clock, MessagesSquare, ArrowRight, TrendingUp, Zap, Users } from 'lucide-react';
+import { MessageSquare, Search, Clock, MessagesSquare, ArrowRight, TrendingUp, Zap, Users, BookmarkCheck } from 'lucide-react';
 import { LineChart, Line, AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from 'recharts';
 import MetricCard, { CardSkeleton } from '../components/ui/MetricCard';
 import EmptyState from '../components/ui/EmptyState';
@@ -24,6 +24,7 @@ function ConversionFunnel({ funnel }) {
     { label: 'Вовлечённые (2+ сообщ.)', value: funnel?.engaged || 0, color: 'bg-[#1A4FFF]' },
     { label: 'С поиском туров', value: funnel?.with_search || 0, color: 'bg-[#3B82F6]' },
     { label: 'С результатами', value: funnel?.with_results || 0, color: 'bg-[#60A5FA]' },
+    { label: 'Запросы на бронь', value: funnel?.booking_intent || 0, color: 'bg-success' },
     { label: 'Потенциальные лиды', value: funnel?.potential_leads || 0, color: 'bg-[#93C5FD]' },
   ];
   const max = Math.max(...steps.map((s) => s.value), 1);
@@ -66,37 +67,26 @@ function ConversionFunnel({ funnel }) {
   );
 }
 
-function InsightCard({ insights, funnel }) {
+function InsightCard({ insights, funnel, avgResponseMs }) {
   const items = useMemo(() => {
-    if (!insights && !funnel) return [];
-    const list = [];
-    if (funnel?.engaged > 0 && funnel?.total > 0) {
-      const pct = Math.round((funnel.engaged / funnel.total) * 100);
-      list.push(`${pct}% посетителей вовлекаются в диалог — отправляют 2 и более сообщений`);
-    }
-    if (funnel?.with_search > 0 && funnel?.total > 0) {
-      const pct = Math.round((funnel.with_search / funnel.total) * 100);
-      list.push(`${pct}% диалогов содержат поиск туров`);
-    }
-    if (insights?.after_hours_pct > 0) {
-      list.push(`${Math.round(insights.after_hours_pct)}% диалогов проходят вне рабочего времени (до 9:00 и после 18:00)`);
-    }
-    if (insights?.avg_duration_minutes > 0) {
-      const mins = insights.avg_duration_minutes;
-      const durationText = mins < 1
-        ? `${Math.round(mins * 60)} секунд`
-        : mins < 2
-        ? `около 1 минуты`
-        : `${Math.round(mins)} минут`;
-      list.push(`Средняя длительность диалога: ${durationText}`);
-    }
-    if (insights?.avg_user_messages > 0) {
-      list.push(`Среднее количество сообщений от клиента: ${Math.round(insights.avg_user_messages)}`);
-    }
-    return list;
-  }, [insights, funnel]);
+    const fTotal = funnel?.total || 0;
+    const searchPct = fTotal > 0 ? Math.round((funnel.with_search / fTotal) * 100) : 0;
+    const cardsPct = fTotal > 0 ? Math.round((funnel.with_results / fTotal) * 100) : 0;
+    const bookingPct = insights?.booking_intent_pct ?? 0;
+    const topDest = insights?.top_destination;
+    const respSec = avgResponseMs ? (avgResponseMs / 1000).toFixed(1) : null;
+    const afterHrs = insights?.after_hours_pct ?? 0;
 
-  if (!items.length) return null;
+    return [
+      { text: `${searchPct}% клиентов ищут туры через ассистента`, color: 'text-primary' },
+      { text: `${cardsPct}% запросов завершились показом предложений`, color: 'text-primary' },
+      { text: `${bookingPct}% клиентов проявляют интерес к бронированию`, color: 'text-success' },
+      { text: topDest ? `Самое популярное направление: ${topDest.name} (${topDest.count} поисков)` : 'Самое популярное направление: —', color: 'text-primary' },
+      { text: respSec ? `Среднее время ответа ассистента: ${respSec}с` : 'Среднее время ответа ассистента: —', color: 'text-primary' },
+      { text: `${afterHrs}% обращений поступают вне рабочего времени`, color: 'text-primary' },
+    ];
+  }, [insights, funnel, avgResponseMs]);
+
   return (
     <div className="bg-white rounded-2xl shadow-sm p-5 animate-fade-in-up stagger-6">
       <div className="flex items-center gap-2 mb-3">
@@ -106,16 +96,12 @@ function InsightCard({ insights, funnel }) {
         <h3 className="text-sm font-semibold text-text">Быстрые инсайты</h3>
       </div>
       <div className="space-y-2">
-        {items.map((item, i) => {
-          const text = typeof item === 'string' ? item : item.text;
-          const colorClass = typeof item === 'object' ? item.color : 'text-primary';
-          return (
-            <p key={i} className="text-xs text-text-secondary leading-relaxed flex items-start gap-2">
-              <TrendingUp size={12} className={`${colorClass} mt-0.5 shrink-0`} />
-              {text}
-            </p>
-          );
-        })}
+        {items.map((item, i) => (
+          <p key={i} className="text-xs text-text-secondary leading-relaxed flex items-start gap-2">
+            <TrendingUp size={12} className={`${item.color} mt-0.5 shrink-0`} />
+            {item.text}
+          </p>
+        ))}
       </div>
     </div>
   );
@@ -133,7 +119,7 @@ export default function Overview() {
   const { data: health } = useFetch('/dashboard/system/health');
 
   const sparklineConv = useOverviewChart(period, 'conversations');
-  const sparklineMsg = useOverviewChart(period, 'messages');
+  const sparklineBooking = useOverviewChart(period, 'booking_intents');
   const sparklineSrch = useOverviewChart(period, 'searches');
 
   const funnel = overview?.funnel || null;
@@ -165,6 +151,7 @@ export default function Overview() {
             <div className="animate-fade-in-up stagger-1 h-full">
               <MetricCard
                 title="Диалогов"
+                tooltip="Общее количество диалогов клиентов с AI-ассистентом за выбранный период"
                 value={formatNumber(overview?.conversations?.value)}
                 delta={overview?.conversations?.delta}
                 icon={MessagesSquare}
@@ -173,15 +160,18 @@ export default function Overview() {
             </div>
             <div className="animate-fade-in-up stagger-2 h-full">
               <MetricCard
-                title="Сообщений"
-                value={formatNumber(overview?.messages?.value)}
-                icon={MessageSquare}
-                sparklineData={sparklineMsg.data?.data}
+                title="Запросы на бронь"
+                tooltip="Диалоги, в которых клиент проявил интерес к бронированию тура"
+                value={formatNumber(overview?.booking_intents?.value)}
+                delta={overview?.booking_intents?.delta}
+                icon={BookmarkCheck}
+                sparklineData={sparklineBooking.data?.data}
               />
             </div>
             <div className="animate-fade-in-up stagger-3 h-full">
               <MetricCard
                 title="Поисков туров"
+                tooltip="Сколько раз ассистент выполнял поиск туров по запросам клиентов"
                 value={formatNumber(overview?.searches?.value)}
                 icon={Search}
                 sparklineData={sparklineSrch.data?.data}
@@ -190,6 +180,7 @@ export default function Overview() {
             <div className="animate-fade-in-up stagger-4 h-full">
               <MetricCard
                 title="Среднее время ответа"
+                tooltip="Среднее время, за которое ассистент отвечает на сообщение клиента (включая поиск туров)"
                 value={formatMs(overview?.avg_response_ms?.value)}
                 icon={Clock}
               />
@@ -206,7 +197,7 @@ export default function Overview() {
             <div className="flex bg-surface-sunken rounded-xl p-0.5">
               {[
                 { value: 'conversations', label: 'Диалоги' },
-                { value: 'messages', label: 'Сообщения' },
+                { value: 'booking_intents', label: 'Запросы на бронь' },
                 { value: 'searches', label: 'Поиски' },
               ].map((m) => (
                 <button
@@ -242,7 +233,7 @@ export default function Overview() {
                   contentStyle={{ borderRadius: 12, border: 'none', boxShadow: '0 4px 12px rgba(0,56,255,0.08)', fontSize: 12 }}
                   labelFormatter={formatShortDate}
                   formatter={(val) => {
-                    const labels = { conversations: 'Диалогов', messages: 'Сообщений', searches: 'Поисков' };
+                    const labels = { conversations: 'Диалогов', booking_intents: 'Запросов на бронь', searches: 'Поисков' };
                     return [val, labels[chartMetric] || 'Значение'];
                   }}
                 />
@@ -281,7 +272,7 @@ export default function Overview() {
       </div>
 
       {/* Insights */}
-      <InsightCard insights={apiInsights} funnel={funnel} />
+      <InsightCard insights={apiInsights} funnel={funnel} avgResponseMs={overview?.avg_response_ms?.value} />
 
       {/* Recent conversations */}
       <div className="bg-white rounded-2xl shadow-sm animate-fade-in-up">
@@ -301,9 +292,9 @@ export default function Overview() {
         ) : recent?.conversations?.length ? (
           <div className="border-t border-border/40">
             {recent.conversations.map((conv) => {
+              const hasBooking = conv.has_booking_intent;
               const hasCards = conv.tour_cards_shown > 0;
-              const hasSearches = conv.search_count > 0;
-              const dotColor = hasCards ? 'bg-success' : hasSearches ? 'bg-primary' : 'bg-text-secondary/30';
+              const dotColor = hasBooking ? 'bg-success' : hasCards ? 'bg-amber-400' : 'bg-text-secondary/30';
 
               return (
                 <div

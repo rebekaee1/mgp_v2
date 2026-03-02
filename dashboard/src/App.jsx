@@ -12,20 +12,29 @@ import WidgetSettings from './pages/WidgetSettings';
 import SystemStatus from './pages/SystemStatus';
 import Account from './pages/Account';
 
-function ProtectedRoute({ children }) {
-  const { user, loading } = useAuth();
-  if (loading) {
-    return (
-      <div className="min-h-screen flex items-center justify-center bg-surface">
-        <div className="flex flex-col items-center gap-3 animate-fade-in">
-          <div className="w-10 h-10 rounded-2xl bg-gradient-to-br from-primary to-[#3B82F6] flex items-center justify-center shadow-md">
-            <span className="text-white font-bold text-sm">A+</span>
-          </div>
-          <div className="w-6 h-6 border-2 border-primary border-t-transparent rounded-full animate-spin" />
+function LoadingScreen() {
+  return (
+    <div className="min-h-screen flex items-center justify-center bg-surface">
+      <div className="flex flex-col items-center gap-5 animate-fade-in">
+        <img
+          src="/globe.svg"
+          alt="AIMPACT+"
+          className="h-20 w-auto animate-globe-pulse"
+          draggable={false}
+        />
+        <div className="flex items-center gap-1.5">
+          <span className="w-2 h-2 rounded-full bg-primary animate-dot-pulse" style={{ animationDelay: '0ms' }} />
+          <span className="w-2 h-2 rounded-full bg-primary animate-dot-pulse" style={{ animationDelay: '200ms' }} />
+          <span className="w-2 h-2 rounded-full bg-primary animate-dot-pulse" style={{ animationDelay: '400ms' }} />
         </div>
       </div>
-    );
-  }
+    </div>
+  );
+}
+
+function ProtectedRoute({ children }) {
+  const { user, loading } = useAuth();
+  if (loading) return <LoadingScreen />;
   return user ? children : <Navigate to="/login" replace />;
 }
 

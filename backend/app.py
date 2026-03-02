@@ -52,6 +52,38 @@ app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_prefix=1)
 _infra_lock = threading.Lock()
 _infra_done = False
 
+def _backfill_booking_intent():
+    """One-time backfill: scan existing conversations for booking intent."""
+    try:
+        from database import get_db, is_db_available
+        if not is_db_available():
+            return
+        from models import Conversation, Message
+        with get_db() as db:
+            if db is None:
+                return
+            convs = db.query(Conversation).filter(
+                Conversation.has_booking_intent == False  # noqa: E712
+            ).all()
+            updated = 0
+            for conv in convs:
+                user_msgs = [
+                    m.content for m in db.query(Message.content).filter(
+                        Message.conversation_id == conv.id,
+                        Message.role == "user",
+                    ).all()
+                ]
+                if check_conversation_booking_intent(user_msgs):
+                    conv.has_booking_intent = True
+                    updated += 1
+            if updated:
+                logging.getLogger("mgp_bot").info(
+                    "Backfill: marked %d conversations with booking intent", updated
+                )
+    except Exception as e:
+        logging.getLogger("mgp_bot").debug("Booking intent backfill: %s", e)
+
+
 def _init_infrastructure():
     """Инициализация БД и Redis при первом запросе (lazy init, thread-safe)."""
     global _infra_done
@@ -66,6 +98,7 @@ def _init_infrastructure():
             from cache import init_cache
             init_db(settings.database_url)
             init_cache(settings.redis_url)
+            _backfill_booking_intent()
         except Exception as e:
             logging.getLogger("mgp_bot").warning("Infrastructure init: %s", e)
         _infra_done = True
@@ -227,6 +260,57 @@ def _cleanup_stale_sessions():
             logger.info("🧹 Cleaned up %d stale sessions (remaining: %d)", len(stale), len(_handlers))
 
 
+# === BOOKING INTENT DETECTION ===
+
+_BOOKING_PHRASES = [
+    "забронировать", "бронирую", "бронируем", "бронируй", "бронируйте",
+    "хочу бронь", "оформить бронь", "оформить тур", "оформляем", "оформляй",
+    "оформляйте", "оформите", "давайте оформим", "давай оформим",
+    "купить тур", "покупаю", "покупаем", "хочу купить",
+    "беру этот", "берем этот", "берём этот", "возьмем", "возьмём", "возьму",
+    "этот вариант беру", "этот тур беру", "давайте этот", "хочу этот",
+    "выбираю этот", "выбрал этот", "выбрали этот",
+    "останавливаюсь на", "решили брать", "решил брать",
+    "как забронировать", "как оформить", "как купить", "как заказать",
+    "условия бронирования", "процесс бронирования",
+    "можно забронировать", "можно оформить", "можно ли забронировать",
+    "можно ли оформить", "хочу забронировать",
+    "контакт менеджера", "номер менеджера",
+    "связаться с менеджером", "позвонить менеджеру",
+    "переведите на менеджера", "переведи на менеджера",
+    "соедините с менеджером", "соедини с менеджером",
+    "нас устраивает", "нам подходит", "подходит идеально",
+    "нравится этот вариант", "нравится этот тур",
+    "готовы оплатить", "готовы оформить", "готов оплатить", "готов оформить",
+    "можно оплатить", "хочу оплатить",
+    "давайте бронируем", "давай бронируем", "бронируем этот",
+    "оформляем этот", "берем этот тур", "берём этот тур",
+    "хотим забронировать", "хотим оформить", "хотим купить",
+    "заказать тур", "заказать этот",
+    "оплатить тур", "оплатить этот",
+    "давайте закажем", "давай закажем",
+    "запишите нас", "запиши нас",
+    "бронь", "бронирование",
+]
+
+_BOOKING_PHRASES_NORMALIZED = [
+    p.lower().replace("ё", "е") for p in _BOOKING_PHRASES
+]
+
+
+def has_booking_intent(text: str) -> bool:
+    """Check if a single message text contains booking intent."""
+    if not text:
+        return False
+    t = text.lower().replace("ё", "е")
+    return any(phrase in t for phrase in _BOOKING_PHRASES_NORMALIZED)
+
+
+def check_conversation_booking_intent(user_messages: list) -> bool:
+    """Check if any user message in a conversation shows booking intent."""
+    return any(has_booking_intent(msg) for msg in user_messages if msg)
+
+
 # === DB LOGGING (полный путь диалога для аналитики и личного кабинета) ===
 
 def _log_chat_to_db(session_id: str, user_message: str, reply: str,
@@ -346,6 +430,16 @@ def _log_chat_to_db(session_id: str, user_message: str, reply: str,
                 conv.tour_cards_shown = (conv.tour_cards_shown or 0) + len(tour_cards)
                 conv.search_count = (conv.search_count or 0) + 1
 
+            if not conv.has_booking_intent:
+                user_texts = [
+                    m.content for m in db.query(Message.content).filter(
+                        Message.conversation_id == conv.id,
+                        Message.role == "user",
+                    ).all()
+                ]
+                if check_conversation_booking_intent(user_texts):
+                    conv.has_booking_intent = True
+
     except Exception as e:
         logger.debug("DB logging failed (non-critical): %s", e)
 
@@ -438,6 +532,58 @@ def frontend_static(filename):
     return send_from_directory(_FRONTEND_DIR, filename)
 
 
+@app.route('/widget.js')
+def widget_js():
+    return send_from_directory(_FRONTEND_DIR, 'script.js', mimetype='application/javascript')
+
+
+@app.route('/widget.css')
+def widget_css():
+    return send_from_directory(_FRONTEND_DIR, 'styles.css', mimetype='text/css')
+
+
+WIDGET_DEFAULTS = {
+    "welcome_message": "\U0001f44b Здравствуйте! Я — ИИ-ассистент туристического агентства.\n\nЯ помогу вам:\n• \U0001f50d Подобрать тур по вашим параметрам\n• \U0001f525 Найти горящие предложения\n• \u2753 Ответить на вопросы о визах, оплате, документах\n\nКуда бы вы хотели поехать?",
+    "primary_color": "#E30613",
+    "position": "bottom-right",
+    "title": "AI Ассистент",
+    "subtitle": "Турагентство",
+    "logo_url": None,
+}
+
+
+@app.route('/api/widget/config')
+def public_widget_config():
+    """Public widget config (no auth). Widget calls this on init."""
+    _init_infrastructure()
+    from database import get_db
+    from models import Assistant
+
+    assistant_id = request.args.get('assistant_id')
+
+    with get_db() as db:
+        if db is None:
+            return jsonify(WIDGET_DEFAULTS)
+
+        if assistant_id:
+            assistant = db.query(Assistant).filter(Assistant.id == assistant_id).first()
+        else:
+            assistant = db.query(Assistant).filter(Assistant.is_active.is_(True)).first()
+
+        if not assistant:
+            return jsonify(WIDGET_DEFAULTS)
+
+        cfg = assistant.widget_config or {}
+        return jsonify({
+            "welcome_message": cfg.get("welcome_message") or WIDGET_DEFAULTS["welcome_message"],
+            "primary_color": cfg.get("primary_color") or WIDGET_DEFAULTS["primary_color"],
+            "position": cfg.get("position") or WIDGET_DEFAULTS["position"],
+            "title": cfg.get("title") or WIDGET_DEFAULTS["title"],
+            "subtitle": cfg.get("subtitle") or WIDGET_DEFAULTS["subtitle"],
+            "logo_url": cfg.get("logo_url") or None,
+        })
+
+
 @app.route('/favicon.ico')
 def favicon():
     """Чтобы не засорять логи 404-ками от браузера."""
@@ -451,7 +597,14 @@ def _log_request_start():
     g._req_start = time.perf_counter()
     g.request_id = uuid.uuid4().hex[:8]
     logger.info("-> %s %s rid=%s ip=%s", request.method, request.path, g.request_id, request.remote_addr)
-    # Периодическая очистка устаревших сессий (каждые 5 минут)
+
+    if request.path.startswith(('/api/chat', '/api/v1/chat')):
+        from cache import rate_limit_check
+        from config import settings
+        ip_key = f"rl:ip:{request.remote_addr}:{int(time.time()) // 60}"
+        if not rate_limit_check(ip_key, settings.rate_limit_per_ip, 60):
+            return jsonify({"error": "Rate limit exceeded"}), 429
+
     now = time.time()
     if now - _last_cleanup[0] > 300:
         _last_cleanup[0] = now

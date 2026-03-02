@@ -4,10 +4,15 @@ Graceful degradation: если PostgreSQL недоступен, приложен
 """
 
 import logging
+import re as _re
 from contextlib import contextmanager
 from typing import Optional, Generator
 
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine, event, text
+
+_DASH_RE = _re.compile(
+    r'[\u002D\u2010\u2011\u2012\u2013\u2014\u2015\u2212\u00AD\uFE63\uFF0D]'
+)
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 
 logger = logging.getLogger("mgp_bot")
@@ -21,6 +26,13 @@ class Base(DeclarativeBase):
     pass
 
 
+def _ensure_psycopg_url(url: str) -> str:
+    """Auto-fix postgresql:// → postgresql+psycopg:// for psycopg3 compatibility."""
+    if url.startswith("postgresql://") and "+" not in url.split("://")[0]:
+        return url.replace("postgresql://", "postgresql+psycopg://", 1)
+    return url
+
+
 def init_db(database_url: str) -> bool:
     """
     Инициализировать подключение к БД (PostgreSQL или SQLite).
@@ -30,6 +42,9 @@ def init_db(database_url: str) -> bool:
 
     is_sqlite = database_url.startswith("sqlite")
 
+    if not is_sqlite:
+        database_url = _ensure_psycopg_url(database_url)
+
     try:
         kwargs = {} if is_sqlite else dict(
             pool_size=5,
@@ -38,6 +53,18 @@ def init_db(database_url: str) -> bool:
             pool_recycle=300,
         )
         _engine = create_engine(database_url, echo=False, **kwargs)
+
+        if is_sqlite:
+            def _normalize(s):
+                if not s:
+                    return None
+                s = s.lower().replace("ё", "е")
+                s = _DASH_RE.sub(" ", s)
+                return s
+
+            @event.listens_for(_engine, "connect")
+            def _register_unicode_funcs(dbapi_conn, connection_record):
+                dbapi_conn.create_function("py_lower", 1, _normalize)
 
         with _engine.connect() as conn:
             conn.execute(text("SELECT 1"))

@@ -1,5 +1,5 @@
 # Stage 1: Build dashboard SPA
-FROM node:22-alpine AS dashboard-build
+FROM node:24-alpine AS dashboard-build
 WORKDIR /app
 COPY dashboard/package.json dashboard/package-lock.json* ./
 RUN npm ci

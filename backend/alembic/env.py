@@ -22,10 +22,10 @@ target_metadata = Base.metadata
 
 
 def get_url() -> str:
-    return os.getenv(
-        "DATABASE_URL",
-        "postgresql://mgp:mgp@localhost:5432/mgp",
-    )
+    url = os.getenv("DATABASE_URL", "postgresql+psycopg://mgp:mgp@localhost:5432/mgp")
+    if url.startswith("postgresql://") and "+" not in url.split("://")[0]:
+        url = url.replace("postgresql://", "postgresql+psycopg://", 1)
+    return url
 
 
 def run_migrations_offline() -> None:

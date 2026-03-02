@@ -32,7 +32,7 @@ class Settings(BaseSettings):
     tourvisor_base_url: str = "https://tourvisor.ru/xml"
 
     # --- PostgreSQL ---
-    database_url: str = "postgresql://mgp:mgp@localhost:5432/mgp"
+    database_url: str = "postgresql+psycopg://mgp:mgp@localhost:5432/mgp"
 
     # --- Redis ---
     redis_url: str = "redis://localhost:6379/0"

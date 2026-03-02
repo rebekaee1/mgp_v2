@@ -3,7 +3,7 @@ import { useParams, useNavigate } from 'react-router-dom';
 import {
   ArrowLeft, Clock, Globe, Cpu, Search,
   Image, Smartphone, Laptop, CheckCircle, Play,
-  ChevronDown, ChevronUp,
+  ChevronDown, ChevronUp, BookmarkCheck,
 } from 'lucide-react';
 import MessageBubble from '../components/chat/MessageBubble';
 import TourCardModal from '../components/chat/TourCardModal';
@@ -168,10 +168,10 @@ export default function ConversationDetail() {
   }
 
   return (
-    <div className="space-y-4 animate-fade-in">
+    <div className="space-y-4">
       <button
         onClick={() => navigate('/conversations')}
-        className="flex items-center gap-1.5 text-sm text-text-secondary hover:text-primary transition-colors group"
+        className="flex items-center gap-1.5 text-sm text-text-secondary hover:text-primary transition-colors group animate-fade-in-up"
       >
         <ArrowLeft size={16} className="group-hover:-translate-x-0.5 transition-transform" />
         Назад к диалогам
@@ -179,7 +179,7 @@ export default function ConversationDetail() {
 
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
         {/* Chat replay */}
-        <div className="lg:col-span-2 bg-surface-sunken rounded-2xl shadow-sm overflow-hidden">
+        <div className="lg:col-span-2 bg-surface-sunken rounded-2xl shadow-sm overflow-hidden animate-fade-in-up stagger-1">
           {/* Chat header */}
           <div className="px-5 py-3 flex items-center justify-between flex-wrap gap-2">
             <div className="flex items-center gap-3">
@@ -218,8 +218,16 @@ export default function ConversationDetail() {
         {/* Sidebar */}
         <div className="space-y-4">
           {/* Client profile */}
-          <div className="bg-white rounded-2xl shadow-sm p-5 space-y-4">
-            <h3 className="text-sm font-semibold text-text">Профиль клиента</h3>
+          <div className="bg-white rounded-2xl shadow-sm p-5 space-y-4 animate-fade-in-up stagger-2">
+            <div className="flex items-center justify-between">
+              <h3 className="text-sm font-semibold text-text">Профиль клиента</h3>
+              {conv.has_booking_intent && (
+                <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-lg bg-success-light text-success text-[11px] font-medium">
+                  <BookmarkCheck size={12} />
+                  Запрос на бронь
+                </span>
+              )}
+            </div>
 
             <div className="flex items-center gap-3 pb-3 border-b border-border/40">
               <div className="w-10 h-10 rounded-xl bg-surface-sunken flex items-center justify-center">
@@ -264,7 +272,7 @@ export default function ConversationDetail() {
           </div>
 
           {/* Stats funnel */}
-          <div className="bg-white rounded-2xl shadow-sm p-5">
+          <div className="bg-white rounded-2xl shadow-sm p-5 animate-fade-in-up stagger-3">
             <h3 className="text-sm font-semibold text-text mb-3">Статистика диалога</h3>
             <div className="grid grid-cols-3 gap-2">
               {funnelSteps.map((step) => (
@@ -278,7 +286,7 @@ export default function ConversationDetail() {
 
           {/* Client journey timeline */}
           {timelineEvents.length > 2 && (
-            <div className="bg-white rounded-2xl shadow-sm p-5">
+            <div className="bg-white rounded-2xl shadow-sm p-5 animate-fade-in-up stagger-4">
               <h3 className="text-sm font-semibold text-text mb-3">Путь клиента</h3>
               <div>
                 {timelineEvents.map((ev, i) => (
@@ -297,7 +305,7 @@ export default function ConversationDetail() {
 
           {/* Tour searches */}
           {searches.length > 0 && (
-            <div className="bg-white rounded-2xl shadow-sm p-5">
+            <div className="bg-white rounded-2xl shadow-sm p-5 animate-fade-in-up stagger-5">
               <h3 className="text-sm font-semibold text-text mb-3">Поиски туров</h3>
               <div className="space-y-2.5">
                 {searches.map((s) => (

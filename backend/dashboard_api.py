@@ -3,11 +3,14 @@ Dashboard API Blueprint — all endpoints for the AIMPACT+ personal cabinet.
 Every endpoint is scoped to the authenticated user's company via @require_auth.
 """
 
+import os
+import re
 import uuid
 from datetime import datetime, timedelta, timezone
 
 from flask import Blueprint, g, jsonify, make_response, request
-from sqlalchemy import func, case, cast, Date, distinct, desc, asc
+from werkzeug.utils import secure_filename
+from sqlalchemy import func, case, cast, Date, distinct, desc, asc, or_
 
 from auth import (
     check_password, create_access_token, create_refresh_token,
@@ -21,6 +24,96 @@ from models import (
 
 auth_bp = Blueprint("auth", __name__, url_prefix="/api/auth")
 dash_bp = Blueprint("dashboard", __name__, url_prefix="/api/dashboard")
+
+_COUNTRY_NAMES = {
+    1: "Турция", 2: "Египет", 3: "ОАЭ", 4: "Таиланд", 5: "Тунис",
+    6: "Греция", 7: "Кипр", 8: "Испания", 9: "Италия", 10: "Черногория",
+    11: "Болгария", 12: "Хорватия", 13: "Чехия", 14: "Андорра",
+    15: "Куба", 16: "Доминикана", 17: "Мексика", 18: "Ямайка",
+    19: "Мальдивы", 20: "Сингапур", 21: "Малайзия",
+    22: "Шри-Ланка", 23: "Индия (Гоа)", 24: "Вьетнам",
+    25: "Южная Корея", 26: "Япония", 27: "ЮАР",
+    28: "Индонезия (Бали)", 29: "Камбоджа",
+    30: "Танзания", 31: "Иордания", 32: "Марокко", 33: "Оман",
+    34: "Бахрейн", 35: "Маврикий", 36: "Мадагаскар",
+    40: "Австрия", 41: "Франция", 42: "Сейшелы", 43: "Китай",
+    44: "Грузия", 45: "Армения", 46: "Азербайджан", 47: "Узбекистан",
+    48: "Казахстан", 49: "Кыргызстан",
+    76: "Россия", 90: "Абхазия",
+}
+
+_DEPARTURE_NAMES = {
+    1: "Москва", 2: "Санкт-Петербург", 3: "Екатеринбург", 4: "Казань",
+    5: "Новосибирск", 6: "Ростов-на-Дону", 7: "Самара", 8: "Уфа",
+    9: "Краснодар", 10: "Минеральные Воды", 11: "Нижний Новгород",
+    12: "Пермь", 13: "Красноярск", 14: "Воронеж", 15: "Волгоград",
+    16: "Челябинск", 17: "Омск", 18: "Тюмень", 19: "Иркутск",
+    20: "Хабаровск", 21: "Владивосток", 22: "Сочи",
+    99: "Без перелёта",
+}
+
+
+_DASH_RE = re.compile(
+    r'[\u002D\u2010\u2011\u2012\u2013\u2014\u2015\u2212\u00AD\uFE63\uFF0D]'
+)
+
+_RU_SUFFIXES = sorted([
+    "ями", "ами", "ией", "ием", "ого", "его", "ому", "ему",
+    "ых", "их", "ый", "ий", "ая", "яя", "ое", "ее", "ые", "ие",
+    "ой", "ей", "ом", "ем", "ым", "им", "ую",
+    "ов", "ев", "ам", "ям", "ах", "ях",
+    "ию", "ии", "ия",
+    "а", "я", "у", "ю", "и", "е", "о", "ы",
+], key=len, reverse=True)
+
+
+def _normalize_text(text: str) -> str:
+    """Lowercase + ё→е + all dashes/hyphens→space."""
+    text = text.lower().replace("ё", "е")
+    text = _DASH_RE.sub(" ", text)
+    return text.strip()
+
+
+_RU_CONSONANTS = set("бвгджзклмнпрстфхцчшщ")
+
+
+def _ru_stem(word: str) -> str:
+    """Remove common Russian suffixes to get a crude stem (min 3 chars)."""
+    if len(word) < 4:
+        return word
+    for sfx in _RU_SUFFIXES:
+        if word.endswith(sfx) and len(word) - len(sfx) >= 3:
+            return word[:-len(sfx)]
+    return word
+
+
+def _stem_variants(word: str) -> list[str]:
+    """Return the stem + variants with fleeting vowels (е/о) inserted."""
+    stem = _ru_stem(word)
+    variants = [stem]
+    if len(stem) >= 3 and stem[-1] in _RU_CONSONANTS:
+        for v in ("е", "о"):
+            variants.append(stem[:-1] + v + stem[-1])
+    return variants
+
+
+def _match_codes(mapping: dict, word: str) -> list[int]:
+    """Stem-aware matching: word against dictionary names.
+    Handles fleeting vowels (Египет→Египта) via shared 4-char prefix fallback.
+    """
+    w = _normalize_text(word)
+    stem = _ru_stem(w)
+    result = []
+    for code, name in mapping.items():
+        n = _normalize_text(name)
+        n_stem = _ru_stem(n)
+        if w in n or n in w:
+            result.append(code)
+        elif stem in n or n_stem in w:
+            result.append(code)
+        elif len(stem) >= 4 and len(n_stem) >= 4 and stem[:4] == n_stem[:4]:
+            result.append(code)
+    return result
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -160,13 +253,14 @@ def overview():
 
         conv_ids_now = [c.id for c in _conv_q(since).with_entities(Conversation.id).all()]
 
-        msgs_now = 0
+        booking_now = 0
+        booking_prev = 0
         searches_now = 0
         avg_latency = 0
         if conv_ids_now:
-            msgs_now = db.query(func.count(Message.id)).filter(
-                Message.conversation_id.in_(conv_ids_now)
-            ).scalar() or 0
+            booking_now = _conv_q(since).filter(
+                Conversation.has_booking_intent == True  # noqa: E712
+            ).count()
 
             searches_now = db.query(func.count(TourSearch.id)).filter(
                 TourSearch.conversation_id.in_(conv_ids_now)
@@ -178,6 +272,11 @@ def overview():
                 Message.latency_ms.isnot(None),
             ).scalar() or 0
 
+        booking_prev = _conv_q(prev_since).filter(
+            Conversation.started_at < since,
+            Conversation.has_booking_intent == True,  # noqa: E712
+        ).count()
+
         def _delta(now_val, prev_val):
             if prev_val == 0:
                 return 0
@@ -185,9 +284,10 @@ def overview():
 
         # ── Funnel data ──
         funnel = {"total": convs_now, "engaged": 0, "with_search": 0,
-                  "with_results": 0, "potential_leads": 0}
+                  "with_results": 0, "booking_intent": 0, "potential_leads": 0}
         insights = {"after_hours_pct": 0, "avg_duration_minutes": 0,
-                    "empty_search_pct": 0, "avg_user_messages": 0}
+                    "empty_search_pct": 0, "avg_user_messages": 0,
+                    "booking_intent_pct": 0}
 
         if conv_ids_now:
             user_msg_counts = dict(
@@ -199,7 +299,7 @@ def overview():
             convs_data = db.query(
                 Conversation.id, Conversation.search_count,
                 Conversation.tour_cards_shown, Conversation.started_at,
-                Conversation.last_active_at,
+                Conversation.last_active_at, Conversation.has_booking_intent,
             ).filter(Conversation.id.in_(conv_ids_now)).all()
 
             total_user_msgs = sum(user_msg_counts.values())
@@ -218,6 +318,8 @@ def overview():
                     funnel["with_search"] += 1
                 if tc > 0:
                     funnel["with_results"] += 1
+                if c.has_booking_intent:
+                    funnel["booking_intent"] += 1
                 if umc >= 4 and tc > 0:
                     funnel["potential_leads"] += 1
 
@@ -235,21 +337,31 @@ def overview():
             if convs_now > 0:
                 insights["after_hours_pct"] = round(after_hours / convs_now * 100)
                 insights["avg_user_messages"] = round(total_user_msgs / convs_now, 1)
+                insights["booking_intent_pct"] = round(
+                    funnel["booking_intent"] / convs_now * 100, 1
+                )
             if duration_count > 0:
                 insights["avg_duration_minutes"] = round(duration_sum / duration_count / 60, 1)
 
-            total_searches_rows = db.query(TourSearch).filter(
-                TourSearch.conversation_id.in_(conv_ids_now)
-            ).all()
-            empty_searches = sum(1 for s in total_searches_rows
-                                 if (s.tours_found or 0) == 0)
-            if total_searches_rows:
-                insights["empty_search_pct"] = round(
-                    empty_searches / len(total_searches_rows) * 100)
+        top_dest = db.query(
+            TourSearch.country,
+            func.count(TourSearch.id).label("cnt"),
+        ).filter(
+            TourSearch.conversation_id.in_(conv_ids_now),
+            TourSearch.country.isnot(None),
+        ).group_by(TourSearch.country).order_by(
+            func.count(TourSearch.id).desc()
+        ).first()
+        if top_dest:
+            insights["top_destination"] = {
+                "name": _COUNTRY_NAMES.get(top_dest.country,
+                                           f"#{top_dest.country}"),
+                "count": top_dest.cnt,
+            }
 
         return jsonify({
             "conversations": {"value": convs_now, "delta": _delta(convs_now, convs_prev)},
-            "messages": {"value": msgs_now},
+            "booking_intents": {"value": booking_now, "delta": _delta(booking_now, booking_prev)},
             "searches": {"value": searches_now},
             "avg_response_ms": {"value": round(avg_latency)},
             "funnel": funnel,
@@ -285,6 +397,18 @@ def overview_chart():
                 func.count(Message.id).label("value"),
             ).join(Conversation, Message.conversation_id == Conversation.id
             ).filter(Conversation.started_at >= since)
+            if aids:
+                q = q.filter(Conversation.assistant_id.in_(aids))
+            rows = q.group_by("date").order_by("date").all()
+
+        elif metric == "booking_intents":
+            q = db.query(
+                func.date(Conversation.started_at).label("date"),
+                func.count(Conversation.id).label("value"),
+            ).filter(
+                Conversation.started_at >= since,
+                Conversation.has_booking_intent == True,  # noqa: E712
+            )
             if aids:
                 q = q.filter(Conversation.assistant_id.in_(aids))
             rows = q.group_by("date").order_by("date").all()
@@ -358,6 +482,8 @@ def overview_recent():
                 "last_active_at": c.last_active_at.isoformat(),
                 "message_count": c.message_count,
                 "search_count": c.search_count,
+                "tour_cards_shown": c.tour_cards_shown,
+                "has_booking_intent": c.has_booking_intent,
                 "preview": (first_msg.content[:120] + "...") if first_msg and first_msg.content and len(first_msg.content) > 120
                            else (first_msg.content if first_msg else ""),
                 "status": c.status,
@@ -374,7 +500,6 @@ def conversations_list():
     page = max(int(request.args.get("page", 1)), 1)
     per_page = min(int(request.args.get("per_page", 20)), 100)
     period = request.args.get("period", "all")
-    has_search = request.args.get("has_search")
     search_text = request.args.get("search", "").strip()
     sort_by = request.args.get("sort_by", "started_at")
     sort_dir = request.args.get("sort_dir", "desc")
@@ -399,28 +524,65 @@ def conversations_list():
         if period != "all":
             q = q.filter(Conversation.started_at >= _period_start(period))
 
-        if has_search == "true":
-            q = q.filter(Conversation.search_count > 0)
-        elif has_search == "false":
-            q = q.filter(Conversation.search_count == 0)
+        has_cards = request.args.get("has_cards")
+        if has_cards == "true":
+            q = q.filter(Conversation.tour_cards_shown > 0)
+        elif has_cards == "false":
+            q = q.filter(Conversation.tour_cards_shown == 0)
+
+        has_booking = request.args.get("has_booking")
+        if has_booking == "true":
+            q = q.filter(Conversation.has_booking_intent == True)  # noqa: E712
+        elif has_booking == "false":
+            q = q.filter(Conversation.has_booking_intent == False)  # noqa: E712
 
         if search_text:
-            matching_conv_ids = db.query(distinct(Message.conversation_id)).filter(
-                Message.content.ilike(f"%{search_text}%")
-            ).subquery()
-            q = q.filter(Conversation.id.in_(matching_conv_ids))
+            search_norm = _normalize_text(search_text)
+            words = [w for w in search_norm.split() if len(w) >= 2]
+            if not words:
+                words = [search_norm]
+
+            msg_q = db.query(Message.conversation_id)
+            for word in words:
+                variants = _stem_variants(word)
+                likes = [
+                    func.lower(Message.content).like(f"%{v}%")
+                    for v in variants
+                ]
+                msg_q = msg_q.filter(or_(*likes))
+            msg_ids = msg_q
+
+            all_country = set()
+            all_departure = set()
+            for word in words:
+                all_country.update(_match_codes(_COUNTRY_NAMES, word))
+                all_departure.update(_match_codes(_DEPARTURE_NAMES, word))
+
+            tour_filters = []
+            if all_country:
+                tour_filters.append(TourSearch.country.in_(list(all_country)))
+            if all_departure:
+                tour_filters.append(TourSearch.departure.in_(list(all_departure)))
+            if tour_filters:
+                tour_ids = db.query(TourSearch.conversation_id).filter(or_(*tour_filters))
+                combined = msg_ids.union(tour_ids).subquery()
+            else:
+                combined = msg_ids.subquery()
+            q = q.filter(Conversation.id.in_(combined))
 
         total = q.count()
 
-        total_with_search = db.query(func.count(Conversation.id)).filter(
-            Conversation.search_count > 0
-        )
-        total_with_cards = db.query(func.count(Conversation.id)).filter(
-            Conversation.tour_cards_shown > 0
-        )
+        gq = db.query(Conversation.id)
         if aids:
-            total_with_search = total_with_search.filter(Conversation.assistant_id.in_(aids))
-            total_with_cards = total_with_cards.filter(Conversation.assistant_id.in_(aids))
+            gq = gq.filter(Conversation.assistant_id.in_(aids))
+        if period != "all":
+            gq = gq.filter(Conversation.started_at >= _period_start(period))
+
+        total_all = gq.count()
+        total_with_cards = gq.filter(Conversation.tour_cards_shown > 0).count()
+        total_with_booking = gq.filter(
+            Conversation.has_booking_intent == True  # noqa: E712
+        ).count()
 
         convs = q.offset((page - 1) * per_page).limit(per_page).all()
 
@@ -458,14 +620,16 @@ def conversations_list():
                 "ip_address": c.ip_address,
                 "preview": _trunc(first_msg, 120),
                 "last_user_message": _trunc(last_user_msg, 80),
+                "has_booking_intent": c.has_booking_intent,
                 "status": c.status,
             })
 
         return jsonify({
             "items": items,
             "total": total,
-            "total_with_search": total_with_search.scalar() or 0,
-            "total_with_cards": total_with_cards.scalar() or 0,
+            "total_all": total_all,
+            "total_with_cards": total_with_cards,
+            "total_with_booking": total_with_booking,
             "page": page,
             "per_page": per_page,
             "pages": (total + per_page - 1) // per_page,
@@ -514,6 +678,7 @@ def conversation_detail(conv_id):
             "message_count": conv.message_count,
             "search_count": conv.search_count,
             "tour_cards_shown": conv.tour_cards_shown,
+            "has_booking_intent": conv.has_booking_intent,
             "avg_latency_ms": round(avg_lat) if avg_lat else None,
             "status": conv.status,
             "messages": [
@@ -812,18 +977,43 @@ def analytics_search_types():
             q = q.filter(Conversation.assistant_id.in_(aids))
         rows = q.group_by(TourSearch.search_type).all()
 
-        avg_nights = db.query(
-            func.avg(TourSearch.nights_from).label("avg_from"),
-            func.avg(TourSearch.nights_to).label("avg_to"),
-        ).join(Conversation).filter(Conversation.started_at >= since)
+        nights_q = db.query(
+            TourSearch.nights_from, TourSearch.nights_to,
+        ).join(Conversation).filter(
+            Conversation.started_at >= since,
+            TourSearch.nights_from.isnot(None),
+        )
         if aids:
-            avg_nights = avg_nights.filter(Conversation.assistant_id.in_(aids))
-        nights = avg_nights.first()
+            nights_q = nights_q.filter(Conversation.assistant_id.in_(aids))
+        nights_rows = nights_q.all()
+        if nights_rows:
+            total_n = sum(
+                (r.nights_from + (r.nights_to or r.nights_from)) / 2
+                for r in nights_rows
+            )
+            avg_nights = round(total_n / len(nights_rows))
+        else:
+            avg_nights = None
+
+        budget_q = db.query(
+            func.avg(TourSearch.price_to).label("avg_budget"),
+        ).join(Conversation).filter(
+            Conversation.started_at >= since,
+            TourSearch.price_to.isnot(None),
+            TourSearch.price_to > 0,
+        )
+        if aids:
+            budget_q = budget_q.filter(Conversation.assistant_id.in_(aids))
+        budget_row = budget_q.first()
+        avg_budget = (
+            round(budget_row.avg_budget) if budget_row and budget_row.avg_budget
+            else None
+        )
 
         return jsonify({
             "types": [{"type": r.search_type, "count": r.count} for r in rows],
-            "avg_nights_from": round(nights.avg_from) if nights and nights.avg_from else None,
-            "avg_nights_to": round(nights.avg_to) if nights and nights.avg_to else None,
+            "avg_nights": avg_nights,
+            "avg_budget": avg_budget,
         })
 
 
@@ -893,7 +1083,8 @@ def analytics_business_metrics():
             return jsonify({
                 "inquiries_handled": 0, "tours_offered": 0,
                 "potential_leads": 0, "after_hours_pct": 0,
-                "after_hours_count": 0, "avg_duration_seconds": 0,
+                "after_hours_count": 0,
+                "booking_intents": 0, "booking_intent_pct": 0,
                 "engagement_pct": 0, "engaged_count": 0,
                 "total_conversations": 0,
             })
@@ -936,24 +1127,9 @@ def analytics_business_metrics():
                 if h < 9 or h >= 18:
                     after_hours += 1
 
-        msg_durations = db.query(
-            Message.conversation_id,
-            func.min(Message.created_at).label("first_msg"),
-            func.max(Message.created_at).label("last_msg"),
-        ).filter(
-            Message.conversation_id.in_(conv_ids)
-        ).group_by(Message.conversation_id).all()
-
-        dur_sum = 0.0
-        dur_cnt = 0
-        for row in msg_durations:
-            if row.first_msg and row.last_msg:
-                diff = (row.last_msg - row.first_msg).total_seconds()
-                if diff > 0:
-                    dur_sum += diff
-                    dur_cnt += 1
-
-        avg_dur_seconds = round(dur_sum / dur_cnt) if dur_cnt else 0
+        booking_count = q.filter(
+            Conversation.has_booking_intent == True  # noqa: E712
+        ).count()
 
         return jsonify({
             "inquiries_handled": total_convs,
@@ -961,7 +1137,8 @@ def analytics_business_metrics():
             "potential_leads": potential_leads,
             "after_hours_pct": round(after_hours / total_convs * 100) if total_convs else 0,
             "after_hours_count": after_hours,
-            "avg_duration_seconds": avg_dur_seconds,
+            "booking_intents": booking_count,
+            "booking_intent_pct": round(booking_count / total_convs * 100, 1) if total_convs else 0,
             "engagement_pct": round(engaged / total_convs * 100) if total_convs else 0,
             "engaged_count": engaged,
             "total_conversations": total_convs,
@@ -1178,6 +1355,20 @@ def analytics_activity():
 
 # ── Widget ────────────────────────────────────────────────────────────────────
 
+_WIDGET_DEFAULTS = {
+    "welcome_message": "\U0001f44b Здравствуйте! Я — ИИ-ассистент туристического агентства.\n\nЯ помогу вам:\n• \U0001f50d Подобрать тур по вашим параметрам\n• \U0001f525 Найти горящие предложения\n• \u2753 Ответить на вопросы о визах, оплате, документах\n\nКуда бы вы хотели поехать?",
+    "primary_color": "#E30613",
+    "position": "bottom-right",
+    "title": "AI Ассистент",
+    "subtitle": "Турагентство",
+    "logo_url": None,
+}
+
+_LOGO_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static", "logos")
+_ALLOWED_LOGO_EXT = {"png", "jpg", "jpeg", "webp"}
+_MAX_LOGO_SIZE = 2 * 1024 * 1024
+
+
 @dash_bp.route("/widget/config", methods=["GET"])
 @require_auth
 def widget_config_get():
@@ -1194,9 +1385,13 @@ def widget_config_get():
         cfg = assistant.widget_config or {}
         return jsonify({
             "assistant_id": str(assistant.id),
-            "welcome_message": cfg.get("welcome_message", ""),
-            "position": cfg.get("position", "bottom-right"),
-            "primary_color": cfg.get("primary_color", "#0038FF"),
+            "welcome_message": cfg.get("welcome_message") or _WIDGET_DEFAULTS["welcome_message"],
+            "position": cfg.get("position") or _WIDGET_DEFAULTS["position"],
+            "primary_color": cfg.get("primary_color") or _WIDGET_DEFAULTS["primary_color"],
+            "title": cfg.get("title") or _WIDGET_DEFAULTS["title"],
+            "subtitle": cfg.get("subtitle") or _WIDGET_DEFAULTS["subtitle"],
+            "logo_url": cfg.get("logo_url") or None,
+            "active_preset": cfg.get("active_preset") or None,
         })
 
 
@@ -1215,7 +1410,7 @@ def widget_config_update():
             return jsonify({"error": "No active assistant"}), 404
 
         cfg = dict(assistant.widget_config or {})
-        for key in ("welcome_message", "position", "primary_color"):
+        for key in ("welcome_message", "position", "primary_color", "title", "subtitle", "logo_url", "active_preset"):
             if key in data:
                 cfg[key] = data[key]
         assistant.widget_config = cfg
@@ -1242,6 +1437,79 @@ def widget_embed_code():
             f'data-assistant-id="{assistant.id}"></script>'
         )
         return jsonify({"embed_code": code, "assistant_id": str(assistant.id)})
+
+
+@dash_bp.route("/widget/logo", methods=["POST"])
+@require_auth
+def widget_logo_upload():
+    with get_db() as db:
+        if db is None:
+            return jsonify({"error": "Database unavailable"}), 503
+
+        assistant = db.query(Assistant).filter(
+            Assistant.company_id == g.company_id, Assistant.is_active.is_(True)
+        ).first()
+        if not assistant:
+            return jsonify({"error": "No active assistant"}), 404
+
+        if "logo" not in request.files:
+            return jsonify({"error": "Файл не предоставлен"}), 400
+
+        file = request.files["logo"]
+        if not file.filename:
+            return jsonify({"error": "Пустое имя файла"}), 400
+
+        ext = file.filename.rsplit(".", 1)[-1].lower() if "." in file.filename else ""
+        if ext not in _ALLOWED_LOGO_EXT:
+            return jsonify({"error": f"Допустимые форматы: {', '.join(_ALLOWED_LOGO_EXT)}"}), 400
+
+        file.seek(0, 2)
+        size = file.tell()
+        file.seek(0)
+        if size > _MAX_LOGO_SIZE:
+            return jsonify({"error": "Максимальный размер файла — 2 МБ"}), 400
+
+        os.makedirs(_LOGO_DIR, exist_ok=True)
+
+        for old in os.listdir(_LOGO_DIR):
+            if old.startswith(str(assistant.id)):
+                os.remove(os.path.join(_LOGO_DIR, old))
+
+        filename = f"{assistant.id}.{ext}"
+        filepath = os.path.join(_LOGO_DIR, filename)
+        file.save(filepath)
+
+        logo_url = f"/static/logos/{filename}"
+        cfg = dict(assistant.widget_config or {})
+        cfg["logo_url"] = logo_url
+        assistant.widget_config = cfg
+
+        return jsonify({"status": "ok", "logo_url": logo_url})
+
+
+@dash_bp.route("/widget/logo", methods=["DELETE"])
+@require_auth
+def widget_logo_delete():
+    with get_db() as db:
+        if db is None:
+            return jsonify({"error": "Database unavailable"}), 503
+
+        assistant = db.query(Assistant).filter(
+            Assistant.company_id == g.company_id, Assistant.is_active.is_(True)
+        ).first()
+        if not assistant:
+            return jsonify({"error": "No active assistant"}), 404
+
+        for old in os.listdir(_LOGO_DIR) if os.path.isdir(_LOGO_DIR) else []:
+            if old.startswith(str(assistant.id)):
+                os.remove(os.path.join(_LOGO_DIR, old))
+
+        cfg = dict(assistant.widget_config or {})
+        cfg.pop("logo_url", None)
+        cfg.pop("active_preset", None)
+        assistant.widget_config = cfg
+
+        return jsonify({"status": "ok"})
 
 
 # ── System ────────────────────────────────────────────────────────────────────
@@ -1357,6 +1625,53 @@ def account_update_profile():
         if company and "company_name" in data:
             company.name = data["company_name"]
         return jsonify({"status": "ok"})
+
+
+# ── Reset Data ────────────────────────────────────────────────────────────────
+
+@dash_bp.route("/account/reset-data", methods=["POST"])
+@require_auth
+def account_reset_data():
+    data = request.get_json(silent=True) or {}
+    password = data.get("password", "")
+    if not password:
+        return jsonify({"error": "Необходимо указать пароль"}), 400
+
+    with get_db() as db:
+        if db is None:
+            return jsonify({"error": "Database unavailable"}), 503
+
+        user = db.query(User).get(g.current_user_id)
+        if not check_password(password, user.password_hash):
+            return jsonify({"error": "Неверный пароль"}), 403
+
+        aids = [
+            a.id for a in db.query(Assistant.id).filter(
+                Assistant.company_id == g.company_id
+            ).all()
+        ]
+
+        if aids:
+            conv_ids = [
+                c.id for c in db.query(Conversation.id).filter(
+                    Conversation.assistant_id.in_(aids)
+                ).all()
+            ]
+            if conv_ids:
+                db.query(Message).filter(
+                    Message.conversation_id.in_(conv_ids)
+                ).delete(synchronize_session=False)
+                db.query(TourSearch).filter(
+                    TourSearch.conversation_id.in_(conv_ids)
+                ).delete(synchronize_session=False)
+                db.query(ApiCall).filter(
+                    ApiCall.conversation_id.in_(conv_ids)
+                ).delete(synchronize_session=False)
+            db.query(Conversation).filter(
+                Conversation.assistant_id.in_(aids)
+            ).delete(synchronize_session=False)
+
+        return jsonify({"status": "ok", "message": "Все данные сброшены"})
 
 
 # ── CSV Export ────────────────────────────────────────────────────────────────

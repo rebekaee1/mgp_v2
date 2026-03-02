@@ -1,16 +1,37 @@
-import { useState } from 'react';
+import { useState, useRef, useEffect, useCallback } from 'react';
 import { Calendar } from 'lucide-react';
 
-const PERIODS = [
+const DEFAULT_PERIODS = [
   { value: '7d', label: '7 дней' },
   { value: '30d', label: '30 дней' },
   { value: '90d', label: '90 дней' },
 ];
 
-export default function PeriodSelector({ value, onChange, showCustom = false, onCustomRange }) {
+export default function PeriodSelector({ value, onChange, showCustom = false, onCustomRange, periods }) {
+  const PERIODS = periods || DEFAULT_PERIODS;
   const [customOpen, setCustomOpen] = useState(false);
   const [dateFrom, setDateFrom] = useState('');
   const [dateTo, setDateTo] = useState('');
+  const containerRef = useRef(null);
+  const [indicatorStyle, setIndicatorStyle] = useState({});
+
+  const updateIndicator = useCallback(() => {
+    if (!containerRef.current || customOpen) return;
+    const active = containerRef.current.querySelector('[data-active="true"]');
+    if (active) {
+      const containerRect = containerRef.current.getBoundingClientRect();
+      const activeRect = active.getBoundingClientRect();
+      setIndicatorStyle({
+        left: activeRect.left - containerRect.left,
+        width: activeRect.width,
+        opacity: 1,
+      });
+    }
+  }, [value, customOpen]);
+
+  useEffect(() => {
+    updateIndicator();
+  }, [updateIndicator]);
 
   const handleCustomApply = () => {
     if (dateFrom && dateTo && onCustomRange) {
@@ -21,14 +42,19 @@ export default function PeriodSelector({ value, onChange, showCustom = false, on
 
   return (
     <div className="flex items-center gap-2">
-      <div className="flex bg-white rounded-xl p-0.5 shadow-xs">
+      <div ref={containerRef} className="relative flex bg-white rounded-xl p-0.5 shadow-xs">
+        <div
+          className="absolute top-0.5 h-[calc(100%-4px)] rounded-lg bg-primary shadow-sm transition-all duration-300 ease-out"
+          style={{ ...indicatorStyle, opacity: indicatorStyle.opacity ?? 0 }}
+        />
         {PERIODS.map((p) => (
           <button
             key={p.value}
+            data-active={value === p.value && !customOpen}
             onClick={() => { onChange(p.value); setCustomOpen(false); }}
-            className={`px-3 py-1.5 rounded-lg text-xs font-medium transition-all ${
+            className={`relative z-10 px-3 py-1.5 rounded-lg text-xs font-medium transition-colors duration-200 ${
               value === p.value && !customOpen
-                ? 'bg-primary text-white shadow-sm'
+                ? 'text-white'
                 : 'text-text-secondary hover:text-text'
             }`}
           >
@@ -38,7 +64,7 @@ export default function PeriodSelector({ value, onChange, showCustom = false, on
         {showCustom && (
           <button
             onClick={() => setCustomOpen(!customOpen)}
-            className={`flex items-center gap-1 px-2.5 py-1.5 rounded-lg text-xs font-medium transition-all ${
+            className={`relative z-10 flex items-center gap-1 px-2.5 py-1.5 rounded-lg text-xs font-medium transition-all ${
               customOpen
                 ? 'bg-primary text-white shadow-sm'
                 : 'text-text-secondary hover:text-text'

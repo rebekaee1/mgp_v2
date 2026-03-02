@@ -10,8 +10,8 @@ function TooltipPortal({ anchor, children, visible }) {
     if (!visible || !anchor.current) { setPos(null); return; }
     const rect = anchor.current.getBoundingClientRect();
     setPos({
-      top: rect.bottom + 8 + window.scrollY,
-      left: rect.left + rect.width / 2 + window.scrollX,
+      top: rect.top - 8,
+      left: rect.left + rect.width / 2,
     });
   }, [visible, anchor]);
 
@@ -19,13 +19,13 @@ function TooltipPortal({ anchor, children, visible }) {
   return createPortal(
     <div
       className="fixed z-[9999] pointer-events-none animate-fade-in"
-      style={{ top: pos.top - window.scrollY, left: pos.left, transform: 'translateX(-50%)' }}
+      style={{ top: pos.top, left: pos.left, transform: 'translate(-50%, -100%)' }}
     >
       <div className="flex flex-col items-center">
-        <div className="w-0 h-0 border-l-[6px] border-r-[6px] border-b-[6px] border-l-transparent border-r-transparent border-b-[#1E293B]" />
         <div className="w-52 px-3.5 py-2.5 rounded-xl bg-[#1E293B] text-white text-[11px] leading-relaxed shadow-xl">
           {children}
         </div>
+        <div className="w-0 h-0 border-l-[6px] border-r-[6px] border-t-[6px] border-l-transparent border-r-transparent border-t-[#1E293B]" />
       </div>
     </div>,
     document.body,

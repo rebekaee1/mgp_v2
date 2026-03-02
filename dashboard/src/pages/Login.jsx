@@ -38,12 +38,12 @@ export default function Login() {
 
       <div className="w-full max-w-sm relative z-10 animate-fade-in-up">
         <div className="text-center mb-8">
-          <div className="inline-flex items-center justify-center w-14 h-14 rounded-2xl bg-gradient-to-br from-primary to-[#3B82F6] shadow-lg mb-4">
-            <span className="text-white font-bold text-xl">A+</span>
-          </div>
-          <h1 className="text-2xl font-bold bg-gradient-to-r from-primary to-[#3B82F6] bg-clip-text text-transparent tracking-tight">
-            AIMPACT+
-          </h1>
+          <img
+            src="/logo.svg"
+            alt="AIMPACT+"
+            className="h-12 w-auto mx-auto mb-4"
+            draggable={false}
+          />
           <p className="text-sm text-text-secondary mt-1">Личный кабинет AI-ассистента</p>
         </div>
 
