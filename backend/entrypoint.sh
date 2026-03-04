@@ -3,6 +3,9 @@ set -e
 
 mkdir -p /app/logs 2>/dev/null || true
 
+# Remove stale scheduler lock (prevents deadlock when container restarts)
+rm -f /app/logs/.scheduler.lock 2>/dev/null || true
+
 # Copy SSH sync key with correct ownership (mounted as root:root from host)
 if [ -f /opt/lk-aimpact/sync_key ]; then
     cp /opt/lk-aimpact/sync_key /tmp/sync_key 2>/dev/null && chmod 600 /tmp/sync_key
