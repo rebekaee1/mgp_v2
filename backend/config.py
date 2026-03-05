@@ -26,6 +26,7 @@ class Settings(BaseSettings):
     openai_base_url: Optional[str] = None
     openai_model: str = "gpt-5-mini"
     ai_report_model: str = ""
+    ai_report_api_key: str = ""
 
     # --- TourVisor ---
     tourvisor_auth_login: str = ""

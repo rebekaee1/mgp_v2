@@ -1922,10 +1922,11 @@ def _get_report_client():
     if _report_llm_client is None:
         from openai import OpenAI
         from config import settings
-        if not settings.openai_api_key:
+        api_key = settings.ai_report_api_key or settings.openai_api_key
+        if not api_key:
             return None
         _report_llm_client = OpenAI(
-            api_key=settings.openai_api_key,
+            api_key=api_key,
             base_url=settings.openai_base_url or None,
             timeout=15.0,
         )
