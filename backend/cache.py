@@ -64,6 +64,17 @@ def cache_get(key: str) -> Optional[Any]:
         return None
 
 
+def cache_delete(key: str) -> bool:
+    """Remove key from cache. False on error."""
+    if not _available or _client is None:
+        return False
+    try:
+        _client.delete(key)
+        return True
+    except Exception:
+        return False
+
+
 def cache_set(key: str, value: Any, ttl_seconds: int = 86400) -> bool:
     """Записать в кеш с TTL. False при ошибке."""
     if not _available or _client is None:

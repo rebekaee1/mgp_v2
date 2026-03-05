@@ -16,6 +16,9 @@ COPY frontend/nginx.conf /etc/nginx/conf.d/default.conf
 # Dashboard SPA at root
 COPY --from=dashboard-build /app/dist/ /usr/share/nginx/html/
 
+# Widget loader script (served as static file with CORS *)
+COPY frontend/widget-loader.js /usr/share/nginx/html/widget-loader.js
+
 EXPOSE 80
 
 RUN apk add --no-cache curl

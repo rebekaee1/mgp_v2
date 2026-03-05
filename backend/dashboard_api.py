@@ -1544,6 +1544,8 @@ def widget_config_get():
         cfg = assistant.widget_config or {}
         return jsonify({
             "assistant_id": str(assistant.id),
+            "bot_server_url": assistant.bot_server_url or "",
+            "allowed_domains": assistant.allowed_domains or "",
             "welcome_message": cfg.get("welcome_message") or _WIDGET_DEFAULTS["welcome_message"],
             "position": cfg.get("position") or _WIDGET_DEFAULTS["position"],
             "primary_color": cfg.get("primary_color") or _WIDGET_DEFAULTS["primary_color"],
@@ -1568,11 +1570,23 @@ def widget_config_update():
         if not assistant:
             return jsonify({"error": "No active assistant"}), 404
 
+        if "bot_server_url" in data:
+            url_val = (data["bot_server_url"] or "").strip()
+            if url_val and not url_val.startswith(("http://", "https://")):
+                return jsonify({"error": "bot_server_url must start with http:// or https://"}), 400
+            assistant.bot_server_url = url_val or None
+
+        if "allowed_domains" in data:
+            assistant.allowed_domains = (data["allowed_domains"] or "").strip() or None
+
         cfg = dict(assistant.widget_config or {})
         for key in ("welcome_message", "position", "primary_color", "title", "subtitle", "logo_url", "active_preset"):
             if key in data:
                 cfg[key] = data[key]
         assistant.widget_config = cfg
+
+        from cache import cache_delete
+        cache_delete(f"widget:config:{assistant.id}")
 
         return jsonify({"status": "ok"})
 
@@ -1590,9 +1604,19 @@ def widget_embed_code():
         if not assistant:
             return jsonify({"error": "No active assistant"}), 404
 
-        host = request.host_url.rstrip("/")
+        if not assistant.bot_server_url:
+            return jsonify({
+                "error": "Сначала укажите URL сервера бота в настройках виджета",
+                "embed_code": None,
+                "assistant_id": str(assistant.id),
+            })
+
+        widget_host = os.environ.get("WIDGET_HOST_URL", "").strip()
+        if not widget_host:
+            widget_host = request.host_url.rstrip("/")
+
         code = (
-            f'<script src="{host}/widget.js" '
+            f'<script src="{widget_host}/widget-loader.js" '
             f'data-assistant-id="{assistant.id}"></script>'
         )
         return jsonify({"embed_code": code, "assistant_id": str(assistant.id)})

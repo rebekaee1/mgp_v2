@@ -68,6 +68,8 @@ class Assistant(Base):
     system_prompt: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     faq_content: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     widget_config: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
+    bot_server_url: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    allowed_domains: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow

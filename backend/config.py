@@ -46,6 +46,9 @@ class Settings(BaseSettings):
     gunicorn_threads: int = 4
     session_ttl_seconds: int = 1800
 
+    # --- Widget ---
+    widget_host_url: str = ""
+
     # --- Rate Limiting ---
     rate_limit_per_ip: int = 30
     rate_limit_per_session: int = 10

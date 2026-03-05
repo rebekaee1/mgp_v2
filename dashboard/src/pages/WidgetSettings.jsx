@@ -58,6 +58,8 @@ export default function WidgetSettings() {
   const [logoUrl, setLogoUrl] = useState(null);
   const [logoPreview, setLogoPreview] = useState(null);
   const [activePreset, setActivePreset] = useState(null);
+  const [botServerUrl, setBotServerUrl] = useState('');
+  const [allowedDomains, setAllowedDomains] = useState('');
   const [saving, setSaving] = useState(false);
   const [uploadingLogo, setUploadingLogo] = useState(false);
   const [copied, setCopied] = useState(false);
@@ -79,6 +81,8 @@ export default function WidgetSettings() {
     setSubtitle(config.subtitle || DEFAULTS.subtitle);
     setLogoUrl(config.logo_url || null);
     setActivePreset(config.active_preset || null);
+    setBotServerUrl(config.bot_server_url || '');
+    setAllowedDomains(config.allowed_domains || '');
   }, [config]);
 
   useEffect(() => {
@@ -98,6 +102,8 @@ export default function WidgetSettings() {
         subtitle,
         logo_url: logoUrl,
         active_preset: activePreset,
+        bot_server_url: botServerUrl,
+        allowed_domains: allowedDomains,
       };
       if (activePreset && (activePreset === 'robot' || activePreset === 'globe')) {
         payload.logo_url = presetSvgDataUrl(activePreset, primaryColor);
@@ -229,8 +235,56 @@ export default function WidgetSettings() {
         </p>
       </div>
 
-      {/* Live Preview */}
+      {/* Bot Server Connection */}
       <div className="bg-white rounded-2xl shadow-sm p-5 animate-fade-in-up stagger-1">
+        <h3 className="text-sm font-semibold text-text mb-1">Подключение к серверу бота</h3>
+        <p className="text-xs text-text-secondary mb-4">
+          Укажите адрес сервера, на котором установлен AI-ассистент. Без этого виджет не будет работать.
+        </p>
+
+        <div className="space-y-3">
+          <div>
+            <label className="block text-sm text-text-secondary mb-1.5">URL сервера бота</label>
+            <input
+              type="url"
+              value={botServerUrl}
+              onChange={(e) => setBotServerUrl(e.target.value)}
+              className="w-full px-3.5 py-2.5 border border-border/60 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-primary/20 focus:border-primary shadow-xs font-mono"
+              placeholder="http://72.56.88.193"
+            />
+            <p className="text-[11px] text-text-secondary mt-1">
+              Адрес сервера, где работает бот (например, http://72.56.88.193)
+            </p>
+          </div>
+          <div>
+            <label className="block text-sm text-text-secondary mb-1.5">Разрешённые домены <span className="text-text-secondary/50">(необязательно)</span></label>
+            <input
+              type="text"
+              value={allowedDomains}
+              onChange={(e) => setAllowedDomains(e.target.value)}
+              className="w-full px-3.5 py-2.5 border border-border/60 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-primary/20 focus:border-primary shadow-xs"
+              placeholder="example.com, shop.example.com"
+            />
+            <p className="text-[11px] text-text-secondary mt-1">
+              Домены, на которых разрешено встраивание виджета. Через запятую. Если пусто — без ограничений.
+            </p>
+          </div>
+        </div>
+
+        {!botServerUrl && (
+          <div className="mt-4 bg-amber-50 border border-amber-200 rounded-xl p-3 flex items-start gap-2">
+            <svg className="w-4 h-4 text-amber-500 mt-0.5 flex-shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-2.5L13.732 4c-.77-.833-1.964-.833-2.732 0L4.082 16.5c-.77.833.192 2.5 1.732 2.5z" />
+            </svg>
+            <p className="text-xs text-amber-800">
+              Укажите URL сервера бота и сохраните настройки, чтобы получить код для встраивания виджета.
+            </p>
+          </div>
+        )}
+      </div>
+
+      {/* Live Preview */}
+      <div className="bg-white rounded-2xl shadow-sm p-5 animate-fade-in-up stagger-2">
         <h3 className="text-sm font-semibold text-text mb-4">Предварительный просмотр</h3>
         <div className="bg-surface-sunken rounded-xl overflow-hidden" style={{ maxWidth: 380, margin: '0 auto' }}>
           {/* Preview header */}
@@ -292,7 +346,7 @@ export default function WidgetSettings() {
       </div>
 
       {/* Logo Upload */}
-      <div className="bg-white rounded-2xl shadow-sm p-5 animate-fade-in-up stagger-2">
+      <div className="bg-white rounded-2xl shadow-sm p-5 animate-fade-in-up stagger-3">
         <h3 className="text-sm font-semibold text-text mb-4">Логотип</h3>
         <p className="text-xs text-text-secondary mb-3">
           Отображается в шапке виджета и в аватаре бота. PNG, JPG или WebP, до 2 МБ.
@@ -412,7 +466,7 @@ export default function WidgetSettings() {
       </div>
 
       {/* Settings form */}
-      <div className="bg-white rounded-2xl shadow-sm p-5 space-y-4 animate-fade-in-up stagger-3">
+      <div className="bg-white rounded-2xl shadow-sm p-5 space-y-4 animate-fade-in-up stagger-4">
         <h3 className="text-sm font-semibold text-text">Параметры</h3>
 
         <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
@@ -544,7 +598,7 @@ export default function WidgetSettings() {
       </div>
 
       {/* Embed code */}
-      <div className="bg-white rounded-2xl shadow-sm p-5 animate-fade-in-up stagger-4">
+      <div className="bg-white rounded-2xl shadow-sm p-5 animate-fade-in-up stagger-5">
         <div className="flex items-center gap-2 mb-3">
           <div className="w-7 h-7 rounded-lg bg-primary-50 flex items-center justify-center">
             <Code2 size={14} className="text-primary" />
@@ -552,29 +606,38 @@ export default function WidgetSettings() {
           <h3 className="text-sm font-semibold text-text">Код для встраивания</h3>
         </div>
 
-        <div className="relative">
-          <pre className="bg-surface-sunken rounded-xl p-4 text-xs font-mono overflow-x-auto whitespace-pre-wrap break-all">
-            {embedData?.embed_code || 'Загрузка...'}
-          </pre>
-          <button
-            onClick={handleCopy}
-            className="absolute top-2 right-2 p-2 rounded-lg bg-white shadow-xs border border-border/40 hover:shadow-sm transition-all"
-          >
-            {copied ? <Check size={14} className="text-success" /> : <Copy size={14} className="text-text-secondary" />}
-          </button>
-        </div>
+        {embedData?.embed_code ? (
+          <>
+            <div className="relative">
+              <pre className="bg-surface-sunken rounded-xl p-4 text-xs font-mono overflow-x-auto whitespace-pre-wrap break-all">
+                {embedData.embed_code}
+              </pre>
+              <button
+                onClick={handleCopy}
+                className="absolute top-2 right-2 p-2 rounded-lg bg-white shadow-xs border border-border/40 hover:shadow-sm transition-all"
+              >
+                {copied ? <Check size={14} className="text-success" /> : <Copy size={14} className="text-text-secondary" />}
+              </button>
+            </div>
 
-        <div className="mt-4 text-xs text-text-secondary space-y-1">
-          <p className="font-medium text-text">Инструкция по установке:</p>
-          <ol className="list-decimal list-inside space-y-0.5 ml-1">
-            <li>Скопируйте код выше</li>
-            <li>
-              Вставьте перед закрывающим тегом{' '}
-              <code className="bg-surface-sunken px-1.5 py-0.5 rounded-md font-mono">&lt;/body&gt;</code>{' '}
-              на вашем сайте
-            </li>
-          </ol>
-        </div>
+            <div className="mt-4 text-xs text-text-secondary space-y-1">
+              <p className="font-medium text-text">Инструкция по установке:</p>
+              <ol className="list-decimal list-inside space-y-0.5 ml-1">
+                <li>Скопируйте код выше</li>
+                <li>
+                  Вставьте перед закрывающим тегом{' '}
+                  <code className="bg-surface-sunken px-1.5 py-0.5 rounded-md font-mono">&lt;/body&gt;</code>{' '}
+                  на вашем сайте
+                </li>
+                <li>Виджет автоматически появится на странице</li>
+              </ol>
+            </div>
+          </>
+        ) : (
+          <div className="bg-amber-50 border border-amber-200 rounded-xl p-4 text-xs text-amber-800">
+            {embedData?.error || 'Для получения кода встраивания сначала укажите URL сервера бота в настройках выше и сохраните.'}
+          </div>
+        )}
       </div>
     </div>
   );

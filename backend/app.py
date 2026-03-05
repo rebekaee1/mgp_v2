@@ -45,7 +45,7 @@ CORS(app, resources={
     r"/api/widget/*": {"origins": "*"},
     r"/api/v1/chat": {"origins": "*"},
     r"/api/*": {"origins": _allowed_origins},
-})
+}, supports_credentials=False)
 
 from dashboard_api import auth_bp, dash_bp
 app.register_blueprint(auth_bp)
@@ -581,35 +581,114 @@ def public_widget_config():
     _init_infrastructure()
     from database import get_db
     from models import Assistant
+    from cache import rate_limit_check, cache_get, cache_set
 
     assistant_id = request.args.get('assistant_id')
+    if not assistant_id:
+        return jsonify({"error": "assistant_id is required"}), 400
 
-    def _nocache(r):
-        r.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
-        return r
+    ip = request.remote_addr
+    rl_key = f"rl:wconfig:{ip}:{int(time.time()) // 60}"
+    if not rate_limit_check(rl_key, 30, 60):
+        return jsonify({"error": "Rate limit exceeded"}), 429
+
+    cache_key = f"widget:config:{assistant_id}"
+    cached = cache_get(cache_key)
+    if cached and isinstance(cached, dict):
+        resp = jsonify(cached)
+        resp.headers["Cache-Control"] = "public, max-age=60"
+        return resp
 
     with get_db() as db:
         if db is None:
-            return _nocache(jsonify(WIDGET_DEFAULTS))
+            return jsonify(WIDGET_DEFAULTS), 503
 
-        if assistant_id:
-            assistant = db.query(Assistant).filter(Assistant.id == assistant_id).first()
-        else:
-            assistant = db.query(Assistant).filter(Assistant.is_active.is_(True)).first()
+        assistant = db.query(Assistant).filter(
+            Assistant.id == assistant_id,
+            Assistant.is_active.is_(True),
+        ).first()
 
         if not assistant:
-            return _nocache(jsonify(WIDGET_DEFAULTS))
+            return jsonify({"error": "Assistant not found"}), 404
 
         cfg = assistant.widget_config or {}
-        resp = jsonify({
+        data = {
+            "assistant_id": str(assistant.id),
             "welcome_message": cfg.get("welcome_message") or WIDGET_DEFAULTS["welcome_message"],
             "primary_color": cfg.get("primary_color") or WIDGET_DEFAULTS["primary_color"],
             "position": cfg.get("position") or WIDGET_DEFAULTS["position"],
             "title": cfg.get("title") or WIDGET_DEFAULTS["title"],
             "subtitle": cfg.get("subtitle") or WIDGET_DEFAULTS["subtitle"],
             "logo_url": cfg.get("logo_url") or None,
-        })
-        return _nocache(resp)
+        }
+        cache_set(cache_key, data, ttl_seconds=300)
+
+        resp = jsonify(data)
+        resp.headers["Cache-Control"] = "public, max-age=60"
+        return resp
+
+
+@app.route('/api/widget/<assistant_id>/chat', methods=['POST', 'OPTIONS'])
+def widget_chat_proxy(assistant_id):
+    """Proxy chat requests to the bot server. Solves mixed-content (HTTPS→HTTP)."""
+    if request.method == 'OPTIONS':
+        return ('', 204)
+
+    _init_infrastructure()
+    from database import get_db
+    from models import Assistant
+    from cache import rate_limit_check
+    import httpx
+
+    ip = request.remote_addr
+    rl_key = f"rl:wchat:{ip}:{assistant_id}:{int(time.time()) // 60}"
+    if not rate_limit_check(rl_key, 30, 60):
+        return jsonify({"error": "Rate limit exceeded"}), 429
+
+    with get_db() as db:
+        if db is None:
+            return jsonify({"error": "Service temporarily unavailable"}), 503
+
+        assistant = db.query(Assistant).filter(
+            Assistant.id == assistant_id,
+            Assistant.is_active.is_(True),
+        ).first()
+
+        if not assistant or not assistant.bot_server_url:
+            return jsonify({"error": "Assistant not configured"}), 503
+
+        bot_url = assistant.bot_server_url.rstrip('/')
+
+    body = request.get_json(silent=True)
+    if not body or 'message' not in body:
+        return jsonify({"error": "message is required"}), 400
+
+    payload = {
+        "message": str(body["message"])[:500],
+        "conversation_id": str(body.get("conversation_id", "")),
+    }
+
+    try:
+        with httpx.Client(timeout=45.0) as client:
+            resp = client.post(
+                f"{bot_url}/api/v1/chat",
+                json=payload,
+                headers={"Content-Type": "application/json"},
+            )
+        return (resp.content, resp.status_code, {"Content-Type": "application/json"})
+    except httpx.TimeoutException:
+        return jsonify({"error": "Бот-сервер не отвечает. Попробуйте позже."}), 504
+    except httpx.ConnectError:
+        return jsonify({"error": "Бот-сервер недоступен. Попробуйте позже."}), 502
+    except Exception as e:
+        logger.exception("Widget chat proxy error")
+        return jsonify({"error": "Внутренняя ошибка сервера"}), 500
+
+
+@app.route('/widget/embed/<assistant_id>')
+def widget_embed_page(assistant_id):
+    """Serve the embeddable widget page (loaded inside iframe)."""
+    return send_from_directory(_FRONTEND_DIR, 'widget-embed.html')
 
 
 @app.route('/favicon.ico')
