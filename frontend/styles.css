@@ -114,9 +114,11 @@ body.mgp-demo {
     color: white;
 }
 
-#mgp-chat-root .chat-launcher:hover {
-    transform: scale(1.08);
-    box-shadow: 0 6px 30px rgba(227, 6, 19, 0.5);
+@media (hover: hover) {
+    #mgp-chat-root .chat-launcher:hover {
+        transform: scale(1.08);
+        box-shadow: 0 6px 30px rgba(227, 6, 19, 0.5);
+    }
 }
 
 #mgp-chat-root .chat-launcher:active {
@@ -171,6 +173,7 @@ body.mgp-demo {
     visibility: hidden;
     transform: translateY(20px) scale(0.95);
     transition: var(--mgp-transition);
+    overscroll-behavior: contain;
 }
 
 #mgp-chat-root .chat-widget.open {
@@ -248,13 +251,20 @@ body.mgp-demo {
     transition: var(--mgp-transition);
 }
 
-#mgp-chat-root .chat-new:hover,
-#mgp-chat-root .chat-close:hover {
-    background: rgba(255, 255, 255, 0.25);
+@media (hover: hover) {
+    #mgp-chat-root .chat-new:hover,
+    #mgp-chat-root .chat-close:hover {
+        background: rgba(255, 255, 255, 0.25);
+    }
+
+    #mgp-chat-root .chat-close:hover {
+        transform: rotate(90deg);
+    }
 }
 
-#mgp-chat-root .chat-close:hover {
-    transform: rotate(90deg);
+#mgp-chat-root .chat-new:active,
+#mgp-chat-root .chat-close:active {
+    background: rgba(255, 255, 255, 0.35);
 }
 
 #mgp-chat-root .chat-new svg,
@@ -274,12 +284,27 @@ body.mgp-demo {
     display: flex;
     flex-direction: column;
     gap: 16px;
+    overscroll-behavior: contain;
 }
 
-#mgp-chat-root .chat-messages::-webkit-scrollbar { width: 6px; }
-#mgp-chat-root .chat-messages::-webkit-scrollbar-track { background: transparent; }
-#mgp-chat-root .chat-messages::-webkit-scrollbar-thumb { background: var(--mgp-gray-medium); border-radius: 3px; }
-#mgp-chat-root .chat-messages::-webkit-scrollbar-thumb:hover { background: var(--mgp-gray-dark); }
+#mgp-chat-root .chat-messages::-webkit-scrollbar {
+    width: 6px;
+}
+
+#mgp-chat-root .chat-messages::-webkit-scrollbar-track {
+    background: transparent;
+}
+
+#mgp-chat-root .chat-messages::-webkit-scrollbar-thumb {
+    background: var(--mgp-gray-medium);
+    border-radius: 3px;
+}
+
+@media (hover: hover) {
+    #mgp-chat-root .chat-messages::-webkit-scrollbar-thumb:hover {
+        background: var(--mgp-gray-dark);
+    }
+}
 
 /* ============================================
    MESSAGE BUBBLES
@@ -366,10 +391,37 @@ body.mgp-demo {
     transition: var(--mgp-transition);
 }
 
-#mgp-chat-root .btn-retry:hover { background: var(--mgp-red-dark); transform: scale(1.02); }
-#mgp-chat-root .btn-new-chat { background: var(--mgp-text-light); }
-#mgp-chat-root .btn-new-chat:hover { background: var(--mgp-text); }
-#mgp-chat-root .error-actions { display: flex; gap: 8px; margin-top: 8px; }
+@media (hover: hover) {
+    #mgp-chat-root .btn-retry:hover {
+        background: var(--mgp-red-dark);
+        transform: scale(1.02);
+    }
+}
+
+#mgp-chat-root .btn-retry:active {
+    background: var(--mgp-red-dark);
+    transform: scale(0.97);
+}
+
+#mgp-chat-root .btn-new-chat {
+    background: var(--mgp-text-light);
+}
+
+@media (hover: hover) {
+    #mgp-chat-root .btn-new-chat:hover {
+        background: var(--mgp-text);
+    }
+}
+
+#mgp-chat-root .btn-new-chat:active {
+    background: var(--mgp-text);
+}
+
+#mgp-chat-root .error-actions {
+    display: flex;
+    gap: 8px;
+    margin-top: 8px;
+}
 
 /* ============================================
    TYPING INDICATOR
@@ -459,14 +511,33 @@ body.mgp-demo {
     scroll-snap-type: x mandatory;
     scroll-behavior: smooth;
     -webkit-overflow-scrolling: touch;
+}
+
+#mgp-chat-root .tour-cards-wrapper::-webkit-scrollbar {
+    height: 6px;
+}
+
+#mgp-chat-root .tour-cards-wrapper::-webkit-scrollbar-track {
+    background: var(--mgp-gray);
+    border-radius: 3px;
+}
+
+#mgp-chat-root .tour-cards-wrapper::-webkit-scrollbar-thumb {
+    background: linear-gradient(90deg, var(--mgp-red), #ff6b6b);
+    border-radius: 3px;
+}
+
+@media (hover: hover) {
+    #mgp-chat-root .tour-cards-wrapper::-webkit-scrollbar-thumb:hover {
+        background: var(--mgp-red-dark);
+    }
+}
+
+/* Firefox scrollbar */
+#mgp-chat-root .tour-cards-wrapper {
     scrollbar-width: thin;
     scrollbar-color: var(--mgp-red) var(--mgp-gray);
 }
-
-#mgp-chat-root .tour-cards-wrapper::-webkit-scrollbar { height: 6px; }
-#mgp-chat-root .tour-cards-wrapper::-webkit-scrollbar-track { background: var(--mgp-gray); border-radius: 3px; }
-#mgp-chat-root .tour-cards-wrapper::-webkit-scrollbar-thumb { background: linear-gradient(90deg, var(--mgp-red), #ff6b6b); border-radius: 3px; }
-#mgp-chat-root .tour-cards-wrapper::-webkit-scrollbar-thumb:hover { background: var(--mgp-red-dark); }
 
 #mgp-chat-root .tour-cards-nav-arrows {
     display: none;
@@ -497,11 +568,13 @@ body.mgp-demo {
     transition: var(--mgp-transition);
 }
 
-#mgp-chat-root .tour-cards-nav-arrows button:hover {
-    background: var(--mgp-red);
-    color: white;
-    border-color: var(--mgp-red);
-    transform: scale(1.1);
+@media (hover: hover) {
+    #mgp-chat-root .tour-cards-nav-arrows button:hover {
+        background: var(--mgp-red);
+        color: white;
+        border-color: var(--mgp-red);
+        transform: scale(1.1);
+    }
 }
 
 #mgp-chat-root .tour-cards-nav-arrows button:disabled { opacity: 0.3; cursor: not-allowed; transform: none; }
@@ -536,7 +609,12 @@ body.mgp-demo {
     #mgp-chat-root .tour-card { min-width: 75%; width: 75%; max-width: 75%; scroll-snap-align: center; }
 }
 
-#mgp-chat-root .tour-card:hover { transform: translateY(-2px); box-shadow: 0 4px 12px rgba(0, 0, 0, 0.12); }
+@media (hover: hover) {
+    #mgp-chat-root .tour-card:hover {
+        transform: translateY(-2px);
+        box-shadow: 0 4px 12px rgba(0, 0, 0, 0.12);
+    }
+}
 
 #mgp-chat-root .tour-card:nth-child(2) { animation-delay: 0.1s; }
 #mgp-chat-root .tour-card:nth-child(3) { animation-delay: 0.2s; }
@@ -552,7 +630,12 @@ body.mgp-demo {
 }
 
 #mgp-chat-root .tour-card-image { width: 100%; height: 100%; object-fit: cover; transition: transform 0.4s ease; }
-#mgp-chat-root .tour-card:hover .tour-card-image { transform: scale(1.05); }
+
+@media (hover: hover) {
+    #mgp-chat-root .tour-card:hover .tour-card-image {
+        transform: scale(1.05);
+    }
+}
 
 #mgp-chat-root .tour-card-image.placeholder {
     display: flex;
@@ -712,13 +795,17 @@ body.mgp-demo {
     box-shadow: 0 2px 8px rgba(39, 174, 96, 0.25);
 }
 
-#mgp-chat-root .btn-book:hover {
-    background: linear-gradient(135deg, var(--mgp-green-light) 0%, var(--mgp-green) 100%);
-    transform: translateY(-1px);
-    box-shadow: 0 4px 12px rgba(39, 174, 96, 0.35);
+@media (hover: hover) {
+    #mgp-chat-root .btn-book:hover {
+        background: linear-gradient(135deg, var(--mgp-green-light) 0%, var(--mgp-green) 100%);
+        transform: translateY(-1px);
+        box-shadow: 0 4px 12px rgba(39, 174, 96, 0.35);
+    }
 }
 
-#mgp-chat-root .btn-book:active { transform: translateY(0); }
+#mgp-chat-root .btn-book:active {
+    transform: scale(0.97);
+}
 
 #mgp-chat-root .btn-details {
     display: flex;
@@ -739,7 +826,17 @@ body.mgp-demo {
     transition: var(--mgp-transition);
 }
 
-#mgp-chat-root .btn-details:hover { background: var(--mgp-red); color: white; }
+@media (hover: hover) {
+    #mgp-chat-root .btn-details:hover {
+        background: var(--mgp-red);
+        color: white;
+    }
+}
+
+#mgp-chat-root .btn-details:active {
+    background: var(--mgp-red);
+    color: white;
+}
 
 #mgp-chat-root .btn-show-more {
     display: flex;
@@ -760,10 +857,25 @@ body.mgp-demo {
     margin-top: 8px;
 }
 
-#mgp-chat-root .btn-show-more:hover { background: var(--mgp-gray-light); border-color: var(--mgp-gray-medium); }
-#mgp-chat-root .btn-show-more .icon { font-size: 16px; transition: transform 0.3s ease; }
-#mgp-chat-root .btn-show-more:hover .icon { transform: translateY(3px); }
+@media (hover: hover) {
+    #mgp-chat-root .btn-show-more:hover {
+        background: var(--mgp-gray-light);
+        border-color: var(--mgp-gray-medium);
+    }
+}
 
+#mgp-chat-root .btn-show-more .icon {
+    font-size: 16px;
+    transition: transform 0.3s ease;
+}
+
+@media (hover: hover) {
+    #mgp-chat-root .btn-show-more:hover .icon {
+        transform: translateY(3px);
+    }
+}
+
+/* Extra cards block (shown after "Show more") */
 #mgp-chat-root .tour-cards-extra {
     position: relative;
     margin-top: 8px;
@@ -791,7 +903,17 @@ body.mgp-demo {
     box-shadow: 0 2px 8px rgba(227, 6, 19, 0.25);
 }
 
-#mgp-chat-root .btn-request-more:hover { transform: translateY(-1px); box-shadow: 0 4px 12px rgba(227, 6, 19, 0.35); }
+@media (hover: hover) {
+    #mgp-chat-root .btn-request-more:hover {
+        transform: translateY(-1px);
+        box-shadow: 0 4px 12px rgba(227, 6, 19, 0.35);
+    }
+}
+
+#mgp-chat-root .btn-request-more:active {
+    transform: scale(0.97);
+}
+
 #mgp-chat-root .btn-request-more .icon { font-size: 14px; }
 
 #mgp-chat-root .tour-cards-nav {
@@ -866,14 +988,49 @@ body.mgp-demo {
     box-shadow: 0 4px 12px rgba(227, 6, 19, 0.3);
 }
 
-#mgp-chat-root .chat-send:hover { transform: scale(1.08); box-shadow: 0 6px 20px rgba(227, 6, 19, 0.4); }
-#mgp-chat-root .chat-send:active { transform: scale(0.95); }
-#mgp-chat-root .chat-send:disabled { background: var(--mgp-gray); cursor: not-allowed; transform: none; box-shadow: none; }
-#mgp-chat-root .chat-send svg { width: 22px; height: 22px; }
+@media (hover: hover) {
+    #mgp-chat-root .chat-send:hover {
+        transform: scale(1.08);
+        box-shadow: 0 6px 20px rgba(227, 6, 19, 0.4);
+    }
+}
 
-#mgp-chat-root .chat-powered { text-align: center; font-size: 11px; color: var(--mgp-text-muted); margin-top: 12px; }
-#mgp-chat-root .chat-powered a { color: var(--mgp-red); font-weight: 600; text-decoration: none; transition: var(--mgp-transition-fast); }
-#mgp-chat-root .chat-powered a:hover { text-decoration: underline; opacity: 0.85; }
+#mgp-chat-root .chat-send:active {
+    transform: scale(0.95);
+}
+
+#mgp-chat-root .chat-send:disabled {
+    background: var(--mgp-gray);
+    cursor: not-allowed;
+    transform: none;
+    box-shadow: none;
+}
+
+#mgp-chat-root .chat-send svg {
+    width: 22px;
+    height: 22px;
+}
+
+#mgp-chat-root .chat-powered {
+    text-align: center;
+    font-size: 11px;
+    color: var(--mgp-text-muted);
+    margin-top: 12px;
+}
+
+#mgp-chat-root .chat-powered a {
+    color: var(--mgp-red);
+    font-weight: 600;
+    text-decoration: none;
+    transition: var(--mgp-transition-fast);
+}
+
+@media (hover: hover) {
+    #mgp-chat-root .chat-powered a:hover {
+        text-decoration: underline;
+        opacity: 0.85;
+    }
+}
 
 /* ============================================
    QUICK REPLIES
@@ -892,7 +1049,18 @@ body.mgp-demo {
     transition: var(--mgp-transition);
 }
 
-#mgp-chat-root .quick-reply:hover { background: var(--mgp-red); color: white; transform: translateY(-2px); }
+@media (hover: hover) {
+    #mgp-chat-root .quick-reply:hover {
+        background: var(--mgp-red);
+        color: white;
+        transform: translateY(-2px);
+    }
+}
+
+#mgp-chat-root .quick-reply:active {
+    background: var(--mgp-red);
+    color: white;
+}
 
 /* ============================================
    RESPONSIVE DESIGN
@@ -900,13 +1068,21 @@ body.mgp-demo {
 @media (max-width: 480px) {
     #mgp-chat-root .chat-launcher { bottom: 16px; right: 16px; width: 58px; height: 58px; }
 
+    #mgp-chat-root .chat-launcher.active {
+        opacity: 0;
+        pointer-events: none;
+        transform: scale(0);
+    }
+
     #mgp-chat-root .chat-widget {
         bottom: 0;
         right: 0;
         left: 0;
         width: 100%;
         height: 100%;
+        height: 100dvh;
         max-height: 100vh;
+        max-height: 100dvh;
         border-radius: 0;
     }
 
@@ -915,18 +1091,57 @@ body.mgp-demo {
     .demo-page h1 { font-size: 1.8rem; }
     .demo-page p { font-size: 1rem; }
 
-    #mgp-chat-root .tour-cards-container { max-width: 100%; }
-    #mgp-chat-root .tour-card-image-container { height: 160px; }
-    #mgp-chat-root .tour-card-price-value { font-size: 22px; }
-    #mgp-chat-root .chat-header { padding: 14px 16px; }
-    #mgp-chat-root .chat-messages { padding: 16px; }
-    #mgp-chat-root .chat-footer { padding: 12px 16px; }
-    #mgp-chat-root .chat-input { padding: 12px 16px; }
-    #mgp-chat-root .chat-send { width: 44px; height: 44px; }
+    #mgp-chat-root .tour-cards-container {
+        max-width: 100%;
+    }
+
+    #mgp-chat-root .tour-card-image-container {
+        height: 160px;
+    }
+
+    #mgp-chat-root .tour-card-price-value {
+        font-size: 22px;
+    }
+
+    #mgp-chat-root .chat-header {
+        padding: 14px 16px;
+    }
+
+    #mgp-chat-root .chat-new,
+    #mgp-chat-root .chat-close {
+        width: 42px;
+        height: 42px;
+    }
+
+    #mgp-chat-root .chat-messages {
+        padding: 16px;
+    }
+
+    #mgp-chat-root .chat-footer {
+        padding: 12px 16px;
+        padding-bottom: calc(12px + env(safe-area-inset-bottom, 0px));
+    }
+
+    #mgp-chat-root .chat-input {
+        padding: 12px 16px;
+        font-size: 16px;
+    }
+
+    #mgp-chat-root .chat-send {
+        width: 44px;
+        height: 44px;
+    }
 }
 
 @media (min-width: 481px) and (max-width: 768px) {
-    #mgp-chat-root .chat-widget { width: 380px; height: 600px; }
+    #mgp-chat-root .chat-widget {
+        width: 380px;
+        height: 600px;
+    }
+
+    #mgp-chat-root .chat-input {
+        font-size: 16px;
+    }
 }
 
 /* ============================================
@@ -966,6 +1181,68 @@ body.mgp-demo {
 @keyframes shimmer {
     0% { background-position: 200% 0; }
     100% { background-position: -200% 0; }
+}
+
+/* ============================================
+   DARK MODE (optional)
+   ============================================ */
+@media (prefers-color-scheme: dark) {
+    /* Widget stays light for contrast */
+}
+
+/* ============================================
+   REDUCED MOTION
+   ============================================ */
+@media (prefers-reduced-motion: reduce) {
+    *,
+    *::before,
+    *::after {
+        animation-duration: 0.01ms !important;
+        animation-iteration-count: 1 !important;
+        transition-duration: 0.01ms !important;
+    }
+}
+
+/* ============================================
+   LANDSCAPE ORIENTATION (phones)
+   ============================================ */
+@media (max-width: 768px) and (orientation: landscape) {
+    #mgp-chat-root .chat-header {
+        padding: 8px 16px;
+    }
+
+    #mgp-chat-root .chat-logo {
+        width: 32px;
+        height: 32px;
+    }
+
+    #mgp-chat-root .chat-logo svg {
+        width: 20px;
+        height: 20px;
+    }
+
+    #mgp-chat-root .chat-messages {
+        padding: 8px 16px;
+    }
+
+    #mgp-chat-root .chat-footer {
+        padding: 8px 16px;
+        padding-bottom: calc(8px + env(safe-area-inset-bottom, 0px));
+    }
+
+    #mgp-chat-root .chat-input {
+        padding: 10px 14px;
+        font-size: 16px;
+    }
+
+    #mgp-chat-root .chat-send {
+        width: 40px;
+        height: 40px;
+    }
+
+    #mgp-chat-root .chat-powered {
+        margin-top: 6px;
+    }
 }
 
 /* ============================================

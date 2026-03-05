@@ -54,6 +54,9 @@ app.register_blueprint(dash_bp)
 from werkzeug.middleware.proxy_fix import ProxyFix
 app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_prefix=1)
 
+_MAX_MESSAGE_LENGTH = 2000
+_MAX_SESSIONS = 500
+
 # === ИНИЦИАЛИЗАЦИЯ ИНФРАСТРУКТУРЫ (PostgreSQL, Redis) ===
 _infra_lock = threading.Lock()
 _infra_done = False
@@ -537,6 +540,12 @@ def _log_tour_searches(db, conv_id, tool_calls_data, tour_cards=None):
 _FRONTEND_DIR = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "frontend"))
 
 
+def _is_internal_request() -> bool:
+    """Check if request comes from localhost or Docker internal network."""
+    ip = request.remote_addr or ""
+    return ip in ("127.0.0.1", "::1", "172.18.0.1") or ip.startswith("172.") or ip.startswith("10.")
+
+
 @app.route('/')
 def index():
     """Главная страница — новый чат-виджет"""
@@ -745,20 +754,25 @@ def _log_request_start():
     g.request_id = uuid.uuid4().hex[:8]
     logger.info("-> %s %s rid=%s ip=%s", request.method, request.path, g.request_id, request.remote_addr)
 
-    from cache import rate_limit_check
-    from config import settings
-    ip = request.remote_addr
+    try:
+        from cache import rate_limit_check
+        from config import settings
+        ip = request.remote_addr or "unknown"
 
-    if request.path in ('/api/auth/login', '/api/auth/refresh'):
-        auth_key = f"rl:auth:{ip}:{int(time.time()) // 300}"
-        if not rate_limit_check(auth_key, 10, 300):
-            return jsonify({"error": "Too many login attempts. Try again in 5 minutes."}), 429
+        if request.path in ('/api/auth/login', '/api/auth/refresh'):
+            auth_key = f"rl:auth:{ip}:{int(time.time()) // 300}"
+            if not rate_limit_check(auth_key, 10, 300):
+                return jsonify({"error": "Too many login attempts. Try again in 5 minutes."}), 429
 
-    if request.path.startswith(('/api/chat', '/api/v1/chat')):
-        ip_key = f"rl:ip:{ip}:{int(time.time()) // 60}"
-        if not rate_limit_check(ip_key, settings.rate_limit_per_ip, 60):
-            return jsonify({"error": "Rate limit exceeded"}), 429
+        if request.path.startswith(('/api/chat', '/api/v1/chat')):
+            ip_key = f"rl:ip:{ip}:{int(time.time()) // 60}"
+            if not rate_limit_check(ip_key, settings.rate_limit_per_ip, 60):
+                logger.warning("🚫 RATE LIMIT ip=%s path=%s", ip, request.path)
+                return jsonify({"error": "Rate limit exceeded", "reply": "Слишком много запросов. Подождите минуту."}), 429
+    except Exception:
+        pass
 
+    # Периодическая очистка устаревших сессий (каждые 5 минут)
     now = time.time()
     if now - _last_cleanup[0] > 300:
         _last_cleanup[0] = now
@@ -794,12 +808,14 @@ def _handle_unexpected_error(e: Exception):
 @app.route('/api/chat', methods=['POST'])
 def chat():
     """Обычный chat без streaming"""
-    data = request.json
-    message = data.get('message', '')
+    data = request.json or {}
+    message = data.get('message', '').strip()
     session_id = data.get('session_id', 'default')
     
     if not message:
         return jsonify({'error': 'Empty message'}), 400
+    if len(message) > _MAX_MESSAGE_LENGTH:
+        return jsonify({'error': 'Message too long'}), 400
     
     handler = get_handler(session_id)
     
@@ -837,8 +853,8 @@ def chat_v1():
     - tour_cards — массив структурированных объектов для визуальных карточек
     - reply — текстовый ответ ассистента (без Markdown-карточек)
     """
-    data = request.json
-    message = data.get('message', '')
+    data = request.json or {}
+    message = data.get('message', '').strip()
     conversation_id = data.get('conversation_id', str(uuid.uuid4()))
     assistant_id = data.get('assistant_id')
 
@@ -850,8 +866,27 @@ def chat_v1():
             'conversation_id': conversation_id
         }), 400
 
+    if len(message) > _MAX_MESSAGE_LENGTH:
+        return jsonify({
+            'error': 'Message too long',
+            'reply': f'Сообщение слишком длинное (макс. {_MAX_MESSAGE_LENGTH} символов).',
+            'tour_cards': [],
+            'conversation_id': conversation_id
+        }), 400
+
     # conversation_id → session_id
     session_id = conversation_id
+
+    # Session count limit
+    with _handlers_lock:
+        if session_id not in _handlers and len(_handlers) >= _MAX_SESSIONS:
+            logger.warning("🚫 SESSION LIMIT reached (%d), rejecting new session", _MAX_SESSIONS)
+            return jsonify({
+                'error': 'Server busy',
+                'reply': 'Сервер перегружен. Попробуйте позже.',
+                'tour_cards': [],
+                'conversation_id': conversation_id
+            }), 503
 
     log(f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━", "INFO")
     log(f"📨 [v1] Новое сообщение от {session_id[:8]}...", "MSG")
@@ -919,10 +954,15 @@ def chat_v1():
 @app.route('/api/chat/stream', methods=['POST'])
 def chat_stream():
     """Chat со streaming через SSE"""
-    data = request.json
-    message = data.get('message', '')
+    data = request.json or {}
+    message = data.get('message', '').strip()
     session_id = data.get('conversation_id') or data.get('session_id', 'default')
     _stream_assistant_id = data.get('assistant_id')
+
+    if not message:
+        return jsonify({'error': 'Empty message'}), 400
+    if len(message) > _MAX_MESSAGE_LENGTH:
+        return jsonify({'error': 'Message too long'}), 400
     
     log(f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━", "INFO")
     log(f"📨 Новое сообщение от {session_id[:8]}...", "MSG")
@@ -930,10 +970,6 @@ def chat_stream():
     
     # Логируем входящее сообщение пользователя
     _write_dialogue_log(session_id, "USER", message)
-    
-    if not message:
-        log("❌ Пустое сообщение!", "ERROR")
-        return jsonify({'error': 'Empty message'}), 400
     
     handler = get_handler(session_id)
     _stream_ip = request.remote_addr
@@ -1073,7 +1109,9 @@ def health():
 
 @app.route('/api/status')
 def status():
-    """Статус сервера"""
+    """Статус сервера (только внутренние IP)."""
+    if not _is_internal_request():
+        return jsonify({"error": "Forbidden"}), 403
     with _handlers_lock:
         session_count = len(_handlers)
     return jsonify({
@@ -1086,8 +1124,10 @@ def status():
 def get_metrics():
     """
     Возвращает агрегированные метрики по всем активным сессиям.
-    Используется для мониторинга качества работы AI-ассистента.
+    Доступно только с внутренних IP.
     """
+    if not _is_internal_request():
+        return jsonify({"error": "Forbidden"}), 403
     with _handlers_lock:
         aggregated = {
             "total_sessions": len(_handlers),

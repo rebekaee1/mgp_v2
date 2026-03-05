@@ -367,6 +367,9 @@
     function openChat() {
         elements.widget.classList.add('open');
         elements.launcher.classList.add('active');
+        if (window.innerWidth <= 480) {
+            document.body.style.overflow = 'hidden';
+        }
         elements.input.focus();
         
         if (!conversationId) {
@@ -377,6 +380,7 @@
     function closeChat() {
         elements.widget.classList.remove('open');
         elements.launcher.classList.remove('active');
+        document.body.style.overflow = '';
     }
 
     function startNewChat() {
