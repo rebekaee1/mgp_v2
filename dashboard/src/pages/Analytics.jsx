@@ -16,10 +16,11 @@ import {
 } from '../hooks/useDashboardAPI';
 import api from '../lib/api';
 import { COUNTRY_NAMES, DEPARTURE_NAMES, MEAL_NAMES, STARS_LABELS, formatShortDate } from '../lib/constants';
+import { useRelativeTimeLabel } from '../lib/dataFreshness';
 import {
   MessageSquare, Clock, Globe, MapPin, BookmarkCheck,
   Moon, Users, Building2, Calendar, Download, TrendingUp,
-  Wallet, Plane, UserCheck, X,
+  Wallet, Plane, UserCheck, X, RefreshCw, Sparkles, ChevronDown, FileText,
 } from 'lucide-react';
 
 const SEMANTIC_COLORS = [
@@ -405,8 +406,8 @@ function OperatorsChart({ data }) {
 }
 
 const ALL_STARS = [5, 4, 3, 2];
-const ALL_MEALS = [1, 2, 3, 4, 5, 6, 7, 8, 9];
-const MEAL_SHORT = { 1: 'RO', 2: 'BB', 3: 'HB', 4: 'FB', 5: 'AI', 6: 'UAI', 7: 'HB+', 8: 'FB+', 9: 'AI+' };
+const ALL_MEALS = [2, 3, 4, 5, 6, 7, 8, 9];
+const MEAL_SHORT = { 2: 'RO', 3: 'BB', 4: 'HB', 5: 'FB', 6: 'HB+', 7: 'AI', 8: 'FB+', 9: 'UAI' };
 
 function CombinationGrid({ combos }) {
   const [tip, setTip] = useState(null);
@@ -534,6 +535,136 @@ function BudgetVsPrice({ data }) {
   );
 }
 
+function AIReportCard({ data, loading, onRefresh, softRefreshing, onGenerate }) {
+  const [expanded, setExpanded] = useState(false);
+  const contentRef = useRef(null);
+  const generatedAt = data?.generated_at ? new Date(data.generated_at).getTime() : null;
+  const timeLabel = useRelativeTimeLabel(generatedAt);
+
+  const preview = useMemo(() => {
+    if (!data?.report) return '';
+    const first = data.report.split('\n').find(l => l.trim().length > 0) || '';
+    return first.length > 120 ? first.slice(0, 117) + '...' : first;
+  }, [data?.report]);
+
+  if (loading) {
+    return (
+      <div className="bg-white rounded-2xl shadow-sm p-4 border-l-4 border-success/40 animate-fade-in-up">
+        <div className="flex items-center gap-2">
+          <div className="w-6 h-6 rounded-lg bg-success/10 flex items-center justify-center">
+            <Sparkles size={12} className="text-success animate-pulse" />
+          </div>
+          <span className="text-sm font-semibold text-text">ИИ-отчёт</span>
+          <span className="text-xs text-text-secondary">— генерация...</span>
+        </div>
+      </div>
+    );
+  }
+
+  if (data?.error) {
+    return (
+      <div className="bg-white rounded-2xl shadow-sm p-4 border-l-4 border-warning/40 animate-fade-in-up">
+        <div className="flex items-center justify-between">
+          <div className="flex items-center gap-2">
+            <div className="w-6 h-6 rounded-lg bg-warning-light flex items-center justify-center">
+              <Sparkles size={12} className="text-warning" />
+            </div>
+            <span className="text-sm font-semibold text-text">ИИ-отчёт</span>
+            <span className="text-xs text-text-secondary">— {data.error}</span>
+          </div>
+          {data.retry !== false && (
+            <button
+              onClick={onRefresh}
+              className="text-xs text-primary font-medium hover:underline"
+            >
+              Попробовать снова
+            </button>
+          )}
+        </div>
+      </div>
+    );
+  }
+
+  if (!data?.report) {
+    return (
+      <div className="bg-white rounded-2xl shadow-sm p-4 border-l-4 border-primary/30 animate-fade-in-up">
+        <div className="flex items-center justify-between">
+          <div className="flex items-center gap-2">
+            <div className="w-6 h-6 rounded-lg bg-primary/10 flex items-center justify-center">
+              <Sparkles size={12} className="text-primary" />
+            </div>
+            <span className="text-sm font-semibold text-text">ИИ-отчёт</span>
+            <span className="text-xs text-text-secondary">— анализ метрик с помощью AI</span>
+          </div>
+          <button
+            onClick={onGenerate}
+            className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-white bg-primary rounded-lg hover:bg-primary/90 transition-colors"
+          >
+            <Sparkles size={11} />
+            Сгенерировать
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="bg-white rounded-2xl shadow-sm border-l-4 border-success animate-fade-in-up overflow-hidden">
+      <button
+        onClick={() => setExpanded(v => !v)}
+        className="w-full flex items-center justify-between px-4 py-3.5 text-left hover:bg-success/[0.02] transition-colors cursor-pointer"
+      >
+        <div className="flex items-center gap-2 min-w-0">
+          <div className="w-6 h-6 rounded-lg bg-success/10 flex items-center justify-center shrink-0">
+            <Sparkles size={12} className="text-success" />
+          </div>
+          <span className="text-sm font-semibold text-text shrink-0">ИИ-отчёт</span>
+          {!expanded && preview && (
+            <span className="text-xs text-text-secondary truncate ml-1">— {preview}</span>
+          )}
+        </div>
+        <div className="flex items-center gap-2 shrink-0 ml-3">
+          <span className="text-[10px] text-text-secondary hidden sm:inline">{timeLabel}</span>
+          <ChevronDown
+            size={16}
+            className={`text-text-secondary transition-transform duration-300 ${expanded ? 'rotate-180' : ''}`}
+          />
+        </div>
+      </button>
+
+      <div
+        ref={contentRef}
+        className="transition-all duration-300 ease-in-out overflow-hidden"
+        style={{
+          maxHeight: expanded ? (contentRef.current?.scrollHeight || 1000) + 'px' : '0px',
+          opacity: expanded ? 1 : 0,
+        }}
+      >
+        <div className="px-5 pb-4 pt-1">
+          <div className="text-sm text-text leading-relaxed whitespace-pre-line">
+            {data.report}
+          </div>
+          <div className="flex items-center justify-between mt-4 pt-3 border-t border-border/30">
+            <span className="text-[10px] text-text-secondary">
+              Обновлено {timeLabel.toLowerCase()}
+              {data.saved && ' · сохранён'}
+            </span>
+            <button
+              onClick={(e) => { e.stopPropagation(); onGenerate(); }}
+              title="Сгенерировать заново"
+              className="flex items-center gap-1 text-[11px] text-text-secondary hover:text-success transition-colors"
+            >
+              <RefreshCw size={11} className={softRefreshing ? 'animate-spin' : ''} />
+              Обновить отчёт
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+
 function ExportButton({ period }) {
   const [loading, setLoading] = useState(false);
 
@@ -569,29 +700,107 @@ function ExportButton({ period }) {
   );
 }
 
+
+function PDFExportButton({ period }) {
+  const [loading, setLoading] = useState(false);
+
+  const handleExport = useCallback(async () => {
+    setLoading(true);
+    try {
+      const res = await api.get('/dashboard/export/report.pdf', {
+        params: { period },
+        responseType: 'blob',
+      });
+      const url = window.URL.createObjectURL(new Blob([res.data], { type: 'application/pdf' }));
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `aimpact_report_${period}.pdf`;
+      a.click();
+      window.URL.revokeObjectURL(url);
+    } catch {
+      /* ignore */
+    } finally {
+      setLoading(false);
+    }
+  }, [period]);
+
+  return (
+    <button
+      onClick={handleExport}
+      disabled={loading}
+      className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-primary-50 text-primary text-xs font-medium hover:bg-primary/10 transition-colors disabled:opacity-50"
+    >
+      <FileText size={12} />
+      {loading ? 'Генерация...' : 'PDF'}
+    </button>
+  );
+}
+
 export default function Analytics() {
   const [period, setPeriod] = useState('30d');
+  const [refreshKey, setRefreshKey] = useState(0);
+  const refreshOpts = useMemo(() => ({ refreshKey }), [refreshKey]);
 
-  const { data: destData, loading: loadDest } = useAnalyticsDestinations(period);
-  const { data: depData, loading: loadDep } = useAnalyticsDepartures(period);
-  const { data: paramsData, loading: loadParams } = useAnalyticsSearchParams(period);
-  const { data: rtData, loading: loadRT } = useAnalyticsResponseTimes(period);
-  const { data: typesData } = useAnalyticsSearchTypes(period);
-  const { data: demandData, loading: loadDemand } = useAnalyticsDemand(period);
-  const { data: operatorsData, loading: loadOps } = useAnalyticsOperators(period);
-  const { data: activityData, loading: loadActivity } = useAnalyticsActivity(period);
-  const { data: travelDatesData, loading: loadTravelDates } = useAnalyticsTravelDates(period);
-  const { data: bizData } = useAnalyticsBusinessMetrics(period);
+  const { data: destData, loading: loadDest, lastFetchedAt: destFetchedAt, softRefreshing: destRefreshing } = useAnalyticsDestinations(period, refreshOpts);
+  const { data: depData, loading: loadDep } = useAnalyticsDepartures(period, refreshOpts);
+  const { data: paramsData, loading: loadParams } = useAnalyticsSearchParams(period, refreshOpts);
+  const { data: rtData, loading: loadRT } = useAnalyticsResponseTimes(period, refreshOpts);
+  const { data: typesData } = useAnalyticsSearchTypes(period, refreshOpts);
+  const { data: demandData, loading: loadDemand } = useAnalyticsDemand(period, refreshOpts);
+  const { data: operatorsData, loading: loadOps } = useAnalyticsOperators(period, refreshOpts);
+  const { data: activityData, loading: loadActivity } = useAnalyticsActivity(period, refreshOpts);
+  const { data: travelDatesData, loading: loadTravelDates } = useAnalyticsTravelDates(period, refreshOpts);
+  const { data: bizData } = useAnalyticsBusinessMetrics(period, refreshOpts);
 
-  const destinations = (destData?.data || []).map((r) => ({
+  const [reportData, setReportData] = useState(null);
+  const [loadReport, setLoadReport] = useState(false);
+  const [reportRefreshing, setReportRefreshing] = useState(false);
+  const reportAbortRef = useRef(null);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    api.get('/dashboard/analytics/ai-report', { params: { period }, signal: controller.signal })
+      .then(({ data: res }) => { if (res?.report) setReportData(res); else setReportData(null); })
+      .catch(() => {});
+    return () => controller.abort();
+  }, [period]);
+
+  const handleReportGenerate = useCallback(async () => {
+    if (reportAbortRef.current) reportAbortRef.current.abort();
+    const controller = new AbortController();
+    reportAbortRef.current = controller;
+
+    if (reportData?.report) {
+      setReportRefreshing(true);
+    } else {
+      setLoadReport(true);
+    }
+    try {
+      const { data: res } = await api.get('/dashboard/analytics/ai-report', { params: { period, force: true }, signal: controller.signal });
+      setReportData(res);
+    } catch (err) {
+      if (err?.name !== 'CanceledError' && err?.code !== 'ERR_CANCELED') {
+        setReportData({ error: err.response?.data?.error || err.message });
+      }
+    } finally {
+      setLoadReport(false);
+      setReportRefreshing(false);
+    }
+  }, [period, reportData]);
+
+  const handleReportRefresh = useCallback(() => handleReportGenerate(), [handleReportGenerate]);
+
+  const handleRefreshAll = useCallback(() => setRefreshKey((k) => k + 1), []);
+
+  const destinations = useMemo(() => (destData?.data || []).map((r) => ({
     name: COUNTRY_NAMES[r.country_code] || `#${r.country_code}`,
     value: r.count,
-  }));
+  })), [destData]);
 
-  const departures = (depData?.data || []).map((r) => ({
+  const departures = useMemo(() => (depData?.data || []).map((r) => ({
     name: DEPARTURE_NAMES[r.departure_code] || `#${r.departure_code}`,
     value: r.count,
-  }));
+  })), [depData]);
 
   const starsChart = (paramsData?.stars || []).map((r) => ({
     name: STARS_LABELS[r.stars] || `${r.stars}★`,
@@ -619,8 +828,7 @@ export default function Analytics() {
   const nightsData = demandData?.nights_distribution || [];
   const groupData = demandData?.group_sizes || [];
 
-  const mskHour = new Date(new Date().toLocaleString('en-US', { timeZone: 'Europe/Moscow' })).getHours();
-  const updateLabel = mskHour >= 19 ? 'сегодня в 19:00' : mskHour >= 12 ? 'сегодня в 12:00' : 'вчера в 19:00';
+  const updateLabel = useRelativeTimeLabel(destFetchedAt);
 
   const topInsights = useMemo(() => {
     const items = [];
@@ -651,8 +859,9 @@ export default function Analytics() {
           <h1 className="text-xl font-bold text-text">Аналитика</h1>
           <p className="text-sm text-text-secondary mt-0.5">Эффективность AI-ассистента и анализ спроса</p>
         </div>
-        <div className="flex items-center gap-3">
+        <div className="flex items-center gap-2">
           <ExportButton period={period} />
+          <PDFExportButton period={period} />
           <PeriodSelector value={period} onChange={setPeriod} />
         </div>
       </div>
@@ -729,7 +938,16 @@ export default function Analytics() {
               <TrendingUp size={14} className="text-primary" />
               <span className="text-xs font-semibold text-text">Ключевые выводы:</span>
             </div>
-            <span className="text-[10px] text-text-secondary">Обновлено: {updateLabel}</span>
+            <div className="flex items-center gap-2">
+              <span className="text-[10px] text-text-secondary">{updateLabel}</span>
+              <button
+                onClick={handleRefreshAll}
+                title="Обновить все данные"
+                className="p-1 rounded-md text-text-secondary hover:text-primary hover:bg-primary-50 transition-colors"
+              >
+                <RefreshCw size={11} className={destRefreshing ? 'animate-spin' : ''} />
+              </button>
+            </div>
           </div>
           <div className="flex flex-wrap gap-2">
             {topInsights.map((t, i) => (
@@ -738,6 +956,15 @@ export default function Analytics() {
           </div>
         </div>
       )}
+
+      {/* AI Report */}
+      <AIReportCard
+        data={reportData}
+        loading={loadReport}
+        onRefresh={handleReportRefresh}
+        softRefreshing={reportRefreshing}
+        onGenerate={handleReportGenerate}
+      />
 
       {/* Geography */}
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
@@ -809,7 +1036,7 @@ export default function Analytics() {
         </ChartCard>
 
         <ChartCard title="Бюджет клиентов" subtitle="Распределение по ценовым диапазонам">
-          {budgetsChart.length ? (
+          {loadParams ? <LoadingSkeleton rows={3} /> : budgetsChart.length ? (
             <ResponsiveContainer width="100%" height={220}>
               <BarChart data={budgetsChart}>
                 <CartesianGrid strokeDasharray="3 3" stroke="#E2E8F0" vertical={false} />

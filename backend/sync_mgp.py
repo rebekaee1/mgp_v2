@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 """
 Sync engine: pulls new conversations, messages, and tour_searches from a remote
 MGP bot PostgreSQL (accessed via SSH tunnel) into the local ЛК database.
@@ -12,9 +14,16 @@ Usage:
     # Integrated with APScheduler inside the ЛК backend (see scheduler.py).
 """
 
+import json
 import logging
 import os
 import signal
+
+try:
+    from dotenv import load_dotenv
+    load_dotenv(os.path.join(os.path.dirname(__file__), "..", ".env"))
+except ImportError:
+    pass
 import socket
 import subprocess
 import time
@@ -27,6 +36,24 @@ import psycopg
 logger = logging.getLogger("mgp_bot.sync")
 
 SYNC_STATE_KEY = "sync:mgp:watermarks"
+SYNC_STATUS_FILE = os.path.join(os.path.dirname(__file__), "..", "logs", "sync_status.json")
+
+
+def _write_sync_status(conversations: int, messages: int, searches: int, success: bool):
+    """Persist sync result to a JSON file so the dashboard API can report freshness."""
+    status = {
+        "last_sync_at": datetime.now(timezone.utc).isoformat(),
+        "success": success,
+        "conversations_synced": conversations,
+        "messages_synced": messages,
+        "searches_synced": searches,
+    }
+    try:
+        os.makedirs(os.path.dirname(SYNC_STATUS_FILE), exist_ok=True)
+        with open(SYNC_STATUS_FILE, "w") as f:
+            json.dump(status, f)
+    except Exception:
+        logger.debug("Could not write sync status file")
 
 _CONV_COLS_REMOTE = (
     "id", "session_id", "llm_provider", "model", "ip_address",
@@ -171,7 +198,7 @@ def sync_conversations(remote_conn, local_session, assistant_id: uuid.UUID, wate
 
     if not rows:
         logger.info("Conversations: 0 new/updated")
-        return watermark
+        return watermark, 0
 
     from sqlalchemy import text as sa_text
     upsert_sql = sa_text("""
@@ -196,14 +223,18 @@ def sync_conversations(remote_conn, local_session, assistant_id: uuid.UUID, wate
     skipped = 0
     for row in rows:
         data = dict(zip(_CONV_COLS_REMOTE, row))
-        data["assistant_id"] = str(assistant_id)
+        data["assistant_id"] = str(assistant_id).replace("-", "")
+        for k, v in data.items():
+            if isinstance(v, uuid.UUID):
+                data[k] = v.hex
         try:
             sp = local_session.begin_nested()
             local_session.execute(upsert_sql, data)
             sp.commit()
-        except Exception:
+        except Exception as e:
             sp.rollback()
             skipped += 1
+            logger.debug("Conv skip %s: %s", data.get("id", "?")[:8], e)
             continue
         ts = data["last_active_at"]
         if isinstance(ts, datetime):
@@ -214,8 +245,9 @@ def sync_conversations(remote_conn, local_session, assistant_id: uuid.UUID, wate
         logger.warning("Conversations: skipped %d rows (unique constraint)", skipped)
 
     local_session.flush()
-    logger.info("Conversations: %d synced (watermark → %s)", len(rows), new_watermark)
-    return new_watermark
+    synced_count = len(rows) - skipped
+    logger.info("Conversations: %d synced (watermark → %s)", synced_count, new_watermark)
+    return new_watermark, synced_count
 
 
 def _jsonb_safe(val):
@@ -245,12 +277,13 @@ def sync_messages(remote_conn, local_session, watermark: str | None):
 
     if not rows:
         logger.info("Messages: 0 new")
-        return watermark
+        return watermark, 0
 
     from sqlalchemy import text as sa_text
+    is_sqlite = str(local_session.bind.url).startswith("sqlite")
     jsonb_cols = {"tool_calls", "tour_cards"}
     placeholders = ", ".join(
-        f"CAST(:{c} AS jsonb)" if c in jsonb_cols else f":{c}"
+        f":{c}" if is_sqlite else (f"CAST(:{c} AS jsonb)" if c in jsonb_cols else f":{c}")
         for c in _MSG_COLS
     )
     cols_str = ", ".join(_MSG_COLS)
@@ -265,6 +298,9 @@ def sync_messages(remote_conn, local_session, watermark: str | None):
         data = dict(zip(_MSG_COLS, row))
         for jc in jsonb_cols:
             data[jc] = _jsonb_safe(data[jc])
+        for k, v in data.items():
+            if isinstance(v, uuid.UUID):
+                data[k] = v.hex
         local_session.execute(upsert_sql, data)
         ts = data["created_at"]
         if isinstance(ts, datetime):
@@ -274,7 +310,7 @@ def sync_messages(remote_conn, local_session, watermark: str | None):
 
     local_session.flush()
     logger.info("Messages: %d synced (watermark → %s)", len(rows), new_watermark)
-    return new_watermark
+    return new_watermark, len(rows)
 
 
 def sync_tour_searches(remote_conn, local_session, watermark: str | None):
@@ -294,7 +330,7 @@ def sync_tour_searches(remote_conn, local_session, watermark: str | None):
 
     if not rows:
         logger.info("TourSearches: 0 new")
-        return watermark
+        return watermark, 0
 
     from sqlalchemy import text as sa_text
     cols_str = ", ".join(_SEARCH_COLS)
@@ -308,6 +344,9 @@ def sync_tour_searches(remote_conn, local_session, watermark: str | None):
     new_watermark = watermark
     for row in rows:
         data = dict(zip(_SEARCH_COLS, row))
+        for k, v in data.items():
+            if isinstance(v, uuid.UUID):
+                data[k] = v.hex
         local_session.execute(upsert_sql, data)
         ts = data["created_at"]
         if isinstance(ts, datetime):
@@ -317,7 +356,7 @@ def sync_tour_searches(remote_conn, local_session, watermark: str | None):
 
     local_session.flush()
     logger.info("TourSearches: %d synced (watermark → %s)", len(rows), new_watermark)
-    return new_watermark
+    return new_watermark, len(rows)
 
 
 _SEQ_OFFSET = 10_000_000
@@ -335,6 +374,34 @@ def _ensure_sequence_offset(local_session):
                 logger.info("Sequence %s advanced to %d", seq, _SEQ_OFFSET)
         except Exception:
             logger.debug("Sequence %s not found, skipping", seq)
+
+
+def _recompute_booking_intent(local_session):
+    """Re-evaluate has_booking_intent for conversations that are still marked False."""
+    from models import Conversation, Message
+    import sys
+    sys.path.insert(0, os.path.dirname(__file__))
+    from app import check_conversation_booking_intent
+
+    convs = local_session.query(Conversation).filter(
+        Conversation.has_booking_intent == False  # noqa: E712
+    ).all()
+
+    updated = 0
+    for conv in convs:
+        user_texts = [
+            m.content for m in local_session.query(Message.content).filter(
+                Message.conversation_id == conv.id,
+                Message.role == "user",
+            ).all()
+        ]
+        if check_conversation_booking_intent(user_texts):
+            conv.has_booking_intent = True
+            updated += 1
+
+    if updated:
+        local_session.flush()
+    logger.info("Booking intent: %d conversations updated", updated)
 
 
 def run_sync():
@@ -377,28 +444,33 @@ def run_sync():
 
                 _ensure_sequence_offset(db)
 
-                wm_conv = sync_conversations(
+                wm_conv, n_conv = sync_conversations(
                     remote_conn, db, assistant_id,
                     watermarks.get("conversations"),
                 )
-                wm_msg = sync_messages(
+                wm_msg, n_msg = sync_messages(
                     remote_conn, db,
                     watermarks.get("messages"),
                 )
-                wm_ts = sync_tour_searches(
+                wm_ts, n_ts = sync_tour_searches(
                     remote_conn, db,
                     watermarks.get("tour_searches"),
                 )
+
+                if n_msg > 0:
+                    _recompute_booking_intent(db)
 
                 watermarks["conversations"] = wm_conv
                 watermarks["messages"] = wm_msg
                 watermarks["tour_searches"] = wm_ts
 
         _save_watermarks(redis_client, watermarks)
+        _write_sync_status(n_conv, n_msg, n_ts, True)
         logger.info("Sync complete ✓")
 
     except Exception:
         logger.exception("Sync failed")
+        _write_sync_status(0, 0, 0, False)
 
 
 if __name__ == "__main__":

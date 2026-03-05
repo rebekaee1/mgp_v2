@@ -13,9 +13,14 @@
     const _scriptTag = document.currentScript || document.querySelector('script[data-assistant-id]');
     const _assistantId = _scriptTag ? _scriptTag.getAttribute('data-assistant-id') : null;
 
-    const _baseUrl = (window.location.port === '5555' || window.location.protocol === 'file:')
-        ? 'http://127.0.0.1:8080'
-        : window.location.origin;
+    let _baseUrl;
+    if (_scriptTag && _scriptTag.src) {
+        try { _baseUrl = new URL(_scriptTag.src).origin; } catch (_) { _baseUrl = window.location.origin; }
+    } else if (window.location.port === '5555' || window.location.protocol === 'file:') {
+        _baseUrl = 'http://127.0.0.1:8080';
+    } else {
+        _baseUrl = window.location.origin;
+    }
 
     const CONFIG = {
         apiUrl: _baseUrl + '/api/v1/chat',
@@ -42,18 +47,100 @@
     let typingStatusTimer = null;
 
     // ============================================
-    // DOM ELEMENTS
+    // DOM ELEMENTS (populated in init after possible injection)
     // ============================================
-    const elements = {
-        launcher: document.getElementById('chatLauncher'),
-        widget: document.getElementById('chatWidget'),
-        closeBtn: document.getElementById('chatClose'),
-        messages: document.getElementById('chatMessages'),
-        form: document.getElementById('chatForm'),
-        input: document.getElementById('chatInput'),
-        sendBtn: document.getElementById('chatSend'),
-        typingIndicator: document.getElementById('typingIndicator')
-    };
+    const elements = {};
+
+    function _queryElements() {
+        elements.launcher = document.getElementById('chatLauncher');
+        elements.widget = document.getElementById('chatWidget');
+        elements.closeBtn = document.getElementById('chatClose');
+        elements.messages = document.getElementById('chatMessages');
+        elements.form = document.getElementById('chatForm');
+        elements.input = document.getElementById('chatInput');
+        elements.sendBtn = document.getElementById('chatSend');
+        elements.typingIndicator = document.getElementById('typingIndicator');
+    }
+
+    function _defaultSvgAvatar() {
+        return '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-1 17.93c-3.95-.49-7-3.85-7-7.93 0-.62.08-1.21.21-1.79L9 15v1c0 1.1.9 2 2 2v1.93zm6.9-2.54c-.26-.81-1-1.39-1.9-1.39h-1v-3c0-.55-.45-1-1-1H8v-2h2c.55 0 1-.45 1-1V7h2c1.1 0 2-.9 2-2v-.41c2.93 1.19 5 4.06 5 7.41 0 2.08-.8 3.97-2.1 5.39z"/></svg>';
+    }
+
+    function injectWidget() {
+        if (document.getElementById('mgp-chat-root')) return;
+
+        var link = document.createElement('link');
+        link.rel = 'stylesheet';
+        link.href = _baseUrl + '/widget.css';
+        document.head.appendChild(link);
+
+        var fontLink = document.createElement('link');
+        fontLink.rel = 'stylesheet';
+        fontLink.href = 'https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap';
+        document.head.appendChild(fontLink);
+
+        var root = document.createElement('div');
+        root.id = 'mgp-chat-root';
+        root.innerHTML =
+            '<button class="chat-launcher" id="chatLauncher" aria-label="Открыть чат">' +
+                '<svg class="launcher-icon" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">' +
+                    '<path d="M20 2H4C2.9 2 2 2.9 2 4V22L6 18H20C21.1 18 22 17.1 22 16V4C22 2.9 21.1 2 20 2ZM20 16H5.17L4 17.17V4H20V16Z" fill="currentColor"/>' +
+                    '<path d="M7 9H17V11H7V9ZM7 6H17V8H7V6ZM7 12H14V14H7V12Z" fill="currentColor"/>' +
+                '</svg>' +
+                '<svg class="launcher-close" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">' +
+                    '<path d="M19 6.41L17.59 5L12 10.59L6.41 5L5 6.41L10.59 12L5 17.59L6.41 19L12 13.41L17.59 19L19 17.59L13.41 12L19 6.41Z" fill="currentColor"/>' +
+                '</svg>' +
+            '</button>' +
+            '<div class="chat-widget" id="chatWidget">' +
+                '<div class="chat-header">' +
+                    '<div class="chat-header-info">' +
+                        '<div class="chat-logo">' + _defaultSvgAvatar() + '</div>' +
+                        '<div class="chat-title">' +
+                            '<span class="chat-title-main">AI Ассистент</span>' +
+                            '<span class="chat-title-sub">Турагентство</span>' +
+                        '</div>' +
+                    '</div>' +
+                    '<button class="chat-new" data-action="new-chat" aria-label="Новый чат" title="Новый чат">' +
+                        '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M17.65 6.35A7.958 7.958 0 0 0 12 4C7.58 4 4.01 7.58 4.01 12S7.58 20 12 20c3.73 0 6.84-2.55 7.73-6h-2.08A5.99 5.99 0 0 1 12 18c-3.31 0-6-2.69-6-6s2.69-6 6-6c1.66 0 3.14.69 4.22 1.78L13 11h7V4l-2.35 2.35z"/></svg>' +
+                    '</button>' +
+                    '<button class="chat-close" id="chatClose" aria-label="Закрыть чат">' +
+                        '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M19 6.41L17.59 5L12 10.59L6.41 5L5 6.41L10.59 12L5 17.59L6.41 19L12 13.41L17.59 19L19 17.59L13.41 12L19 6.41Z"/></svg>' +
+                    '</button>' +
+                '</div>' +
+                '<div class="chat-messages" id="chatMessages">' +
+                    '<div class="message bot-message">' +
+                        '<div class="message-avatar">' + _defaultSvgAvatar() + '</div>' +
+                        '<div class="message-content">' +
+                            '<div class="message-bubble">' +
+                                '\uD83D\uDC4B Здравствуйте! Я — ИИ-ассистент туристического агентства.<br><br>' +
+                                'Я помогу вам:<br>' +
+                                '• \uD83D\uDD0D Подобрать тур по вашим параметрам<br>' +
+                                '• \uD83D\uDD25 Найти горящие предложения<br>' +
+                                '• \u2753 Ответить на вопросы о визах, оплате, документах<br><br>' +
+                                '<strong>Куда бы вы хотели поехать?</strong>' +
+                            '</div>' +
+                        '</div>' +
+                    '</div>' +
+                '</div>' +
+                '<div class="typing-indicator" id="typingIndicator">' +
+                    '<div class="message-avatar">' + _defaultSvgAvatar() + '</div>' +
+                    '<div class="typing-content">' +
+                        '<div class="typing-dots"><span></span><span></span><span></span></div>' +
+                        '<span class="typing-status" id="typingStatus"></span>' +
+                    '</div>' +
+                '</div>' +
+                '<div class="chat-footer">' +
+                    '<form class="chat-form" id="chatForm">' +
+                        '<input type="text" class="chat-input" id="chatInput" placeholder="Введите ваш запрос..." autocomplete="off">' +
+                        '<button type="submit" class="chat-send" id="chatSend" aria-label="Отправить">' +
+                            '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"/></svg>' +
+                        '</button>' +
+                    '</form>' +
+                    '<div class="chat-powered">Powered by <a href="https://xn----btbbndkbaoaccge1au.xn--p1ai" target="_blank" rel="noopener">навылет ai</a></div>' +
+                '</div>' +
+            '</div>';
+        document.body.appendChild(root);
+    }
 
     // ============================================
     // UTILITIES
@@ -213,12 +300,12 @@
     }
 
     function applyConfig(cfg) {
-        const root = document.documentElement;
+        var scopeEl = document.getElementById('mgp-chat-root') || document.documentElement;
 
         if (cfg.primary_color) {
-            root.style.setProperty('--mgp-red', cfg.primary_color);
-            root.style.setProperty('--mgp-red-dark', darkenColor(cfg.primary_color, 30));
-            root.style.setProperty('--mgp-red-light', darkenColor(cfg.primary_color, -30));
+            scopeEl.style.setProperty('--mgp-red', cfg.primary_color);
+            scopeEl.style.setProperty('--mgp-red-dark', darkenColor(cfg.primary_color, 30));
+            scopeEl.style.setProperty('--mgp-red-light', darkenColor(cfg.primary_color, -30));
         }
 
         if (cfg.title) {
@@ -231,10 +318,14 @@
         }
 
         if (cfg.logo_url) {
-            CONFIG.botLogoUrl = cfg.logo_url;
+            var logoSrc = cfg.logo_url;
+            if (logoSrc.startsWith('/') && !logoSrc.startsWith('//')) {
+                logoSrc = _baseUrl + logoSrc;
+            }
+            CONFIG.botLogoUrl = logoSrc;
             const logoContainer = document.querySelector('.chat-logo');
             if (logoContainer) {
-                logoContainer.innerHTML = `<img src="${cfg.logo_url}" alt="logo" style="width:100%;height:100%;object-fit:cover;border-radius:50%;">`;
+                logoContainer.innerHTML = `<img src="${logoSrc}" alt="logo" style="width:100%;height:100%;object-fit:cover;border-radius:50%;">`;
             }
         }
 
@@ -871,8 +962,15 @@
     // ============================================
 
     function init() {
+        _queryElements();
+
         if (!elements.launcher || !elements.widget) {
-            console.error('MGP Chat: Required elements not found');
+            injectWidget();
+            _queryElements();
+        }
+
+        if (!elements.launcher || !elements.widget) {
+            console.error('MGP Chat: Required elements not found after injection');
             return;
         }
 

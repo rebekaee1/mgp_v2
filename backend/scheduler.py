@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 """
 APScheduler integration for the ЛК backend.
 

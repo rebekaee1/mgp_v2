@@ -22,18 +22,18 @@ function LogoMark({ collapsed, onClick }) {
       className="relative flex items-center cursor-pointer hover:opacity-80 overflow-hidden shrink-0"
       style={{
         height: 44,
-        width: collapsed ? 42 : 176,
+        width: collapsed ? 48 : 200,
         transition: 'width 300ms cubic-bezier(0.4, 0, 0.2, 1)',
       }}
       aria-label="Перейти к обзору"
     >
       <img
         src="/globe.svg"
-        alt="AIMPACT+"
+        alt="навылет"
         className="absolute pointer-events-none object-contain"
         style={{
           height: 40,
-          width: 40,
+          width: 48,
           top: '50%',
           left: '50%',
           transform: 'translate(-50%, -50%)',
@@ -46,7 +46,7 @@ function LogoMark({ collapsed, onClick }) {
       />
       <img
         src="/logo.svg"
-        alt="AIMPACT+"
+        alt="навылет"
         className="shrink-0 pointer-events-none"
         style={{
           height: 44,

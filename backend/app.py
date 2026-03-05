@@ -42,6 +42,8 @@ _cors_origins = os.getenv("CORS_ORIGINS", "").strip()
 _allowed_origins = [o.strip() for o in _cors_origins.split(",") if o.strip()] if _cors_origins else ["*"]
 
 CORS(app, resources={
+    r"/api/widget/*": {"origins": "*"},
+    r"/api/v1/chat": {"origins": "*"},
     r"/api/*": {"origins": _allowed_origins},
 })
 
@@ -440,7 +442,16 @@ def _log_chat_to_db(session_id: str, user_message: str, reply: str,
             conv.message_count = (conv.message_count or 0) + msg_count
             if tour_cards:
                 conv.tour_cards_shown = (conv.tour_cards_shown or 0) + len(tour_cards)
-                conv.search_count = (conv.search_count or 0) + 1
+
+            search_call_count = 0
+            if history_snapshot:
+                for entry in history_snapshot:
+                    for tc in (entry.get("tool_calls") or []):
+                        fn = tc.get("function", {}).get("name", "")
+                        if fn in ("search_tours", "get_hot_tours"):
+                            search_call_count += 1
+            if search_call_count > 0:
+                conv.search_count = (conv.search_count or 0) + search_call_count
 
             if not conv.has_booking_intent:
                 user_texts = [
@@ -453,7 +464,7 @@ def _log_chat_to_db(session_id: str, user_message: str, reply: str,
                     conv.has_booking_intent = True
 
     except Exception as e:
-        logger.debug("DB logging failed (non-critical): %s", e)
+        logger.warning("DB logging failed (non-critical): %s", e)
 
 
 def _log_tour_searches(db, conv_id, tool_calls_data, tour_cards=None):
@@ -501,14 +512,14 @@ def _log_tour_searches(db, conv_id, tool_calls_data, tour_cards=None):
                 conversation_id=conv_id,
                 search_type=stype,
                 departure=_int(args.get("departure") or args.get("city")),
-                country=_int(args.get("country") or args.get("countries")),
-                regions=str(args.get("regions", "")) or None,
+                country=_int((args.get("country") or args.get("countries", "")).split(",")[0] or None),
+                regions=args.get("regions") or None,
                 date_from=args.get("datefrom"),
                 date_to=args.get("dateto"),
                 nights_from=_int(args.get("nightsfrom")),
-                nights_to=_int(args.get("nightsto") or args.get("maxdays")),
+                nights_to=_int(args.get("nightsto") or (args.get("maxdays") if stype != "hot" else None)),
                 adults=_int(args.get("adults")),
-                children=_int(args.get("children")),
+                children=_int(args.get("child")),
                 stars=_int(args.get("stars")),
                 meal=_int(args.get("meal")),
                 price_from=_int(args.get("pricefrom")),
@@ -518,8 +529,8 @@ def _log_tour_searches(db, conv_id, tool_calls_data, tour_cards=None):
                 min_price=min_price,
             )
             db.add(search)
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning("_log_tour_searches failed: %s", e)
 
 
 # Путь к новому фронтенду (frontend/) — абсолютный путь для корректной работы send_from_directory
@@ -573,9 +584,13 @@ def public_widget_config():
 
     assistant_id = request.args.get('assistant_id')
 
+    def _nocache(r):
+        r.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+        return r
+
     with get_db() as db:
         if db is None:
-            return jsonify(WIDGET_DEFAULTS)
+            return _nocache(jsonify(WIDGET_DEFAULTS))
 
         if assistant_id:
             assistant = db.query(Assistant).filter(Assistant.id == assistant_id).first()
@@ -583,10 +598,10 @@ def public_widget_config():
             assistant = db.query(Assistant).filter(Assistant.is_active.is_(True)).first()
 
         if not assistant:
-            return jsonify(WIDGET_DEFAULTS)
+            return _nocache(jsonify(WIDGET_DEFAULTS))
 
         cfg = assistant.widget_config or {}
-        return jsonify({
+        resp = jsonify({
             "welcome_message": cfg.get("welcome_message") or WIDGET_DEFAULTS["welcome_message"],
             "primary_color": cfg.get("primary_color") or WIDGET_DEFAULTS["primary_color"],
             "position": cfg.get("position") or WIDGET_DEFAULTS["position"],
@@ -594,6 +609,7 @@ def public_widget_config():
             "subtitle": cfg.get("subtitle") or WIDGET_DEFAULTS["subtitle"],
             "logo_url": cfg.get("logo_url") or None,
         })
+        return _nocache(resp)
 
 
 @app.route('/favicon.ico')
@@ -675,9 +691,12 @@ def chat():
         response = loop.run_until_complete(handler.chat(message))
         loop.close()
         _new_entries = handler.full_history[_hist_before:]
-        
+
+        tour_cards = list(handler._pending_tour_cards)
+        handler._pending_tour_cards = []
+
         _latency_ms = int((time.perf_counter() - g._req_start) * 1000) if hasattr(g, '_req_start') else None
-        _log_chat_to_db(session_id, message, response, [],
+        _log_chat_to_db(session_id, message, response, tour_cards,
                         _latency_ms, model_name=getattr(handler, 'model', 'unknown'),
                         history_snapshot=_new_entries)
         

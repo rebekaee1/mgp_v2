@@ -1,7 +1,7 @@
 import { useState, useMemo, useRef } from 'react';
 import { createPortal } from 'react-dom';
 import { useNavigate } from 'react-router-dom';
-import { MessageSquare, Search, Clock, MessagesSquare, ArrowRight, TrendingUp, Zap, Users, BookmarkCheck, HelpCircle } from 'lucide-react';
+import { MessageSquare, Search, Clock, MessagesSquare, ArrowRight, TrendingUp, Zap, Users, BookmarkCheck, HelpCircle, RefreshCw } from 'lucide-react';
 import { LineChart, Line, AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from 'recharts';
 import MetricCard, { CardSkeleton } from '../components/ui/MetricCard';
 import EmptyState from '../components/ui/EmptyState';
@@ -10,6 +10,7 @@ import PeriodSelector from '../components/ui/PeriodSelector';
 import { useOverview, useOverviewChart, useRecentConversations, useFetch } from '../hooks/useDashboardAPI';
 import { useAuth } from '../hooks/useAuth';
 import { formatNumber, formatMs, formatDate, formatShortDate } from '../lib/constants';
+import { useRelativeTimeLabel } from '../lib/dataFreshness';
 
 function getGreeting() {
   const h = new Date().getHours();
@@ -61,8 +62,7 @@ function ConversionFunnel({ funnel }) {
   const steps = [
     { label: 'Все диалоги', value: funnel?.total || 0, color: 'bg-primary' },
     { label: 'Вовлечённые (2+ сообщ.)', value: funnel?.engaged || 0, color: 'bg-[#1A4FFF]' },
-    { label: 'С поиском туров', value: funnel?.with_search || 0, color: 'bg-[#3B82F6]' },
-    { label: 'Показаны карточки туров', value: funnel?.with_results || 0, color: 'bg-[#60A5FA]' },
+    { label: 'Показаны карточки туров', value: funnel?.with_results || 0, color: 'bg-[#3B82F6]' },
     { label: 'Потенциальные лиды', value: funnel?.potential_leads || 0, color: 'bg-[#93C5FD]' },
     { label: 'Запросы на бронь', value: funnel?.booking_intent || 0, color: 'bg-success' },
   ];
@@ -106,7 +106,8 @@ function ConversionFunnel({ funnel }) {
   );
 }
 
-function InsightCard({ insights, funnel, avgResponseMs }) {
+function InsightCard({ insights, funnel, avgResponseMs, lastFetchedAt, softRefreshing, onRefresh }) {
+  const timeLabel = useRelativeTimeLabel(lastFetchedAt);
   const items = useMemo(() => {
     const result = [];
     const topDest = insights?.top_destination;
@@ -135,11 +136,23 @@ function InsightCard({ insights, funnel, avgResponseMs }) {
 
   return (
     <div className="bg-white rounded-2xl shadow-sm p-5 animate-fade-in-up stagger-6">
-      <div className="flex items-center gap-2 mb-3">
-        <div className="w-7 h-7 rounded-lg bg-warning-light flex items-center justify-center">
-          <Zap size={14} className="text-warning" />
+      <div className="flex items-center justify-between mb-3">
+        <div className="flex items-center gap-2">
+          <div className="w-7 h-7 rounded-lg bg-warning-light flex items-center justify-center">
+            <Zap size={14} className="text-warning" />
+          </div>
+          <h3 className="text-sm font-semibold text-text">Быстрые инсайты</h3>
         </div>
-        <h3 className="text-sm font-semibold text-text">Быстрые инсайты</h3>
+        <div className="flex items-center gap-2">
+          <span className="text-[10px] text-text-secondary">{timeLabel}</span>
+          <button
+            onClick={onRefresh}
+            title="Обновить данные"
+            className="p-1 rounded-md text-text-secondary hover:text-primary hover:bg-primary-50 transition-colors"
+          >
+            <RefreshCw size={12} className={softRefreshing ? 'animate-spin' : ''} />
+          </button>
+        </div>
       </div>
       <div className="space-y-2">
         {items.map((item, i) => (
@@ -159,7 +172,7 @@ export default function Overview() {
   const navigate = useNavigate();
   const { user } = useAuth();
 
-  const { data: overview, loading: loadingOverview } = useOverview(period);
+  const { data: overview, loading: loadingOverview, lastFetchedAt: overviewFetchedAt, softRefreshing: overviewRefreshing, refetch: refetchOverview } = useOverview(period);
   const { data: chartData, loading: loadingChart } = useOverviewChart(period, chartMetric);
   const { data: recent, loading: loadingRecent } = useRecentConversations(5);
   const { data: health } = useFetch('/dashboard/system/health');
@@ -318,7 +331,14 @@ export default function Overview() {
       </div>
 
       {/* Insights */}
-      <InsightCard insights={apiInsights} funnel={funnel} avgResponseMs={overview?.avg_response_ms?.value} />
+      <InsightCard
+        insights={apiInsights}
+        funnel={funnel}
+        avgResponseMs={overview?.avg_response_ms?.value}
+        lastFetchedAt={overviewFetchedAt}
+        softRefreshing={overviewRefreshing}
+        onRefresh={refetchOverview}
+      />
 
       {/* Recent conversations */}
       <div className="bg-white rounded-2xl shadow-sm animate-fade-in-up">

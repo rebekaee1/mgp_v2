@@ -320,8 +320,8 @@ export default function ConversationDetail() {
                       </span>
                       <span className="text-text-secondary text-[10px]">{formatDate(s.created_at)}</span>
                     </div>
-                    {s.country && <div className="text-text">Страна: {COUNTRY_NAMES[s.country] || s.country}</div>}
-                    {s.departure && <div>Вылет: {DEPARTURE_NAMES[s.departure] || s.departure}</div>}
+                    {s.country && <div className="text-text">Страна: {COUNTRY_NAMES[s.country] || `#${s.country}`}</div>}
+                    {s.departure && <div>Вылет: {DEPARTURE_NAMES[s.departure] || `#${s.departure}`}</div>}
                     {s.date_from && <div>Даты: {s.date_from} — {s.date_to || '?'}</div>}
                     {s.nights_from && <div>Ночей: {s.nights_from}—{s.nights_to}</div>}
                     {s.adults && <div>Туристы: {s.adults} взр.{s.children ? ` + ${s.children} дет.` : ''}</div>}

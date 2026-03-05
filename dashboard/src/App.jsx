@@ -11,6 +11,7 @@ import Analytics from './pages/Analytics';
 import WidgetSettings from './pages/WidgetSettings';
 import SystemStatus from './pages/SystemStatus';
 import Account from './pages/Account';
+import ResetPassword from './pages/ResetPassword';
 
 function LoadingScreen() {
   return (
@@ -18,7 +19,7 @@ function LoadingScreen() {
       <div className="flex flex-col items-center gap-5 animate-fade-in">
         <img
           src="/globe.svg"
-          alt="AIMPACT+"
+          alt="навылет"
           className="h-20 w-auto animate-globe-pulse"
           draggable={false}
         />
@@ -52,6 +53,7 @@ export default function App() {
           <BrowserRouter basename={import.meta.env.BASE_URL.replace(/\/$/, '') || '/'}>
             <Routes>
               <Route path="/login" element={<PublicRoute><Login /></PublicRoute>} />
+              <Route path="/reset-password" element={<PublicRoute><ResetPassword /></PublicRoute>} />
               <Route element={<ProtectedRoute><Layout /></ProtectedRoute>}>
                 <Route index element={<Overview />} />
                 <Route path="conversations" element={<Conversations />} />

@@ -3,6 +3,7 @@ import { createPortal } from 'react-dom';
 import { useLocation, useNavigate } from 'react-router-dom';
 import { Menu, Search, ChevronRight, LogOut, User, Settings, Clock, BarChart3, Code2 } from 'lucide-react';
 import { useAuth } from '../../hooks/useAuth';
+import { useDataFreshness, useRelativeTimeLabel } from '../../lib/dataFreshness';
 
 const ROUTE_META = {
   '/': { title: 'Обзор', breadcrumbs: [] },
@@ -23,24 +24,10 @@ function getRouteMeta(pathname) {
   return ROUTE_META[pathname] || { title: '', breadcrumbs: [] };
 }
 
-function useRelativeTime() {
-  const [now, setNow] = useState(Date.now());
-  const [lastFetch, setLastFetch] = useState(Date.now());
-
-  useEffect(() => {
-    const timer = setInterval(() => setNow(Date.now()), 30000);
-    return () => clearInterval(timer);
-  }, []);
-
-  const markFetched = () => setLastFetch(Date.now());
-  const diffSec = Math.floor((now - lastFetch) / 1000);
-
-  let label;
-  if (diffSec < 60) label = 'Только что';
-  else if (diffSec < 3600) label = `${Math.floor(diffSec / 60)} мин. назад`;
-  else label = `${Math.floor(diffSec / 3600)} ч. назад`;
-
-  return { label, markFetched };
+function useRealFreshness() {
+  const ts = useDataFreshness();
+  const label = useRelativeTimeLabel(ts);
+  return { label };
 }
 
 function ProfileDropdown({ anchorRef, open, onClose, user, onNavigate, onLogout }) {
@@ -153,7 +140,7 @@ export default function Header({ onMobileMenuToggle, onSearchOpen }) {
   const [dropdownOpen, setDropdownOpen] = useState(false);
   const avatarRef = useRef(null);
   const meta = getRouteMeta(location.pathname);
-  const { label: lastUpdated } = useRelativeTime();
+  const { label: lastUpdated } = useRealFreshness();
 
   const closeDropdown = useCallback(() => setDropdownOpen(false), []);
 

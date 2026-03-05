@@ -25,6 +25,7 @@ class Settings(BaseSettings):
     openai_api_key: str = ""
     openai_base_url: Optional[str] = None
     openai_model: str = "gpt-5-mini"
+    ai_report_model: str = ""
 
     # --- TourVisor ---
     tourvisor_auth_login: str = ""
@@ -52,6 +53,14 @@ class Settings(BaseSettings):
     jwt_secret: str = "change-me-in-production-please"
     jwt_access_minutes: int = 30
     jwt_refresh_days: int = 7
+
+    # --- Email (SMTP) ---
+    smtp_host: str = "smtp.mail.ru"
+    smtp_port: int = 465
+    smtp_user: str = ""
+    smtp_password: str = ""
+    smtp_from: str = ""
+    smtp_use_ssl: bool = True
 
 
 @lru_cache

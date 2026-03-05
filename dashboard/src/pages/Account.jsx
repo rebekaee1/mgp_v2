@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react';
-import { User, Building2, Lock, Shield, AlertTriangle } from 'lucide-react';
+import { User, Building2, Shield, AlertTriangle, Eye, EyeOff, Lock, CheckCircle2 } from 'lucide-react';
 import LoadingSkeleton from '../components/ui/LoadingSkeleton';
 import { useAccount } from '../hooks/useDashboardAPI';
 import { useToast } from '../hooks/useToast';
@@ -15,6 +15,11 @@ export default function Account() {
 
   const [oldPassword, setOldPassword] = useState('');
   const [newPassword, setNewPassword] = useState('');
+  const [confirmPassword, setConfirmPassword] = useState('');
+  const [showOldPw, setShowOldPw] = useState(false);
+  const [showNewPw, setShowNewPw] = useState(false);
+  const [changingPw, setChangingPw] = useState(false);
+  const [pwSuccess, setPwSuccess] = useState(false);
 
   const [resetOpen, setResetOpen] = useState(false);
   const [resetPassword, setResetPassword] = useState('');
@@ -26,6 +31,10 @@ export default function Account() {
       setCompanyName(data.company?.name || '');
     }
   }, [data]);
+
+  const pwMismatch = confirmPassword && newPassword !== confirmPassword;
+  const pwTooShort = newPassword && newPassword.length < 6;
+  const pwValid = oldPassword && newPassword.length >= 6 && newPassword === confirmPassword;
 
   const handleProfileSave = async () => {
     setSaving(true);
@@ -42,16 +51,23 @@ export default function Account() {
 
   const handlePasswordChange = async (e) => {
     e.preventDefault();
+    if (!pwValid) return;
+    setChangingPw(true);
     try {
       await api.put('/dashboard/account/password', {
         old_password: oldPassword,
         new_password: newPassword,
       });
-      toast('Пароль успешно изменён', 'success');
+      setPwSuccess(true);
       setOldPassword('');
       setNewPassword('');
+      setConfirmPassword('');
+      toast('Пароль успешно изменён', 'success');
+      setTimeout(() => setPwSuccess(false), 3000);
     } catch (err) {
       toast(err.response?.data?.error || 'Ошибка смены пароля', 'error');
+    } finally {
+      setChangingPw(false);
     }
   };
 
@@ -137,34 +153,119 @@ export default function Account() {
           <div className="w-8 h-8 rounded-xl bg-primary-50 flex items-center justify-center">
             <Shield size={16} className="text-primary" />
           </div>
-          <h3 className="text-sm font-semibold text-text">Безопасность</h3>
+          <div>
+            <h3 className="text-sm font-semibold text-text">Безопасность</h3>
+            {data?.user?.last_login_at && (
+              <p className="text-[11px] text-text-secondary mt-0.5">
+                Последний вход: {new Date(data.user.last_login_at).toLocaleString('ru-RU')}
+              </p>
+            )}
+          </div>
         </div>
 
-        <form onSubmit={handlePasswordChange} className="space-y-3">
-          <input
-            type="password"
-            value={oldPassword}
-            onChange={(e) => setOldPassword(e.target.value)}
-            placeholder="Текущий пароль"
-            required
-            className="w-full px-3.5 py-2.5 border border-border/60 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-primary/20 focus:border-primary shadow-xs"
-          />
-          <input
-            type="password"
-            value={newPassword}
-            onChange={(e) => setNewPassword(e.target.value)}
-            placeholder="Новый пароль (мин. 6 символов)"
-            required
-            minLength={6}
-            className="w-full px-3.5 py-2.5 border border-border/60 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-primary/20 focus:border-primary shadow-xs"
-          />
-          <button
-            type="submit"
-            className="bg-gradient-to-r from-primary to-[#2557E8] hover:from-primary-dark hover:to-primary text-white text-sm font-medium px-5 py-2.5 rounded-xl transition-all shadow-sm hover:shadow-md"
-          >
-            Сменить пароль
-          </button>
-        </form>
+        <div className="mb-4">
+          <label className="block text-xs text-text-secondary mb-1.5">Email аккаунта</label>
+          <div className="relative">
+            <Lock size={14} className="absolute left-3 top-1/2 -translate-y-1/2 text-text-secondary/50" />
+            <input
+              type="email"
+              value={data?.user?.email || ''}
+              disabled
+              className="w-full pl-9 pr-3.5 py-2.5 border border-border/60 rounded-xl text-sm bg-surface-sunken/60 text-text-secondary"
+            />
+          </div>
+        </div>
+
+        {pwSuccess ? (
+          <div className="flex items-center gap-3 py-4 animate-fade-in">
+            <div className="w-10 h-10 rounded-full bg-success/10 flex items-center justify-center">
+              <CheckCircle2 size={20} className="text-success" />
+            </div>
+            <div>
+              <p className="text-sm font-medium text-success">Пароль успешно изменён</p>
+              <p className="text-xs text-text-secondary">Используйте новый пароль при следующем входе</p>
+            </div>
+          </div>
+        ) : (
+          <form onSubmit={handlePasswordChange} className="space-y-3">
+            <div>
+              <label className="block text-xs text-text-secondary mb-1.5">Текущий пароль</label>
+              <div className="relative">
+                <input
+                  type={showOldPw ? 'text' : 'password'}
+                  value={oldPassword}
+                  onChange={(e) => setOldPassword(e.target.value)}
+                  placeholder="Введите текущий пароль"
+                  required
+                  className="w-full px-3.5 py-2.5 pr-10 border border-border/60 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-primary/20 focus:border-primary shadow-xs"
+                />
+                <button
+                  type="button"
+                  onClick={() => setShowOldPw(!showOldPw)}
+                  className="absolute right-3 top-1/2 -translate-y-1/2 text-text-secondary hover:text-text transition-colors"
+                >
+                  {showOldPw ? <EyeOff size={16} /> : <Eye size={16} />}
+                </button>
+              </div>
+            </div>
+
+            <div>
+              <label className="block text-xs text-text-secondary mb-1.5">Новый пароль</label>
+              <div className="relative">
+                <input
+                  type={showNewPw ? 'text' : 'password'}
+                  value={newPassword}
+                  onChange={(e) => setNewPassword(e.target.value)}
+                  placeholder="Минимум 6 символов"
+                  required
+                  minLength={6}
+                  className={`w-full px-3.5 py-2.5 pr-10 border rounded-xl text-sm focus:outline-none focus:ring-2 shadow-xs transition-all ${
+                    pwTooShort
+                      ? 'border-danger/40 focus:ring-danger/20 focus:border-danger'
+                      : 'border-border/60 focus:ring-primary/20 focus:border-primary'
+                  }`}
+                />
+                <button
+                  type="button"
+                  onClick={() => setShowNewPw(!showNewPw)}
+                  className="absolute right-3 top-1/2 -translate-y-1/2 text-text-secondary hover:text-text transition-colors"
+                >
+                  {showNewPw ? <EyeOff size={16} /> : <Eye size={16} />}
+                </button>
+              </div>
+              {pwTooShort && (
+                <p className="text-xs text-danger mt-1">Минимум 6 символов</p>
+              )}
+            </div>
+
+            <div>
+              <label className="block text-xs text-text-secondary mb-1.5">Повторите новый пароль</label>
+              <input
+                type={showNewPw ? 'text' : 'password'}
+                value={confirmPassword}
+                onChange={(e) => setConfirmPassword(e.target.value)}
+                placeholder="Повторите пароль"
+                required
+                className={`w-full px-3.5 py-2.5 border rounded-xl text-sm focus:outline-none focus:ring-2 shadow-xs transition-all ${
+                  pwMismatch
+                    ? 'border-danger/40 focus:ring-danger/20 focus:border-danger'
+                    : 'border-border/60 focus:ring-primary/20 focus:border-primary'
+                }`}
+              />
+              {pwMismatch && (
+                <p className="text-xs text-danger mt-1">Пароли не совпадают</p>
+              )}
+            </div>
+
+            <button
+              type="submit"
+              disabled={!pwValid || changingPw}
+              className="bg-gradient-to-r from-primary to-[#2557E8] hover:from-primary-dark hover:to-primary text-white text-sm font-medium px-5 py-2.5 rounded-xl transition-all disabled:opacity-60 shadow-sm hover:shadow-md"
+            >
+              {changingPw ? 'Сохранение...' : 'Сменить пароль'}
+            </button>
+          </form>
+        )}
       </div>
 
       {/* Danger zone */}

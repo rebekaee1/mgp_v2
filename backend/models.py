@@ -9,10 +9,9 @@ from datetime import datetime, timezone
 from typing import Optional, List
 
 from sqlalchemy import (
-    BigInteger, Boolean, DateTime, Index, Integer, String, Text,
+    BigInteger, Boolean, DateTime, Index, Integer, JSON, String, Text,
     ForeignKey, Uuid,
 )
-from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 UUID = Uuid
@@ -68,7 +67,7 @@ class Assistant(Base):
     llm_model: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
     system_prompt: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     faq_content: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
-    widget_config: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
+    widget_config: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow
@@ -176,8 +175,8 @@ class Message(Base):
     role: Mapped[str] = mapped_column(String(16), nullable=False)
     content: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     tool_call_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
-    tool_calls: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
-    tour_cards: Mapped[Optional[list]] = mapped_column(JSONB, nullable=True)
+    tool_calls: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
+    tour_cards: Mapped[Optional[list]] = mapped_column(JSON, nullable=True)
     tokens_prompt: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     tokens_completion: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     latency_ms: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
@@ -259,6 +258,23 @@ class ApiCall(Base):
 
     __table_args__ = (
         Index("ix_api_calls_service", "service", "created_at"),
+    )
+
+
+class AIReport(Base):
+    """Сохранённый AI-отчёт (один на company + period)."""
+    __tablename__ = "ai_reports"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    company_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    period: Mapped[str] = mapped_column(String(8), nullable=False)
+    report_text: Mapped[str] = mapped_column(Text, nullable=False)
+    generated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow
+    )
+
+    __table_args__ = (
+        Index("ix_ai_reports_company_period", "company_id", "period", unique=True),
     )
 
 

@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { useNavigate } from 'react-router-dom';
+import { useNavigate, Link } from 'react-router-dom';
 import { useAuth } from '../hooks/useAuth';
 import { LogIn, Eye, EyeOff } from 'lucide-react';
 
@@ -40,7 +40,7 @@ export default function Login() {
         <div className="text-center mb-8">
           <img
             src="/logo.svg"
-            alt="AIMPACT+"
+            alt="навылет"
             className="h-12 w-auto mx-auto mb-4"
             draggable={false}
           />
@@ -87,6 +87,15 @@ export default function Login() {
                 {showPassword ? <EyeOff size={16} /> : <Eye size={16} />}
               </button>
             </div>
+          </div>
+
+          <div className="flex justify-end -mt-1">
+            <Link
+              to={`/reset-password${email ? `?email=${encodeURIComponent(email)}` : ''}`}
+              className="text-xs text-primary hover:underline transition-colors"
+            >
+              Забыли пароль?
+            </Link>
           </div>
 
           <button
