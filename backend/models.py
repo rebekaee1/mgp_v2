@@ -75,6 +75,24 @@ class Assistant(Base):
         DateTime(timezone=True), default=_utcnow
     )
 
+    # ── Sync configuration (per-assistant remote DB credentials) ──
+    sync_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
+    sync_ssh_host: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    sync_ssh_port: Mapped[int] = mapped_column(Integer, default=22)
+    sync_ssh_user: Mapped[str] = mapped_column(String(128), default="root")
+    sync_ssh_password: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    sync_pg_port: Mapped[int] = mapped_column(Integer, default=5432)
+    sync_pg_user: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    sync_pg_password: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    sync_pg_db: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+
+    # ── Sync status (written by sync engine, read by dashboard) ──
+    last_sync_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    last_sync_status: Mapped[Optional[str]] = mapped_column(String(16), nullable=True)
+    last_sync_error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
     company: Mapped["Company"] = relationship(back_populates="assistants")
     conversations: Mapped[List["Conversation"]] = relationship(
         back_populates="assistant"
@@ -174,6 +192,7 @@ class Message(Base):
         ForeignKey("conversations.id", ondelete="CASCADE"),
         nullable=False,
     )
+    remote_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     role: Mapped[str] = mapped_column(String(16), nullable=False)
     content: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     tool_call_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
@@ -190,6 +209,7 @@ class Message(Base):
 
     __table_args__ = (
         Index("ix_messages_conv_created", "conversation_id", "created_at"),
+        Index("uq_messages_conv_remote", "conversation_id", "remote_id", unique=True),
     )
 
 
@@ -206,6 +226,7 @@ class TourSearch(Base):
         ForeignKey("conversations.id", ondelete="CASCADE"),
         nullable=False,
     )
+    remote_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     requestid: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
     search_type: Mapped[str] = mapped_column(String(16), default="regular")
     departure: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
@@ -233,6 +254,7 @@ class TourSearch(Base):
 
     __table_args__ = (
         Index("ix_tour_searches_country", "country", "created_at"),
+        Index("uq_tour_searches_conv_remote", "conversation_id", "remote_id", unique=True),
     )
 
 

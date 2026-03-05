@@ -21,10 +21,10 @@ _scheduler: BackgroundScheduler | None = None
 
 
 def _job_sync_mgp():
-    """Pull new conversations/messages/tour_searches from remote MGP."""
+    """Pull new conversations/messages/tour_searches from all sync-enabled assistants."""
     try:
-        from sync_mgp import run_sync
-        run_sync()
+        from sync_mgp import run_sync_all
+        run_sync_all()
     except Exception:
         logger.exception("sync_mgp job failed")
 

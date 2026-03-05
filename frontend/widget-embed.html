@@ -282,9 +282,9 @@ var path = window.location.pathname;
 var m = path.match(/\/widget\/embed\/([^/?#]+)/);
 if (m) assistantId = m[1];
 
-var lsKey = assistantId ? 'aimpact_cid_' + assistantId : 'aimpact_cid';
-conversationId = localStorage.getItem(lsKey) || generateUUID();
-localStorage.setItem(lsKey, conversationId);
+var urlParams = new URLSearchParams(window.location.search);
+var cidFromParent = urlParams.get('cid');
+conversationId = cidFromParent || generateUUID();
 
 apiUrl = baseUrl + '/api/widget/' + assistantId + '/chat';
 configUrl = baseUrl + '/api/widget/config?assistant_id=' + assistantId;
@@ -486,7 +486,10 @@ async function sendMessage(text) {
     clearTimeout(timer);
     if (!resp.ok) throw new Error('HTTP '+resp.status);
     var data = await resp.json();
-    if (data.conversation_id) { conversationId = data.conversation_id; localStorage.setItem(lsKey, conversationId); }
+    if (data.conversation_id && data.conversation_id !== conversationId) {
+      conversationId = data.conversation_id;
+      window.parent.postMessage({type:'aimpact:updateCid', cid: conversationId}, '*');
+    }
     hideTyping();
     if (data.reply) addMessage('bot', data.reply);
     if (data.tour_cards && data.tour_cards.length > 0) setTimeout(function(){ renderTourCards(data.tour_cards); }, 400);
@@ -506,7 +509,7 @@ async function sendMessage(text) {
 
 function startNewChat() {
   conversationId = generateUUID();
-  localStorage.setItem(lsKey, conversationId);
+  window.parent.postMessage({type:'aimpact:updateCid', cid: conversationId}, '*');
   cardSetCounter = 0; cardSets.clear(); lastFailedMessage = null;
   var welcome = els.messages.querySelector('.message');
   els.messages.innerHTML = '';

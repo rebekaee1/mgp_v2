@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
-import { Copy, Check, Code2, Upload, Trash2, RotateCcw, Save, Image as ImageIcon, Sparkles } from 'lucide-react';
+import { Copy, Check, Code2, Upload, Trash2, RotateCcw, Save, Image as ImageIcon, Sparkles, ChevronDown, RefreshCw, Database, CheckCircle2, XCircle, Loader2 } from 'lucide-react';
 import LoadingSkeleton from '../components/ui/LoadingSkeleton';
-import { useWidgetConfig, useWidgetEmbedCode } from '../hooks/useDashboardAPI';
+import { useWidgetConfig, useWidgetEmbedCode, useSyncConfig } from '../hooks/useDashboardAPI';
 import { useToast } from '../hooks/useToast';
 import api from '../lib/api';
 
@@ -47,7 +47,7 @@ function formatWelcomePreview(text) {
 
 export default function WidgetSettings() {
   const { data: config, loading: loadingConfig } = useWidgetConfig();
-  const { data: embedData } = useWidgetEmbedCode();
+  const { data: embedData, refetch: refetchEmbed } = useWidgetEmbedCode();
   const { toast } = useToast();
 
   const [welcomeMsg, setWelcomeMsg] = useState(DEFAULTS.welcome_message);
@@ -64,6 +64,72 @@ export default function WidgetSettings() {
   const [uploadingLogo, setUploadingLogo] = useState(false);
   const [copied, setCopied] = useState(false);
   const [dragOver, setDragOver] = useState(false);
+
+  // Sync configuration state
+  const { data: syncData, refetch: refetchSync } = useSyncConfig();
+  const [syncOpen, setSyncOpen] = useState(false);
+  const [syncEnabled, setSyncEnabled] = useState(false);
+  const [syncSshHost, setSyncSshHost] = useState('');
+  const [syncSshPort, setSyncSshPort] = useState('22');
+  const [syncSshUser, setSyncSshUser] = useState('root');
+  const [syncSshPassword, setSyncSshPassword] = useState('');
+  const [syncPgPort, setSyncPgPort] = useState('5432');
+  const [syncPgUser, setSyncPgUser] = useState('');
+  const [syncPgPassword, setSyncPgPassword] = useState('');
+  const [syncPgDb, setSyncPgDb] = useState('');
+  const [syncSaving, setSyncSaving] = useState(false);
+  const [syncTesting, setSyncTesting] = useState(false);
+  const [syncTestResult, setSyncTestResult] = useState(null);
+  const syncInitRef = useRef(false);
+
+  useEffect(() => {
+    if (!syncData || syncInitRef.current) return;
+    syncInitRef.current = true;
+    setSyncEnabled(syncData.sync_enabled || false);
+    setSyncSshHost(syncData.sync_ssh_host || '');
+    setSyncSshPort(String(syncData.sync_ssh_port || 22));
+    setSyncSshUser(syncData.sync_ssh_user || 'root');
+    setSyncPgPort(String(syncData.sync_pg_port || 5432));
+    setSyncPgUser(syncData.sync_pg_user || '');
+    setSyncPgDb(syncData.sync_pg_db || '');
+  }, [syncData]);
+
+  const handleSyncSave = async () => {
+    setSyncSaving(true);
+    try {
+      const payload = {
+        sync_enabled: syncEnabled,
+        sync_ssh_host: syncSshHost,
+        sync_ssh_port: parseInt(syncSshPort) || 22,
+        sync_ssh_user: syncSshUser,
+        sync_pg_port: parseInt(syncPgPort) || 5432,
+        sync_pg_user: syncPgUser,
+        sync_pg_db: syncPgDb,
+      };
+      if (syncSshPassword) payload.sync_ssh_password = syncSshPassword;
+      if (syncPgPassword) payload.sync_pg_password = syncPgPassword;
+      await api.put('/dashboard/sync/config', payload);
+      toast('Настройки синхронизации сохранены', 'success');
+      refetchSync();
+    } catch {
+      toast('Ошибка сохранения настроек синхронизации', 'error');
+    } finally {
+      setSyncSaving(false);
+    }
+  };
+
+  const handleSyncTest = async () => {
+    setSyncTesting(true);
+    setSyncTestResult(null);
+    try {
+      const { data: result } = await api.post('/dashboard/sync/test');
+      setSyncTestResult(result);
+    } catch (err) {
+      setSyncTestResult({ success: false, error: err.response?.data?.error || 'Ошибка подключения' });
+    } finally {
+      setSyncTesting(false);
+    }
+  };
 
   const fileInputRef = useRef(null);
   const initializedRef = useRef(false);
@@ -111,6 +177,7 @@ export default function WidgetSettings() {
       }
       await api.put('/dashboard/widget/config', payload);
       toast('Настройки виджета сохранены', 'success');
+      refetchEmbed();
     } catch {
       toast('Ошибка сохранения', 'error');
     } finally {
@@ -279,6 +346,195 @@ export default function WidgetSettings() {
             <p className="text-xs text-amber-800">
               Укажите URL сервера бота и сохраните настройки, чтобы получить код для встраивания виджета.
             </p>
+          </div>
+        )}
+      </div>
+
+      {/* Data Sync Configuration */}
+      <div className="bg-white rounded-2xl shadow-sm animate-fade-in-up stagger-1">
+        <button
+          onClick={() => setSyncOpen(!syncOpen)}
+          className="w-full flex items-center justify-between p-5 text-left"
+        >
+          <div className="flex items-center gap-2.5">
+            <div className="w-7 h-7 rounded-lg bg-blue-50 flex items-center justify-center">
+              <Database size={14} className="text-blue-600" />
+            </div>
+            <div>
+              <h3 className="text-sm font-semibold text-text">Синхронизация данных</h3>
+              <p className="text-[11px] text-text-secondary mt-0.5">
+                Автоматическое получение данных из удалённой БД бота
+              </p>
+            </div>
+          </div>
+          <div className="flex items-center gap-2">
+            {syncData?.last_sync_status === 'ok' && (
+              <span className="text-[10px] text-emerald-600 bg-emerald-50 px-2 py-0.5 rounded-full font-medium">Активно</span>
+            )}
+            {syncData?.last_sync_status === 'error' && (
+              <span className="text-[10px] text-red-600 bg-red-50 px-2 py-0.5 rounded-full font-medium">Ошибка</span>
+            )}
+            <ChevronDown size={16} className={`text-text-secondary transition-transform ${syncOpen ? 'rotate-180' : ''}`} />
+          </div>
+        </button>
+
+        {syncOpen && (
+          <div className="px-5 pb-5 pt-0 space-y-4 border-t border-border/40">
+            <div className="flex items-center justify-between pt-4">
+              <label className="text-sm text-text">Включить синхронизацию</label>
+              <button
+                onClick={() => setSyncEnabled(!syncEnabled)}
+                className={`relative w-10 h-5.5 rounded-full transition-colors ${syncEnabled ? 'bg-primary' : 'bg-border/60'}`}
+                style={{ width: 40, height: 22 }}
+              >
+                <span
+                  className={`absolute top-0.5 w-4.5 h-4.5 rounded-full bg-white shadow-sm transition-transform ${syncEnabled ? 'translate-x-5' : 'translate-x-0.5'}`}
+                  style={{ width: 18, height: 18, top: 2, left: syncEnabled ? 20 : 2 }}
+                />
+              </button>
+            </div>
+
+            {syncEnabled && (
+              <>
+                <div className="bg-surface-sunken rounded-xl p-4 space-y-3">
+                  <h4 className="text-xs font-semibold text-text uppercase tracking-wider">SSH-туннель</h4>
+                  <div className="grid grid-cols-2 gap-3">
+                    <div>
+                      <label className="block text-[11px] text-text-secondary mb-1">Хост</label>
+                      <input
+                        type="text" value={syncSshHost} onChange={(e) => setSyncSshHost(e.target.value)}
+                        className="w-full px-3 py-2 border border-border/60 rounded-lg text-sm font-mono focus:outline-none focus:ring-2 focus:ring-primary/20 focus:border-primary"
+                        placeholder="72.56.88.193"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-[11px] text-text-secondary mb-1">Порт</label>
+                      <input
+                        type="number" value={syncSshPort} onChange={(e) => setSyncSshPort(e.target.value)}
+                        className="w-full px-3 py-2 border border-border/60 rounded-lg text-sm font-mono focus:outline-none focus:ring-2 focus:ring-primary/20 focus:border-primary"
+                        placeholder="22"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-[11px] text-text-secondary mb-1">Пользователь</label>
+                      <input
+                        type="text" value={syncSshUser} onChange={(e) => setSyncSshUser(e.target.value)}
+                        className="w-full px-3 py-2 border border-border/60 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-primary/20 focus:border-primary"
+                        placeholder="root"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-[11px] text-text-secondary mb-1">
+                        Пароль SSH {syncData?.has_ssh_password && <span className="text-emerald-500">(установлен)</span>}
+                      </label>
+                      <input
+                        type="password" value={syncSshPassword} onChange={(e) => setSyncSshPassword(e.target.value)}
+                        className="w-full px-3 py-2 border border-border/60 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-primary/20 focus:border-primary"
+                        placeholder={syncData?.has_ssh_password ? '••••••••' : 'Пароль SSH'}
+                      />
+                    </div>
+                  </div>
+                </div>
+
+                <div className="bg-surface-sunken rounded-xl p-4 space-y-3">
+                  <h4 className="text-xs font-semibold text-text uppercase tracking-wider">PostgreSQL</h4>
+                  <div className="grid grid-cols-2 gap-3">
+                    <div>
+                      <label className="block text-[11px] text-text-secondary mb-1">Порт</label>
+                      <input
+                        type="number" value={syncPgPort} onChange={(e) => setSyncPgPort(e.target.value)}
+                        className="w-full px-3 py-2 border border-border/60 rounded-lg text-sm font-mono focus:outline-none focus:ring-2 focus:ring-primary/20 focus:border-primary"
+                        placeholder="5432"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-[11px] text-text-secondary mb-1">Пользователь</label>
+                      <input
+                        type="text" value={syncPgUser} onChange={(e) => setSyncPgUser(e.target.value)}
+                        className="w-full px-3 py-2 border border-border/60 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-primary/20 focus:border-primary"
+                        placeholder="mgp"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-[11px] text-text-secondary mb-1">
+                        Пароль PG {syncData?.has_pg_password && <span className="text-emerald-500">(установлен)</span>}
+                      </label>
+                      <input
+                        type="password" value={syncPgPassword} onChange={(e) => setSyncPgPassword(e.target.value)}
+                        className="w-full px-3 py-2 border border-border/60 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-primary/20 focus:border-primary"
+                        placeholder={syncData?.has_pg_password ? '••••••••' : 'Пароль PG'}
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-[11px] text-text-secondary mb-1">База данных</label>
+                      <input
+                        type="text" value={syncPgDb} onChange={(e) => setSyncPgDb(e.target.value)}
+                        className="w-full px-3 py-2 border border-border/60 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-primary/20 focus:border-primary"
+                        placeholder="mgp"
+                      />
+                    </div>
+                  </div>
+                </div>
+
+                {/* Sync status */}
+                {syncData?.last_sync_at && (
+                  <div className={`rounded-xl p-3 flex items-center gap-2.5 text-xs ${
+                    syncData.last_sync_status === 'ok' ? 'bg-emerald-50 text-emerald-700' : 'bg-red-50 text-red-700'
+                  }`}>
+                    {syncData.last_sync_status === 'ok' ? <CheckCircle2 size={14} /> : <XCircle size={14} />}
+                    <div>
+                      <span className="font-medium">
+                        {syncData.last_sync_status === 'ok' ? 'Синхронизация работает' : 'Ошибка синхронизации'}
+                      </span>
+                      <span className="text-text-secondary ml-1.5">
+                        {new Date(syncData.last_sync_at).toLocaleString('ru-RU')}
+                      </span>
+                      {syncData.last_sync_error && (
+                        <p className="mt-1 text-[11px] opacity-80">{syncData.last_sync_error}</p>
+                      )}
+                    </div>
+                  </div>
+                )}
+
+                {/* Test result */}
+                {syncTestResult && (
+                  <div className={`rounded-xl p-3 text-xs ${syncTestResult.success ? 'bg-emerald-50 text-emerald-700' : 'bg-red-50 text-red-700'}`}>
+                    {syncTestResult.success ? (
+                      <div>
+                        <div className="flex items-center gap-1.5 font-medium"><CheckCircle2 size={14} /> Подключение успешно!</div>
+                        <p className="mt-1">
+                          Найдены таблицы: {syncTestResult.tables_found?.join(', ') || 'нет'}.
+                          {syncTestResult.row_counts && (
+                            <> Записей: {Object.entries(syncTestResult.row_counts).map(([t, c]) => `${t}: ${c}`).join(', ')}</>
+                          )}
+                        </p>
+                      </div>
+                    ) : (
+                      <div className="flex items-center gap-1.5"><XCircle size={14} /> {syncTestResult.error}</div>
+                    )}
+                  </div>
+                )}
+
+                <div className="flex gap-3 pt-1">
+                  <button
+                    onClick={handleSyncSave}
+                    disabled={syncSaving}
+                    className="bg-primary text-white text-xs font-medium px-4 py-2 rounded-xl transition-all disabled:opacity-60 shadow-sm hover:shadow-md flex items-center gap-1.5"
+                  >
+                    <Save size={13} />
+                    {syncSaving ? 'Сохранение...' : 'Сохранить'}
+                  </button>
+                  <button
+                    onClick={handleSyncTest}
+                    disabled={syncTesting || !syncSshHost}
+                    className="bg-blue-50 text-blue-600 text-xs font-medium px-4 py-2 rounded-xl transition-all disabled:opacity-50 hover:bg-blue-100 flex items-center gap-1.5"
+                  >
+                    {syncTesting ? <Loader2 size={13} className="animate-spin" /> : <RefreshCw size={13} />}
+                    {syncTesting ? 'Проверка...' : 'Тестировать подключение'}
+                  </button>
+                </div>
+              </>
+            )}
           </div>
         )}
       </div>

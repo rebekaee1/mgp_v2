@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 """
-Sync engine: pulls new conversations, messages, and tour_searches from a remote
-MGP bot PostgreSQL (accessed via SSH tunnel) into the local ЛК database.
+Multi-tenant sync engine: pulls new conversations, messages, and tour_searches
+from each assistant's remote PostgreSQL (accessed via SSH tunnel) into the
+local ЛК database.
 
-Incremental sync: uses last_active_at / created_at watermarks stored in Redis
-so only new/updated rows are fetched each cycle.
+Incremental sync: uses per-assistant watermarks stored in Redis so only
+new/updated rows are fetched each cycle.
 
 Usage:
     # One-shot (cron / manual):
@@ -17,13 +18,6 @@ Usage:
 import json
 import logging
 import os
-import signal
-
-try:
-    from dotenv import load_dotenv
-    load_dotenv(os.path.join(os.path.dirname(__file__), "..", ".env"))
-except ImportError:
-    pass
 import socket
 import subprocess
 import time
@@ -33,27 +27,13 @@ from datetime import datetime, timezone
 
 import psycopg
 
+try:
+    from dotenv import load_dotenv
+    load_dotenv(os.path.join(os.path.dirname(__file__), "..", ".env"))
+except ImportError:
+    pass
+
 logger = logging.getLogger("mgp_bot.sync")
-
-SYNC_STATE_KEY = "sync:mgp:watermarks"
-SYNC_STATUS_FILE = os.path.join(os.path.dirname(__file__), "..", "logs", "sync_status.json")
-
-
-def _write_sync_status(conversations: int, messages: int, searches: int, success: bool):
-    """Persist sync result to a JSON file so the dashboard API can report freshness."""
-    status = {
-        "last_sync_at": datetime.now(timezone.utc).isoformat(),
-        "success": success,
-        "conversations_synced": conversations,
-        "messages_synced": messages,
-        "searches_synced": searches,
-    }
-    try:
-        os.makedirs(os.path.dirname(SYNC_STATUS_FILE), exist_ok=True)
-        with open(SYNC_STATUS_FILE, "w") as f:
-            json.dump(status, f)
-    except Exception:
-        logger.debug("Could not write sync status file")
 
 _CONV_COLS_REMOTE = (
     "id", "session_id", "llm_provider", "model", "ip_address",
@@ -61,23 +41,19 @@ _CONV_COLS_REMOTE = (
     "status", "started_at", "last_active_at",
 )
 
-_MSG_COLS = (
+_MSG_COLS_REMOTE = (
     "id", "conversation_id", "role", "content", "tool_call_id",
     "tool_calls", "tour_cards", "tokens_prompt", "tokens_completion",
     "latency_ms", "created_at",
 )
 
-_SEARCH_COLS = (
+_SEARCH_COLS_REMOTE = (
     "id", "conversation_id", "requestid", "search_type", "departure",
     "country", "regions", "date_from", "date_to", "nights_from",
     "nights_to", "adults", "children", "stars", "meal",
     "price_from", "price_to", "hotels_found", "tours_found",
     "min_price", "duration_ms", "created_at",
 )
-
-
-def _get_env(key: str, default: str = "") -> str:
-    return os.environ.get(key, default)
 
 
 def _find_free_port() -> int:
@@ -87,55 +63,47 @@ def _find_free_port() -> int:
 
 
 @contextmanager
-def remote_pg_connection():
-    """Open SSH tunnel via ssh key (preferred) or sshpass fallback → remote PostgreSQL.
-    Yields a psycopg3 connection."""
-    ssh_host = _get_env("MGP_SSH_HOST", "")
+def remote_pg_connection(cfg: dict):
+    """Open SSH tunnel → remote PostgreSQL. Yields a psycopg3 connection.
+
+    cfg keys: ssh_host, ssh_port, ssh_user, ssh_password,
+              pg_port, pg_user, pg_password, pg_db
+    """
+    ssh_host = cfg["ssh_host"]
     if not ssh_host:
-        raise RuntimeError("MGP_SSH_HOST not configured — cannot open SSH tunnel")
-    ssh_port = _get_env("MGP_SSH_PORT", "22")
-    ssh_user = _get_env("MGP_SSH_USER", "root")
-    ssh_pass = _get_env("MGP_SSH_PASSWORD", "")
-    ssh_key = _get_env("MGP_SSH_KEY_PATH", "/tmp/sync_key")
-    remote_pg_port = _get_env("MGP_PG_PORT", "5432")
-    pg_user = _get_env("MGP_PG_USER", "mgp")
-    pg_pass = _get_env("MGP_PG_PASSWORD", "mgp")
-    pg_db = _get_env("MGP_PG_DB", "mgp")
+        raise RuntimeError("ssh_host not configured — cannot open SSH tunnel")
+    ssh_port = str(cfg.get("ssh_port", 22))
+    ssh_user = cfg.get("ssh_user", "root")
+    ssh_pass = cfg.get("ssh_password", "")
+    remote_pg_port = str(cfg.get("pg_port", 5432))
+    pg_user = cfg.get("pg_user", "mgp")
+    pg_pass = cfg.get("pg_password", "mgp")
+    pg_db = cfg.get("pg_db", "mgp")
 
     local_port = _find_free_port()
 
+    ssh_key = "/tmp/sync_key"
     use_key = os.path.isfile(ssh_key)
+
+    ssh_opts = [
+        "-o", "StrictHostKeyChecking=accept-new",
+        "-o", "ConnectTimeout=10",
+        "-o", "ServerAliveInterval=15",
+        "-o", "ServerAliveCountMax=3",
+        "-N",
+        "-L", f"{local_port}:127.0.0.1:{remote_pg_port}",
+        "-p", ssh_port,
+        f"{ssh_user}@{ssh_host}",
+    ]
     if use_key:
-        cmd = [
-            "ssh",
-            "-i", ssh_key,
-            "-o", "StrictHostKeyChecking=accept-new",
-            "-o", "ConnectTimeout=10",
-            "-o", "ServerAliveInterval=15",
-            "-o", "ServerAliveCountMax=3",
-            "-N",
-            "-L", f"{local_port}:127.0.0.1:{remote_pg_port}",
-            "-p", ssh_port,
-            f"{ssh_user}@{ssh_host}",
-        ]
+        cmd = ["ssh", "-i", ssh_key] + ssh_opts
     else:
-        cmd = [
-            "sshpass", "-p", ssh_pass,
-            "ssh",
-            "-o", "StrictHostKeyChecking=accept-new",
-            "-o", "ConnectTimeout=10",
-            "-o", "ServerAliveInterval=15",
-            "-o", "ServerAliveCountMax=3",
-            "-N",
-            "-L", f"{local_port}:127.0.0.1:{remote_pg_port}",
-            "-p", ssh_port,
-            f"{ssh_user}@{ssh_host}",
-        ]
+        cmd = ["sshpass", "-p", ssh_pass, "ssh"] + ssh_opts
+
     tunnel_proc = subprocess.Popen(
         cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
     )
 
-    # Wait for tunnel to be ready
     for _ in range(30):
         try:
             with socket.create_connection(("127.0.0.1", local_port), timeout=1):
@@ -163,26 +131,36 @@ def remote_pg_connection():
         logger.info("SSH tunnel closed")
 
 
-def _load_watermarks(redis_client) -> dict:
-    """Load last-sync timestamps from Redis."""
+def _wm_key(assistant_id: uuid.UUID) -> str:
+    return f"sync:wm:{assistant_id}"
+
+
+def _load_watermarks(redis_client, assistant_id: uuid.UUID) -> dict:
     if redis_client is None:
         return {}
-    import json
-    raw = redis_client.get(SYNC_STATE_KEY)
+    raw = redis_client.get(_wm_key(assistant_id))
     if raw:
         return json.loads(raw)
     return {}
 
 
-def _save_watermarks(redis_client, wm: dict):
+def _save_watermarks(redis_client, assistant_id: uuid.UUID, wm: dict):
     if redis_client is None:
         return
-    import json
-    redis_client.set(SYNC_STATE_KEY, json.dumps(wm), ex=86400 * 30)
+    redis_client.set(_wm_key(assistant_id), json.dumps(wm), ex=86400 * 30)
 
+
+def _jsonb_safe(val):
+    if val is None:
+        return None
+    if isinstance(val, (dict, list)):
+        return json.dumps(val, ensure_ascii=False)
+    return val
+
+
+# ── Conversations ────────────────────────────────────────────────────────────
 
 def sync_conversations(remote_conn, local_session, assistant_id: uuid.UUID, watermark: str | None):
-    """Sync conversations: UPSERT by id, link to assistant_id."""
     since_clause = ""
     params: dict = {}
     if watermark:
@@ -197,7 +175,7 @@ def sync_conversations(remote_conn, local_session, assistant_id: uuid.UUID, wate
         rows = cur.fetchall()
 
     if not rows:
-        logger.info("Conversations: 0 new/updated")
+        logger.info("[%s] Conversations: 0 new/updated", str(assistant_id)[:8])
         return watermark, 0
 
     from sqlalchemy import text as sa_text
@@ -242,33 +220,24 @@ def sync_conversations(remote_conn, local_session, assistant_id: uuid.UUID, wate
         if not new_watermark or ts > new_watermark:
             new_watermark = ts
     if skipped:
-        logger.warning("Conversations: skipped %d rows (unique constraint)", skipped)
+        logger.warning("[%s] Conversations: skipped %d rows", str(assistant_id)[:8], skipped)
 
     local_session.flush()
     synced_count = len(rows) - skipped
-    logger.info("Conversations: %d synced (watermark → %s)", synced_count, new_watermark)
+    logger.info("[%s] Conversations: %d synced (wm → %s)", str(assistant_id)[:8], synced_count, new_watermark)
     return new_watermark, synced_count
 
 
-def _jsonb_safe(val):
-    """Convert dict/list to JSON string for raw SQL JSONB insert via psycopg3."""
-    if val is None:
-        return None
-    import json
-    if isinstance(val, (dict, list)):
-        return json.dumps(val, ensure_ascii=False)
-    return val
+# ── Messages ─────────────────────────────────────────────────────────────────
 
-
-def sync_messages(remote_conn, local_session, watermark: str | None):
-    """Sync messages: INSERT new only (messages are immutable)."""
+def sync_messages(remote_conn, local_session, watermark: str | None, assistant_tag: str = ""):
     since_clause = ""
     params: dict = {}
     if watermark:
         since_clause = "WHERE created_at > %(since)s"
         params["since"] = watermark
 
-    cols = ", ".join(_MSG_COLS)
+    cols = ", ".join(_MSG_COLS_REMOTE)
     sql = f"SELECT {cols} FROM messages {since_clause} ORDER BY created_at LIMIT 100000"
 
     with remote_conn.cursor() as cur:
@@ -276,32 +245,46 @@ def sync_messages(remote_conn, local_session, watermark: str | None):
         rows = cur.fetchall()
 
     if not rows:
-        logger.info("Messages: 0 new")
+        logger.info("[%s] Messages: 0 new", assistant_tag)
         return watermark, 0
 
     from sqlalchemy import text as sa_text
-    is_sqlite = str(local_session.bind.url).startswith("sqlite")
     jsonb_cols = {"tool_calls", "tour_cards"}
-    placeholders = ", ".join(
-        f":{c}" if is_sqlite else (f"CAST(:{c} AS jsonb)" if c in jsonb_cols else f":{c}")
-        for c in _MSG_COLS
+
+    local_cols = (
+        "conversation_id", "remote_id", "role", "content", "tool_call_id",
+        "tool_calls", "tour_cards", "tokens_prompt", "tokens_completion",
+        "latency_ms", "created_at",
     )
-    cols_str = ", ".join(_MSG_COLS)
+    placeholders = ", ".join(
+        f"CAST(:{c} AS jsonb)" if c in jsonb_cols else f":{c}"
+        for c in local_cols
+    )
+    cols_str = ", ".join(local_cols)
     upsert_sql = sa_text(f"""
         INSERT INTO messages ({cols_str})
         VALUES ({placeholders})
-        ON CONFLICT (id) DO NOTHING
+        ON CONFLICT (conversation_id, remote_id) DO NOTHING
     """)
 
     new_watermark = watermark
+    inserted = 0
     for row in rows:
-        data = dict(zip(_MSG_COLS, row))
+        data = dict(zip(_MSG_COLS_REMOTE, row))
+        remote_id = data.pop("id")
+        data["remote_id"] = remote_id
         for jc in jsonb_cols:
             data[jc] = _jsonb_safe(data[jc])
         for k, v in data.items():
             if isinstance(v, uuid.UUID):
                 data[k] = v.hex
-        local_session.execute(upsert_sql, data)
+        try:
+            sp = local_session.begin_nested()
+            local_session.execute(upsert_sql, data)
+            sp.commit()
+            inserted += 1
+        except Exception:
+            sp.rollback()
         ts = data["created_at"]
         if isinstance(ts, datetime):
             ts = ts.isoformat()
@@ -309,19 +292,20 @@ def sync_messages(remote_conn, local_session, watermark: str | None):
             new_watermark = ts
 
     local_session.flush()
-    logger.info("Messages: %d synced (watermark → %s)", len(rows), new_watermark)
-    return new_watermark, len(rows)
+    logger.info("[%s] Messages: %d synced (wm → %s)", assistant_tag, inserted, new_watermark)
+    return new_watermark, inserted
 
 
-def sync_tour_searches(remote_conn, local_session, watermark: str | None):
-    """Sync tour_searches: INSERT new only."""
+# ── Tour searches ────────────────────────────────────────────────────────────
+
+def sync_tour_searches(remote_conn, local_session, watermark: str | None, assistant_tag: str = ""):
     since_clause = ""
     params: dict = {}
     if watermark:
         since_clause = "WHERE created_at > %(since)s"
         params["since"] = watermark
 
-    cols = ", ".join(_SEARCH_COLS)
+    cols = ", ".join(_SEARCH_COLS_REMOTE)
     sql = f"SELECT {cols} FROM tour_searches {since_clause} ORDER BY created_at LIMIT 100000"
 
     with remote_conn.cursor() as cur:
@@ -329,25 +313,42 @@ def sync_tour_searches(remote_conn, local_session, watermark: str | None):
         rows = cur.fetchall()
 
     if not rows:
-        logger.info("TourSearches: 0 new")
+        logger.info("[%s] TourSearches: 0 new", assistant_tag)
         return watermark, 0
 
     from sqlalchemy import text as sa_text
-    cols_str = ", ".join(_SEARCH_COLS)
-    placeholders = ", ".join(f":{c}" for c in _SEARCH_COLS)
+
+    local_cols = (
+        "conversation_id", "remote_id", "requestid", "search_type", "departure",
+        "country", "regions", "date_from", "date_to", "nights_from",
+        "nights_to", "adults", "children", "stars", "meal",
+        "price_from", "price_to", "hotels_found", "tours_found",
+        "min_price", "duration_ms", "created_at",
+    )
+    placeholders = ", ".join(f":{c}" for c in local_cols)
+    cols_str = ", ".join(local_cols)
     upsert_sql = sa_text(f"""
         INSERT INTO tour_searches ({cols_str})
         VALUES ({placeholders})
-        ON CONFLICT (id) DO NOTHING
+        ON CONFLICT (conversation_id, remote_id) DO NOTHING
     """)
 
     new_watermark = watermark
+    inserted = 0
     for row in rows:
-        data = dict(zip(_SEARCH_COLS, row))
+        data = dict(zip(_SEARCH_COLS_REMOTE, row))
+        remote_id = data.pop("id")
+        data["remote_id"] = remote_id
         for k, v in data.items():
             if isinstance(v, uuid.UUID):
                 data[k] = v.hex
-        local_session.execute(upsert_sql, data)
+        try:
+            sp = local_session.begin_nested()
+            local_session.execute(upsert_sql, data)
+            sp.commit()
+            inserted += 1
+        except Exception:
+            sp.rollback()
         ts = data["created_at"]
         if isinstance(ts, datetime):
             ts = ts.isoformat()
@@ -355,36 +356,21 @@ def sync_tour_searches(remote_conn, local_session, watermark: str | None):
             new_watermark = ts
 
     local_session.flush()
-    logger.info("TourSearches: %d synced (watermark → %s)", len(rows), new_watermark)
-    return new_watermark, len(rows)
+    logger.info("[%s] TourSearches: %d synced (wm → %s)", assistant_tag, inserted, new_watermark)
+    return new_watermark, inserted
 
 
-_SEQ_OFFSET = 10_000_000
+# ── Booking intent ───────────────────────────────────────────────────────────
 
-
-def _ensure_sequence_offset(local_session):
-    """Ensure local auto-increment sequences start above _SEQ_OFFSET to avoid
-    ID collisions with synced remote data (remote IDs are < _SEQ_OFFSET)."""
-    from sqlalchemy import text as sa_text
-    for seq in ("messages_id_seq", "tour_searches_id_seq", "api_calls_id_seq"):
-        try:
-            row = local_session.execute(sa_text(f"SELECT last_value FROM {seq}")).fetchone()
-            if row and row[0] < _SEQ_OFFSET:
-                local_session.execute(sa_text(f"SELECT setval('{seq}', {_SEQ_OFFSET}, false)"))
-                logger.info("Sequence %s advanced to %d", seq, _SEQ_OFFSET)
-        except Exception:
-            logger.debug("Sequence %s not found, skipping", seq)
-
-
-def _recompute_booking_intent(local_session):
-    """Re-evaluate has_booking_intent for conversations that are still marked False."""
+def _recompute_booking_intent(local_session, assistant_id: uuid.UUID):
     from models import Conversation, Message
     import sys
     sys.path.insert(0, os.path.dirname(__file__))
     from app import check_conversation_booking_intent
 
     convs = local_session.query(Conversation).filter(
-        Conversation.has_booking_intent == False  # noqa: E712
+        Conversation.has_booking_intent == False,  # noqa: E712
+        Conversation.assistant_id == assistant_id,
     ).all()
 
     updated = 0
@@ -401,11 +387,122 @@ def _recompute_booking_intent(local_session):
 
     if updated:
         local_session.flush()
-    logger.info("Booking intent: %d conversations updated", updated)
+    logger.info("[%s] Booking intent: %d updated", str(assistant_id)[:8], updated)
 
 
-def run_sync():
-    """Full incremental sync: remote MGP → local ЛК database."""
+# ── Per-assistant update sync status in DB ───────────────────────────────────
+
+def _update_sync_status(local_session, assistant_id: uuid.UUID, success: bool, error: str | None = None):
+    from sqlalchemy import text as sa_text
+    local_session.execute(
+        sa_text("""
+            UPDATE assistants
+            SET last_sync_at = :ts,
+                last_sync_status = :status,
+                last_sync_error = :error
+            WHERE id = :aid
+        """),
+        {
+            "ts": datetime.now(timezone.utc),
+            "status": "ok" if success else "error",
+            "error": error[:500] if error else None,
+            "aid": str(assistant_id).replace("-", ""),
+        },
+    )
+    local_session.flush()
+
+
+# ── Single assistant sync ────────────────────────────────────────────────────
+
+def _sync_single_assistant(assistant, redis_client, get_db_fn):
+    """Run incremental sync for one assistant. Isolated: exceptions don't leak."""
+    aid = assistant.id
+    tag = str(aid)[:8]
+    logger.info("── Sync start: %s (%s) ──", assistant.name, tag)
+
+    cfg = {
+        "ssh_host": assistant.sync_ssh_host,
+        "ssh_port": assistant.sync_ssh_port or 22,
+        "ssh_user": assistant.sync_ssh_user or "root",
+        "ssh_password": assistant.sync_ssh_password or "",
+        "pg_port": assistant.sync_pg_port or 5432,
+        "pg_user": assistant.sync_pg_user or "mgp",
+        "pg_password": assistant.sync_pg_password or "mgp",
+        "pg_db": assistant.sync_pg_db or "mgp",
+    }
+
+    watermarks = _load_watermarks(redis_client, aid)
+
+    try:
+        with remote_pg_connection(cfg) as remote_conn:
+            with get_db_fn() as db:
+                if db is None:
+                    return
+
+                wm_conv, n_conv = sync_conversations(
+                    remote_conn, db, aid,
+                    watermarks.get("conversations"),
+                )
+                wm_msg, n_msg = sync_messages(
+                    remote_conn, db,
+                    watermarks.get("messages"),
+                    assistant_tag=tag,
+                )
+                wm_ts, n_ts = sync_tour_searches(
+                    remote_conn, db,
+                    watermarks.get("tour_searches"),
+                    assistant_tag=tag,
+                )
+
+                if n_msg > 0:
+                    _recompute_booking_intent(db, aid)
+
+                watermarks["conversations"] = wm_conv
+                watermarks["messages"] = wm_msg
+                watermarks["tour_searches"] = wm_ts
+
+                _update_sync_status(db, aid, success=True)
+
+        _save_watermarks(redis_client, aid, watermarks)
+        logger.info("── Sync done: %s (%d conv, %d msg, %d ts) ──", tag, n_conv, n_msg, n_ts)
+
+    except Exception as exc:
+        logger.exception("Sync failed for assistant %s", tag)
+        try:
+            with get_db_fn() as db:
+                if db:
+                    _update_sync_status(db, aid, success=False, error=str(exc))
+        except Exception:
+            logger.debug("Could not persist sync error for %s", tag)
+
+
+# ── Main entry point (called by scheduler) ───────────────────────────────────
+
+def _migrate_legacy_watermarks(redis_client, assistants):
+    """One-time: move old `sync:mgp:watermarks` key to per-assistant keys."""
+    if redis_client is None:
+        return
+    old_key = "sync:mgp:watermarks"
+    raw = redis_client.get(old_key)
+    if not raw:
+        return
+    try:
+        old_wm = json.loads(raw)
+    except Exception:
+        return
+    if not old_wm or not assistants:
+        return
+    first_id = assistants[0].id
+    new_key = _wm_key(first_id)
+    if redis_client.exists(new_key):
+        return
+    redis_client.set(new_key, json.dumps(old_wm), ex=86400 * 30)
+    redis_client.delete(old_key)
+    logger.info("Migrated legacy watermarks → %s", new_key)
+
+
+def run_sync_all():
+    """Iterate over all sync-enabled assistants and sync each one."""
     from database import init_db, get_db
     from config import settings
 
@@ -414,68 +511,42 @@ def run_sync():
     try:
         import redis as _redis
         redis_client = _redis.from_url(
-            _get_env("REDIS_URL", "redis://localhost:6379/0"),
+            os.environ.get("REDIS_URL", settings.redis_url),
             decode_responses=True,
         )
         redis_client.ping()
     except Exception:
         redis_client = None
-        logger.warning("Redis unavailable — watermarks will not persist between runs")
+        logger.warning("Redis unavailable — watermarks will not persist")
 
-    watermarks = _load_watermarks(redis_client)
+    from models import Assistant
 
     with get_db() as db:
         if db is None:
             logger.error("Local DB unavailable — cannot sync")
             return
+        assistants = db.query(Assistant).filter(
+            Assistant.sync_enabled == True,  # noqa: E712
+            Assistant.sync_ssh_host.isnot(None),
+        ).all()
 
-        from models import Assistant
-        assistant = db.query(Assistant).first()
-        if assistant is None:
-            logger.error("No assistant found — run seed_data.py first")
-            return
-        assistant_id = assistant.id
+    _migrate_legacy_watermarks(redis_client, assistants)
 
-    try:
-        with remote_pg_connection() as remote_conn:
-            with get_db() as db:
-                if db is None:
-                    return
+    if not assistants:
+        logger.info("No sync-enabled assistants found — nothing to do")
+        return
 
-                _ensure_sequence_offset(db)
+    logger.info("Sync cycle: %d assistant(s) to sync", len(assistants))
+    for ast in assistants:
+        _sync_single_assistant(ast, redis_client, get_db)
 
-                wm_conv, n_conv = sync_conversations(
-                    remote_conn, db, assistant_id,
-                    watermarks.get("conversations"),
-                )
-                wm_msg, n_msg = sync_messages(
-                    remote_conn, db,
-                    watermarks.get("messages"),
-                )
-                wm_ts, n_ts = sync_tour_searches(
-                    remote_conn, db,
-                    watermarks.get("tour_searches"),
-                )
 
-                if n_msg > 0:
-                    _recompute_booking_intent(db)
-
-                watermarks["conversations"] = wm_conv
-                watermarks["messages"] = wm_msg
-                watermarks["tour_searches"] = wm_ts
-
-        _save_watermarks(redis_client, watermarks)
-        _write_sync_status(n_conv, n_msg, n_ts, True)
-        logger.info("Sync complete ✓")
-
-    except Exception:
-        logger.exception("Sync failed")
-        _write_sync_status(0, 0, 0, False)
-
+# Backward-compat alias
+run_sync = run_sync_all
 
 if __name__ == "__main__":
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
     )
-    run_sync()
+    run_sync_all()

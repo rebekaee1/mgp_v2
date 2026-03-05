@@ -20,6 +20,16 @@
   var isReady = false;
   var launcher, iframe, overlay;
 
+  var lsKey = 'aimpact_cid_' + assistantId;
+  var conversationId;
+  try { conversationId = localStorage.getItem(lsKey); } catch(e) {}
+  if (!conversationId) {
+    conversationId = 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function(c) {
+      var r = Math.random() * 16 | 0; return (c === 'x' ? r : (r & 0x3 | 0x8)).toString(16);
+    });
+    try { localStorage.setItem(lsKey, conversationId); } catch(e) {}
+  }
+
   function darken(hex, amt) {
     hex = hex.replace('#','');
     var r = Math.max(0, parseInt(hex.substring(0,2),16) - amt);
@@ -68,7 +78,7 @@
   function createIframe() {
     iframe = document.createElement('iframe');
     iframe.className = 'aimpact-frame';
-    iframe.src = embedUrl;
+    iframe.src = embedUrl + '?cid=' + encodeURIComponent(conversationId);
     iframe.setAttribute('sandbox', 'allow-scripts allow-same-origin allow-forms allow-popups allow-popups-to-escape-sandbox');
     iframe.setAttribute('allow', 'clipboard-write');
     applyPosition(iframe, 'iframe');
@@ -153,6 +163,10 @@
     if (!e.data || typeof e.data.type !== 'string') return;
     if (e.data.type === 'aimpact:ready') { isReady = true; }
     else if (e.data.type === 'aimpact:close') { close(); }
+    else if (e.data.type === 'aimpact:updateCid' && e.data.cid) {
+      conversationId = e.data.cid;
+      try { localStorage.setItem(lsKey, conversationId); } catch(ex) {}
+    }
   }
 
   window.addEventListener('message', onMessage);

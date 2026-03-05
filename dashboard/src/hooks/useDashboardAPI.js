@@ -164,3 +164,7 @@ export function useWidgetEmbedCode() {
 export function useAccount() {
   return useFetch('/dashboard/account');
 }
+
+export function useSyncConfig() {
+  return useFetch('/dashboard/sync/config');
+}

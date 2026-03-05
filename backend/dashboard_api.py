@@ -140,16 +140,31 @@ def _match_codes(mapping: dict, word: str) -> list[int]:
     return result
 
 
-_SYNC_STATUS_FILE = os.path.join(os.path.dirname(__file__), "..", "logs", "sync_status.json")
-
-
-def _get_sync_status():
-    """Read sync status written by sync_mgp after each run."""
+def _get_sync_status(db=None):
+    """Read aggregated sync status from all sync-enabled assistants.
+    Accepts optional existing db session to avoid nested get_db() calls."""
     try:
-        with open(_SYNC_STATUS_FILE) as f:
-            return json.load(f)
+        if db is not None:
+            return _sync_status_from_db(db)
+        with get_db() as session:
+            if session is None:
+                return None
+            return _sync_status_from_db(session)
     except Exception:
-        return None
+        pass
+    return None
+
+
+def _sync_status_from_db(db):
+    ast = db.query(Assistant).filter(
+        Assistant.sync_enabled == True  # noqa: E712
+    ).order_by(Assistant.last_sync_at.desc().nulls_last()).first()
+    if ast and ast.last_sync_at:
+        return {
+            "last_sync_at": ast.last_sync_at.isoformat(),
+            "success": ast.last_sync_status == "ok",
+        }
+    return None
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -527,7 +542,7 @@ def overview():
             "avg_response_ms": {"value": round(avg_latency)},
             "funnel": funnel,
             "insights": insights,
-            "last_sync": _get_sync_status(),
+            "last_sync": _get_sync_status(db),
         })
 
 
@@ -1587,6 +1602,7 @@ def widget_config_update():
 
         from cache import cache_delete
         cache_delete(f"widget:config:{assistant.id}")
+        cache_delete(f"widget:fa:{assistant.id}")
 
         return jsonify({"status": "ok"})
 
@@ -1712,6 +1728,132 @@ def widget_logo_delete():
         assistant.widget_config = cfg
 
         return jsonify({"status": "ok"})
+
+
+# ── Sync Configuration ────────────────────────────────────────────────────────
+
+@dash_bp.route("/sync/config", methods=["GET"])
+@require_auth
+def sync_config_get():
+    with get_db() as db:
+        if db is None:
+            return jsonify({"error": "Database unavailable"}), 503
+
+        assistant = db.query(Assistant).filter(
+            Assistant.company_id == g.company_id, Assistant.is_active.is_(True)
+        ).first()
+        if not assistant:
+            return jsonify({"error": "No active assistant"}), 404
+
+        return jsonify({
+            "sync_enabled": assistant.sync_enabled,
+            "sync_ssh_host": assistant.sync_ssh_host or "",
+            "sync_ssh_port": assistant.sync_ssh_port or 22,
+            "sync_ssh_user": assistant.sync_ssh_user or "root",
+            "has_ssh_password": bool(assistant.sync_ssh_password),
+            "sync_pg_port": assistant.sync_pg_port or 5432,
+            "sync_pg_user": assistant.sync_pg_user or "",
+            "has_pg_password": bool(assistant.sync_pg_password),
+            "sync_pg_db": assistant.sync_pg_db or "",
+            "last_sync_at": assistant.last_sync_at.isoformat() if assistant.last_sync_at else None,
+            "last_sync_status": assistant.last_sync_status,
+            "last_sync_error": assistant.last_sync_error,
+        })
+
+
+@dash_bp.route("/sync/config", methods=["PUT"])
+@require_auth
+def sync_config_update():
+    data = request.get_json(silent=True) or {}
+    with get_db() as db:
+        if db is None:
+            return jsonify({"error": "Database unavailable"}), 503
+
+        assistant = db.query(Assistant).filter(
+            Assistant.company_id == g.company_id, Assistant.is_active.is_(True)
+        ).first()
+        if not assistant:
+            return jsonify({"error": "No active assistant"}), 404
+
+        if "sync_enabled" in data:
+            assistant.sync_enabled = bool(data["sync_enabled"])
+        if "sync_ssh_host" in data:
+            assistant.sync_ssh_host = (data["sync_ssh_host"] or "").strip() or None
+        if "sync_ssh_port" in data:
+            assistant.sync_ssh_port = int(data["sync_ssh_port"] or 22)
+        if "sync_ssh_user" in data:
+            assistant.sync_ssh_user = (data["sync_ssh_user"] or "root").strip()
+        if "sync_ssh_password" in data:
+            val = data["sync_ssh_password"]
+            if val is not None:
+                assistant.sync_ssh_password = val
+        if "sync_pg_port" in data:
+            assistant.sync_pg_port = int(data["sync_pg_port"] or 5432)
+        if "sync_pg_user" in data:
+            assistant.sync_pg_user = (data["sync_pg_user"] or "").strip() or None
+        if "sync_pg_password" in data:
+            val = data["sync_pg_password"]
+            if val is not None:
+                assistant.sync_pg_password = val
+        if "sync_pg_db" in data:
+            assistant.sync_pg_db = (data["sync_pg_db"] or "").strip() or None
+
+        return jsonify({"status": "ok"})
+
+
+@dash_bp.route("/sync/test", methods=["POST"])
+@require_auth
+def sync_test_connection():
+    """Test SSH+PostgreSQL connectivity to remote bot database."""
+    with get_db() as db:
+        if db is None:
+            return jsonify({"error": "Database unavailable"}), 503
+
+        assistant = db.query(Assistant).filter(
+            Assistant.company_id == g.company_id, Assistant.is_active.is_(True)
+        ).first()
+        if not assistant:
+            return jsonify({"error": "No active assistant"}), 404
+
+        if not assistant.sync_ssh_host:
+            return jsonify({"success": False, "error": "SSH хост не указан"}), 400
+
+        cfg = {
+            "ssh_host": assistant.sync_ssh_host,
+            "ssh_port": assistant.sync_ssh_port or 22,
+            "ssh_user": assistant.sync_ssh_user or "root",
+            "ssh_password": assistant.sync_ssh_password or "",
+            "pg_port": assistant.sync_pg_port or 5432,
+            "pg_user": assistant.sync_pg_user or "mgp",
+            "pg_password": assistant.sync_pg_password or "",
+            "pg_db": assistant.sync_pg_db or "mgp",
+        }
+
+    try:
+        from sync_mgp import remote_pg_connection
+        with remote_pg_connection(cfg) as conn:
+            with conn.cursor() as cur:
+                tables_found = []
+                for tbl in ("conversations", "messages", "tour_searches"):
+                    cur.execute(
+                        "SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_name = %s)",
+                        (tbl,),
+                    )
+                    if cur.fetchone()[0]:
+                        tables_found.append(tbl)
+
+                counts = {}
+                for tbl in tables_found:
+                    cur.execute(f"SELECT COUNT(*) FROM {tbl}")
+                    counts[tbl] = cur.fetchone()[0]
+
+        return jsonify({
+            "success": True,
+            "tables_found": tables_found,
+            "row_counts": counts,
+        })
+    except Exception as exc:
+        return jsonify({"success": False, "error": str(exc)}), 400
 
 
 # ── System ────────────────────────────────────────────────────────────────────

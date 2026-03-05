@@ -687,8 +687,48 @@ def widget_chat_proxy(assistant_id):
 
 @app.route('/widget/embed/<assistant_id>')
 def widget_embed_page(assistant_id):
-    """Serve the embeddable widget page (loaded inside iframe)."""
-    return send_from_directory(_FRONTEND_DIR, 'widget-embed.html')
+    """Serve the embeddable widget page (loaded inside iframe).
+    Sets dynamic CSP with frame-ancestors based on assistant's allowed_domains."""
+    _init_infrastructure()
+    from database import get_db
+    from models import Assistant
+    from cache import cache_get, cache_set
+
+    frame_ancestors = "*"
+    cache_key = f"widget:fa:{assistant_id}"
+    cached_fa = cache_get(cache_key)
+    if cached_fa and isinstance(cached_fa, str):
+        frame_ancestors = cached_fa
+    else:
+        try:
+            with get_db() as db:
+                if db:
+                    assistant = db.query(Assistant).filter(
+                        Assistant.id == assistant_id,
+                        Assistant.is_active.is_(True),
+                    ).first()
+                    if not assistant:
+                        return jsonify({"error": "Assistant not found"}), 404
+                    if assistant.allowed_domains:
+                        domains = [d.strip() for d in assistant.allowed_domains.split(',') if d.strip()]
+                        if domains:
+                            frame_ancestors = ' '.join(domains)
+            cache_set(cache_key, frame_ancestors, ttl_seconds=300)
+        except Exception:
+            logger.debug("widget_embed_page: allowed_domains lookup failed", exc_info=True)
+
+    resp = send_from_directory(_FRONTEND_DIR, 'widget-embed.html')
+    csp = (
+        "default-src 'self' 'unsafe-inline'; "
+        "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; "
+        "connect-src 'self'; "
+        "img-src 'self' data: blob: https:; "
+        "font-src 'self' https://fonts.gstatic.com; "
+        f"frame-ancestors {frame_ancestors};"
+    )
+    resp.headers['Content-Security-Policy'] = csp
+    resp.headers.pop('X-Frame-Options', None)
+    return resp
 
 
 @app.route('/favicon.ico')
