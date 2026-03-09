@@ -68,6 +68,7 @@ class Assistant(Base):
     system_prompt: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     faq_content: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     widget_config: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
+    runtime_metadata: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
     bot_server_url: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     allowed_domains: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
@@ -315,3 +316,33 @@ class DailyStat(Base):
     errors_count: Mapped[int] = mapped_column(Integer, default=0)
     tokens_total: Mapped[int] = mapped_column(Integer, default=0)
     unique_ips: Mapped[int] = mapped_column(Integer, default=0)
+
+
+class ProvisioningRequest(Base):
+    """Control-plane provisioning request state for LK -> MGP orchestration."""
+    __tablename__ = "provisioning_requests"
+
+    provisioning_request_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    idempotency_key: Mapped[str] = mapped_column(String(128), nullable=False)
+    control_plane_request_id: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    callback_url: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    callback_token: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="accepted")
+    company_id: Mapped[Optional[uuid.UUID]] = mapped_column(UUID(), nullable=True)
+    assistant_id: Mapped[Optional[uuid.UUID]] = mapped_column(UUID(), nullable=True)
+    request_payload: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
+    latest_result: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
+    error_code: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    error_message: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    error_retryable: Mapped[Optional[bool]] = mapped_column(Boolean, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, onupdate=_utcnow
+    )
+
+    __table_args__ = (
+        Index("ix_provisioning_requests_status", "status", "created_at"),
+        Index("ix_provisioning_requests_idempotency", "idempotency_key"),
+    )

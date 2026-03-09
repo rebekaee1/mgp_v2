@@ -31,6 +31,8 @@ class RuntimeTenantConfig:
     allowed_domains: Optional[str] = None
     bot_server_url: Optional[str] = None
     widget_config: Dict[str, Any] = field(default_factory=dict)
+    runtime_metadata: Dict[str, Any] = field(default_factory=dict)
+    runtime_service_auth_secret: Optional[str] = None
     source: str = "env-default"
 
 
@@ -100,6 +102,10 @@ def resolve_runtime_config(assistant_id: Optional[str] = None) -> RuntimeTenantC
             runtime_config.allowed_domains = assistant.allowed_domains or None
             runtime_config.bot_server_url = assistant.bot_server_url or None
             runtime_config.widget_config = dict(assistant.widget_config or {})
+            runtime_config.runtime_metadata = dict(assistant.runtime_metadata or {})
+            runtime_config.runtime_service_auth_secret = (
+                (assistant.runtime_metadata or {}).get("service_auth", {}) or {}
+            ).get("secret")
             runtime_config.source = "assistant-db"
             return runtime_config
     except Exception:

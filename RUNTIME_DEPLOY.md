@@ -37,6 +37,7 @@
 - `RUNTIME_TRUSTED_PROXY_CIDRS=...`
 - `RUNTIME_REPORT_URL=...`
 - `RUNTIME_REPORT_TOKEN=...`
+- `RUNTIME_PROVISIONING_API_TOKEN=...`
 
 ## Backend-only profile
 
@@ -80,6 +81,8 @@
 
 - `GET /api/runtime/metadata`
 - `GET /api/runtime/status`
+- `POST /api/provisioning/tenants`
+- `GET /api/provisioning/tenants/<provisioning_request_id>`
 
 Они предназначены для provisioning/orchestration слоя и не меняют chat-контракт.
 
@@ -98,6 +101,81 @@
 - `runtime_mode`
 - `service_auth_mode`
 - флаг включенного reporting/webhook слоя
+
+### Provisioning Contract
+
+`POST /api/provisioning/tenants` принимает:
+
+- `Authorization: Bearer <RUNTIME_PROVISIONING_API_TOKEN>`
+- `X-Idempotency-Key`
+- `X-Control-Plane-Request-Id`
+- `provisioning_request_id` в body
+- tenant/admin/assistant/runtime payload
+
+Финально согласованный способ передачи runtime chat-secret:
+
+- `LK` генерирует runtime-wide secret
+- передаёт его в `runtime.service_auth.secret`
+- `MGP` сохраняет и применяет его в новом runtime
+- `callback/status API` secret не возвращают
+
+Поддерживаемая структура:
+
+```json
+{
+  "provisioning_request_id": "req_123",
+  "callback": {
+    "url": "https://lk.example/api/runtime/callback",
+    "auth": {
+      "token": "callback-secret"
+    }
+  },
+  "tenant": {
+    "company_name": "New Company",
+    "company_slug": "new-company",
+    "company_logo_url": "https://cdn.example/logo.png"
+  },
+  "admin_user": {
+    "email": "admin@example.com",
+    "password": "strong-password",
+    "name": "Admin"
+  },
+  "assistant": {
+    "assistant_id": "11111111-2222-3333-4444-555555555555",
+    "name": "New Company AI Assistant",
+    "bot_server_url": "https://runtime.example.com",
+    "allowed_domains": "https://site.example.com",
+    "system_prompt": "...",
+    "faq_content": "..."
+  },
+  "runtime": {
+    "public_base_url": "https://runtime.example.com",
+    "service_auth": {
+      "mode": "shared_secret",
+      "header_name": "X-MGP-Service-Token",
+      "scope": "runtime",
+      "secret": "generated-by-lk"
+    }
+  }
+}
+```
+
+Status model:
+
+- `accepted`
+- `provisioning`
+- `runtime_ready`
+- `failed`
+
+В `GET /api/provisioning/tenants/<provisioning_request_id>` и callback body возвращаются только:
+
+- `provisioning_request_id`
+- `status`
+- `control_plane_request_id`
+- `tenant.company_id`
+- `tenant.assistant_id`
+- runtime URLs/metadata без `service_auth.secret`
+- `error` при `failed`
 
 ## Template / Provisioning
 

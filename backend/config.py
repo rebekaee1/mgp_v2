@@ -63,6 +63,7 @@ class Settings(BaseSettings):
     runtime_allow_trusted_proxy_bypass: bool = True
     runtime_report_url: str = ""
     runtime_report_token: str = ""
+    runtime_provisioning_api_token: str = ""
 
     # --- Rate Limiting ---
     rate_limit_per_ip: int = 30

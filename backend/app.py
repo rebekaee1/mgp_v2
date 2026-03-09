@@ -51,8 +51,10 @@ CORS(app, resources={
 }, supports_credentials=False)
 
 from dashboard_api import auth_bp, dash_bp
+from provisioning_api import provisioning_bp
 app.register_blueprint(auth_bp)
 app.register_blueprint(dash_bp)
+app.register_blueprint(provisioning_bp)
 
 from werkzeug.middleware.proxy_fix import ProxyFix
 app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_prefix=1)
@@ -675,6 +677,23 @@ def _build_service_auth_headers() -> dict:
     }
 
 
+def _resolve_request_runtime_secret() -> str:
+    from config import settings
+    from runtime_config import resolve_runtime_config
+
+    assistant_id = (request.headers.get("X-Assistant-Id") or "").strip()
+    if not assistant_id:
+        payload = request.get_json(silent=True) or {}
+        assistant_id = str(payload.get("assistant_id") or "").strip()
+    if assistant_id:
+        runtime_config = resolve_runtime_config(assistant_id=assistant_id)
+        assistant_secret = (runtime_config.runtime_service_auth_secret or "").strip()
+        if assistant_secret:
+            return assistant_secret
+
+    return (settings.runtime_service_auth_secret or "").strip()
+
+
 def _evaluate_runtime_auth(path: str = None) -> dict:
     from config import settings
 
@@ -682,7 +701,7 @@ def _evaluate_runtime_auth(path: str = None) -> dict:
     ip = request.remote_addr or ""
     trusted_ip = _ip_matches_trusted_cidrs(ip, settings.runtime_trusted_proxy_cidrs)
     trusted_service_ids = set(_split_csv(settings.runtime_trusted_service_ids))
-    secret = (settings.runtime_service_auth_secret or "").strip()
+    secret = _resolve_request_runtime_secret()
     service_id = (request.headers.get("X-MGP-Service-Id") or "").strip()
     timestamp = (request.headers.get("X-MGP-Timestamp") or "").strip()
     signature = (request.headers.get("X-MGP-Signature") or "").strip().lower()
