@@ -113,6 +113,14 @@ python backend/cli.py provision-tenant \
   --password 'strong-password' \
   --company 'New Company' \
   --slug new-company \
+  --dry-run
+
+# затем реальный запуск:
+python backend/cli.py provision-tenant \
+  --email admin@example.com \
+  --password 'strong-password' \
+  --company 'New Company' \
+  --slug new-company \
   --assistant-name 'New Company AI Assistant' \
   --allowed-domains 'https://site.example.com,https://www.site.example.com' \
   --bot-server-url 'https://runtime.example.com' \
@@ -141,6 +149,18 @@ Tenant values, которые можно подменять без правки 
    - `GET /api/health`
    - `GET /api/runtime/status`
    - `GET /api/runtime/metadata?assistant_id=<...>`
+
+Safe smoke-test без создания tenant:
+
+```bash
+python backend/cli.py provision-tenant \
+  --email smoke-test@example.com \
+  --password 'not-used-in-dry-run' \
+  --company 'Smoke Test Company' \
+  --slug smoke-test-company \
+  --assistant-name 'Smoke Test Assistant' \
+  --dry-run
+```
 
 ## Важное ограничение
 

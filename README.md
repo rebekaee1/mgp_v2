@@ -100,6 +100,14 @@ cp .env.example .env && nano .env
 
 ```bash
 python backend/cli.py provision-tenant \
+  --email smoke-test@example.com \
+  --password 'not-used-in-dry-run' \
+  --company 'Smoke Test Company' \
+  --slug smoke-test-company \
+  --dry-run
+
+# реальный запуск:
+python backend/cli.py provision-tenant \
   --email admin@example.com \
   --password 'strong-password' \
   --company 'New Company' \

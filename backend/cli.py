@@ -12,10 +12,11 @@ Usage:
 """
 
 import argparse
+import json
 import re
 import sys
 from pathlib import Path
-from typing import Optional, Dict
+from typing import Optional, Dict, Any
 
 from config import settings
 from database import init_db, get_db
@@ -51,6 +52,56 @@ def _build_widget_config(args: argparse.Namespace) -> Optional[Dict[str, str]]:
     return widget or None
 
 
+def _resolve_provisioning_payload(args: argparse.Namespace) -> Dict[str, Any]:
+    llm_provider = args.llm_provider or settings.llm_provider
+    llm_model = args.llm_model or (
+        settings.openai_model if llm_provider == "openai" else settings.yandex_model
+    )
+    system_prompt = _read_optional_text(args.system_prompt_file)
+    faq_content = _read_optional_text(args.faq_file)
+
+    return {
+        "company": {
+            "name": args.company,
+            "slug": args.slug or slugify(args.company),
+            "logo_url": args.company_logo_url or None,
+        },
+        "user": {
+            "email": args.email,
+            "name": args.name or args.email.split("@")[0],
+            "role": args.role,
+        },
+        "assistant": {
+            "name": args.assistant_name or f"{args.company} AI Assistant",
+            "allowed_domains": args.allowed_domains or None,
+            "bot_server_url": args.bot_server_url or None,
+            "llm_provider": llm_provider,
+            "llm_model": llm_model,
+            "tourvisor_login_configured": bool(args.tourvisor_login or settings.tourvisor_auth_login),
+            "tourvisor_pass_configured": bool(args.tourvisor_pass or settings.tourvisor_auth_pass),
+            "system_prompt_loaded": bool(system_prompt),
+            "faq_loaded": bool(faq_content),
+            "widget_config": _build_widget_config(args),
+        },
+    }
+
+
+def _print_dry_run_summary(payload: Dict[str, Any], existing_user, company, assistant) -> None:
+    summary = {
+        "mode": "dry-run",
+        "db_write": False,
+        "would_fail_on_real_run": bool(existing_user),
+        "existing": {
+            "user_with_email": bool(existing_user),
+            "company": bool(company),
+            "assistant_for_company": bool(assistant),
+        },
+        "resolved_payload": payload,
+    }
+    print(json.dumps(summary, ensure_ascii=False, indent=2))
+    print("Dry-run completed. No DB changes were written.")
+
+
 def create_user(args: argparse.Namespace) -> None:
     if not init_db(settings.database_url):
         print("ERROR: Cannot connect to PostgreSQL")
@@ -62,15 +113,29 @@ def create_user(args: argparse.Namespace) -> None:
             sys.exit(1)
 
         existing = db.query(User).filter_by(email=args.email).first()
+        payload = _resolve_provisioning_payload(args)
+        resolved_company = payload["company"]
+        company_slug = resolved_company["slug"]
+        company = (
+            db.query(Company)
+            .filter((Company.name == args.company) | (Company.slug == company_slug))
+            .first()
+        )
+        assistant = db.query(Assistant).filter_by(company_id=company.id).first() if company else None
+
+        if getattr(args, "dry_run", False):
+            _print_dry_run_summary(payload, existing, company, assistant)
+            db.rollback()
+            return
+
         if existing:
             print(f"User {args.email} already exists")
             sys.exit(1)
 
-        company = db.query(Company).filter_by(name=args.company).first()
         if not company:
             company = Company(
                 name=args.company,
-                slug=args.slug or slugify(args.company),
+                slug=company_slug,
                 logo_url=args.company_logo_url or None,
             )
             db.add(company)
@@ -88,13 +153,10 @@ def create_user(args: argparse.Namespace) -> None:
                 tourvisor_pass=args.tourvisor_pass or settings.tourvisor_auth_pass,
                 llm_provider=args.llm_provider or settings.llm_provider,
                 llm_api_key=args.llm_api_key or settings.openai_api_key or settings.yandex_api_key,
-                llm_model=args.llm_model or (
-                    settings.openai_model if (args.llm_provider or settings.llm_provider) == "openai"
-                    else settings.yandex_model
-                ),
+                llm_model=payload["assistant"]["llm_model"],
                 system_prompt=_read_optional_text(args.system_prompt_file),
                 faq_content=_read_optional_text(args.faq_file),
-                widget_config=_build_widget_config(args),
+                widget_config=payload["assistant"]["widget_config"],
                 bot_server_url=args.bot_server_url or None,
                 allowed_domains=args.allowed_domains or None,
             )
@@ -173,6 +235,7 @@ def main() -> None:
     cu.add_argument("--widget-primary-color", default=None)
     cu.add_argument("--widget-position", default=None)
     cu.add_argument("--widget-logo-url", default=None)
+    cu.add_argument("--dry-run", action="store_true", help="Validate provisioning without DB writes")
 
     pt = sub.add_parser("provision-tenant", help="Provision tenant runtime from template defaults")
     for action in cu._actions[1:]:
