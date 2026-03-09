@@ -2,12 +2,15 @@
 
 AI-ассистент турагентства с поиском туров через TourVisor API.
 
+Текущий production-профиль: `backend-only runtime`.
+Публичный widget/embed живёт в `LK`, а `MGP` принимает runtime chat traffic и отдает health/runtime metadata.
+
 ## Стек
 
 | Компонент     | Технология                                |
 |---------------|-------------------------------------------|
 | Backend       | Flask + Gunicorn (Python 3.12)            |
-| Frontend      | Vanilla HTML/CSS/JS + Nginx              |
+| Frontend      | Legacy only; production widget is served from LK |
 | LLM           | OpenAI (OpenRouter) / YandexGPT           |
 | Database      | PostgreSQL 16                             |
 | Cache         | Redis 7                                   |
@@ -45,8 +48,10 @@ python app.py
 ssh user@server
 git clone <repo-url> && cd mgp-prod-1
 cp .env.example .env && nano .env
-docker compose up -d --build
+./deploy/deploy-runtime.sh
 ```
+
+Подробный runtime-only профиль и provisioning contract: `RUNTIME_DEPLOY.md`.
 
 ## Структура проекта
 
@@ -82,7 +87,23 @@ docker compose up -d --build
 - `GET /api/health` — health check (PostgreSQL + Redis)
 - `GET /api/status` — active sessions count
 - `GET /api/metrics` — AI assistant metrics
+- `GET /api/runtime/metadata` — runtime metadata для control-plane
+- `GET /api/runtime/status` — runtime status для provisioning/orchestration
 
 ## Логирование
 
 Все диалоги логируются в PostgreSQL (таблицы `conversations`, `messages`, `tour_searches`, `api_calls`) для будущего личного кабинета и аналитики. При недоступности БД — fallback в файловые логи.
+
+## Provisioning
+
+Новый tenant можно поднимать без правки кода:
+
+```bash
+python backend/cli.py provision-tenant \
+  --email admin@example.com \
+  --password 'strong-password' \
+  --company 'New Company' \
+  --slug new-company
+```
+
+Дополнительные tenant-настройки (`allowed_domains`, `bot_server_url`, branding, prompt/faq, ключи) передаются через env/CLI.

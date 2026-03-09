@@ -14,6 +14,8 @@ Usage:
 import argparse
 import re
 import sys
+from pathlib import Path
+from typing import Optional, Dict
 
 from config import settings
 from database import init_db, get_db
@@ -25,6 +27,28 @@ def slugify(text: str) -> str:
     text = text.lower().strip()
     text = re.sub(r"[^\w\s-]", "", text)
     return re.sub(r"[\s_]+", "-", text)[:64]
+
+
+def _read_optional_text(path_value: Optional[str]) -> Optional[str]:
+    if not path_value:
+        return None
+    try:
+        return Path(path_value).read_text(encoding="utf-8").strip() or None
+    except OSError as exc:
+        print(f"ERROR: cannot read file {path_value}: {exc}")
+        sys.exit(1)
+
+
+def _build_widget_config(args: argparse.Namespace) -> Optional[Dict[str, str]]:
+    widget = {
+        "title": args.widget_title,
+        "subtitle": args.widget_subtitle,
+        "primary_color": args.widget_primary_color,
+        "position": args.widget_position,
+        "logo_url": args.widget_logo_url,
+    }
+    widget = {k: v for k, v in widget.items() if v}
+    return widget or None
 
 
 def create_user(args: argparse.Namespace) -> None:
@@ -44,27 +68,69 @@ def create_user(args: argparse.Namespace) -> None:
 
         company = db.query(Company).filter_by(name=args.company).first()
         if not company:
-            company = Company(name=args.company, slug=slugify(args.company))
+            company = Company(
+                name=args.company,
+                slug=args.slug or slugify(args.company),
+                logo_url=args.company_logo_url or None,
+            )
             db.add(company)
             db.flush()
             print(f"Created company: {company.name} (id={company.id})")
+        elif args.company_logo_url:
+            company.logo_url = args.company_logo_url
 
         assistant = db.query(Assistant).filter_by(company_id=company.id).first()
         if not assistant:
             assistant = Assistant(
                 company_id=company.id,
-                name=f"{args.company} AI Assistant",
-                tourvisor_login=settings.tourvisor_auth_login,
-                tourvisor_pass=settings.tourvisor_auth_pass,
-                llm_provider=settings.llm_provider,
-                llm_api_key=settings.openai_api_key or settings.yandex_api_key,
-                llm_model=(settings.openai_model
-                           if settings.llm_provider == "openai"
-                           else settings.yandex_model),
+                name=args.assistant_name or f"{args.company} AI Assistant",
+                tourvisor_login=args.tourvisor_login or settings.tourvisor_auth_login,
+                tourvisor_pass=args.tourvisor_pass or settings.tourvisor_auth_pass,
+                llm_provider=args.llm_provider or settings.llm_provider,
+                llm_api_key=args.llm_api_key or settings.openai_api_key or settings.yandex_api_key,
+                llm_model=args.llm_model or (
+                    settings.openai_model if (args.llm_provider or settings.llm_provider) == "openai"
+                    else settings.yandex_model
+                ),
+                system_prompt=_read_optional_text(args.system_prompt_file),
+                faq_content=_read_optional_text(args.faq_file),
+                widget_config=_build_widget_config(args),
+                bot_server_url=args.bot_server_url or None,
+                allowed_domains=args.allowed_domains or None,
             )
             db.add(assistant)
             db.flush()
             print(f"Created assistant: {assistant.name} (id={assistant.id})")
+        else:
+            updated = False
+            field_updates = {
+                "name": args.assistant_name,
+                "tourvisor_login": args.tourvisor_login,
+                "tourvisor_pass": args.tourvisor_pass,
+                "llm_provider": args.llm_provider,
+                "llm_api_key": args.llm_api_key,
+                "llm_model": args.llm_model,
+                "bot_server_url": args.bot_server_url,
+                "allowed_domains": args.allowed_domains,
+            }
+            for field, value in field_updates.items():
+                if value:
+                    setattr(assistant, field, value)
+                    updated = True
+            system_prompt = _read_optional_text(args.system_prompt_file)
+            faq_content = _read_optional_text(args.faq_file)
+            if system_prompt:
+                assistant.system_prompt = system_prompt
+                updated = True
+            if faq_content:
+                assistant.faq_content = faq_content
+                updated = True
+            widget_config = _build_widget_config(args)
+            if widget_config:
+                assistant.widget_config = widget_config
+                updated = True
+            if updated:
+                print(f"Updated assistant: {assistant.name} (id={assistant.id})")
 
         user = User(
             company_id=company.id,
@@ -88,11 +154,33 @@ def main() -> None:
     cu.add_argument("--email", required=True)
     cu.add_argument("--password", required=True)
     cu.add_argument("--company", required=True, help="Company name")
+    cu.add_argument("--slug", default=None, help="Company slug")
     cu.add_argument("--name", default=None, help="User display name")
     cu.add_argument("--role", default="admin", choices=["admin", "viewer"])
+    cu.add_argument("--company-logo-url", default=None)
+    cu.add_argument("--assistant-name", default=None)
+    cu.add_argument("--allowed-domains", default=None)
+    cu.add_argument("--bot-server-url", default=None)
+    cu.add_argument("--llm-provider", default=None, choices=["openai", "yandex"])
+    cu.add_argument("--llm-api-key", default=None)
+    cu.add_argument("--llm-model", default=None)
+    cu.add_argument("--tourvisor-login", default=None)
+    cu.add_argument("--tourvisor-pass", default=None)
+    cu.add_argument("--system-prompt-file", default=None)
+    cu.add_argument("--faq-file", default=None)
+    cu.add_argument("--widget-title", default=None)
+    cu.add_argument("--widget-subtitle", default=None)
+    cu.add_argument("--widget-primary-color", default=None)
+    cu.add_argument("--widget-position", default=None)
+    cu.add_argument("--widget-logo-url", default=None)
+
+    pt = sub.add_parser("provision-tenant", help="Provision tenant runtime from template defaults")
+    for action in cu._actions[1:]:
+        if not any(existing.dest == action.dest for existing in pt._actions):
+            pt._add_action(action)
 
     args = parser.parse_args()
-    if args.command == "create-user":
+    if args.command in {"create-user", "provision-tenant"}:
         create_user(args)
     else:
         parser.print_help()

@@ -52,6 +52,18 @@ class Settings(BaseSettings):
     runtime_mode: str = "backend-only"  # legacy-web | backend-only
     backend_port: int = 8080
 
+    # --- Runtime Security / Control Plane ---
+    runtime_instance_id: str = ""
+    runtime_public_base_url: str = ""
+    runtime_service_auth_mode: str = "monitor"  # off | monitor | enforce
+    runtime_service_auth_secret: str = ""
+    runtime_service_auth_max_skew_seconds: int = 300
+    runtime_trusted_proxy_cidrs: str = ""
+    runtime_trusted_service_ids: str = "lk"
+    runtime_allow_trusted_proxy_bypass: bool = True
+    runtime_report_url: str = ""
+    runtime_report_token: str = ""
+
     # --- Rate Limiting ---
     rate_limit_per_ip: int = 30
     rate_limit_per_session: int = 10

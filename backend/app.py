@@ -4,6 +4,9 @@ Flask + Server-Sent Events для streaming
 """
 
 import asyncio
+import hashlib
+import hmac
+import ipaddress
 import os
 import time
 import uuid
@@ -624,6 +627,171 @@ def _is_internal_request() -> bool:
     return ip in ("127.0.0.1", "::1", "172.18.0.1") or ip.startswith("172.") or ip.startswith("10.")
 
 
+def _split_csv(raw: str) -> list[str]:
+    return [item.strip() for item in (raw or "").split(",") if item.strip()]
+
+
+def _ip_matches_trusted_cidrs(ip: str, raw_cidrs: str) -> bool:
+    if not ip or not raw_cidrs:
+        return False
+    try:
+        ip_obj = ipaddress.ip_address(ip)
+    except ValueError:
+        return False
+
+    for item in _split_csv(raw_cidrs):
+        try:
+            if "/" in item:
+                if ip_obj in ipaddress.ip_network(item, strict=False):
+                    return True
+            elif ip == item:
+                return True
+        except ValueError:
+            logger.warning("Invalid trusted CIDR/IP ignored: %s", item)
+    return False
+
+
+def _compute_service_signature(secret: str, service_id: str, timestamp: str,
+                               method: str, path: str, body: bytes) -> str:
+    payload = b"\n".join([
+        service_id.encode("utf-8"),
+        timestamp.encode("utf-8"),
+        method.upper().encode("utf-8"),
+        path.encode("utf-8"),
+        body or b"",
+    ])
+    return hmac.new(secret.encode("utf-8"), payload, hashlib.sha256).hexdigest()
+
+
+def _build_service_auth_headers() -> dict:
+    from config import settings
+
+    secret = (settings.runtime_service_auth_secret or "").strip()
+    if not secret:
+        return {}
+
+    return {
+        "X-MGP-Service-Token": secret,
+    }
+
+
+def _evaluate_runtime_auth(path: str = None) -> dict:
+    from config import settings
+
+    mode = (settings.runtime_service_auth_mode or "monitor").strip().lower()
+    ip = request.remote_addr or ""
+    trusted_ip = _ip_matches_trusted_cidrs(ip, settings.runtime_trusted_proxy_cidrs)
+    trusted_service_ids = set(_split_csv(settings.runtime_trusted_service_ids))
+    secret = (settings.runtime_service_auth_secret or "").strip()
+    service_id = (request.headers.get("X-MGP-Service-Id") or "").strip()
+    timestamp = (request.headers.get("X-MGP-Timestamp") or "").strip()
+    signature = (request.headers.get("X-MGP-Signature") or "").strip().lower()
+    token_header = (request.headers.get("X-MGP-Service-Token") or "").strip()
+    auth_header = (request.headers.get("Authorization") or "").strip()
+    bearer_token = ""
+    if auth_header.lower().startswith("bearer "):
+        bearer_token = auth_header[7:].strip()
+
+    present = any([service_id, timestamp, signature, token_header, bearer_token])
+    service_allowed = not trusted_service_ids or not service_id or service_id in trusted_service_ids
+
+    token_valid = bool(secret) and (
+        (token_header and hmac.compare_digest(token_header, secret))
+        or (bearer_token and hmac.compare_digest(bearer_token, secret))
+    )
+
+    signature_valid = False
+    skew_ok = False
+    if secret and service_allowed and service_id and timestamp and signature:
+        try:
+            ts = int(timestamp)
+            skew_ok = abs(int(time.time()) - ts) <= int(settings.runtime_service_auth_max_skew_seconds)
+        except ValueError:
+            skew_ok = False
+
+        if skew_ok:
+            expected = _compute_service_signature(
+                secret,
+                service_id,
+                timestamp,
+                request.method,
+                path or request.path,
+                request.get_data(cache=True) or b"",
+            )
+            signature_valid = hmac.compare_digest(signature, expected)
+
+    reason = "missing"
+    valid = False
+    if mode == "off":
+        reason = "disabled"
+    elif not secret and not settings.runtime_trusted_proxy_cidrs:
+        reason = "not_configured"
+    elif trusted_ip and settings.runtime_allow_trusted_proxy_bypass:
+        valid = True
+        reason = "trusted_proxy"
+    elif not service_allowed:
+        reason = "untrusted_service"
+    elif signature and service_id and timestamp:
+        valid = signature_valid
+        reason = "hmac" if signature_valid else ("timestamp_skew" if not skew_ok else "invalid_hmac")
+    elif token_header or bearer_token:
+        valid = token_valid
+        reason = "token" if token_valid else "invalid_token"
+
+    would_reject = mode == "enforce" and mode != "off" and not valid
+
+    return {
+        "mode": mode,
+        "ip": ip,
+        "present": present,
+        "valid": valid,
+        "trusted_ip": trusted_ip,
+        "service_id": service_id or None,
+        "reason": reason,
+        "would_reject": would_reject,
+    }
+
+
+def _runtime_auth_log_label(outcome: dict) -> str:
+    if outcome.get("valid"):
+        return outcome.get("reason", "ok")
+    if outcome.get("present"):
+        return outcome.get("reason", "invalid")
+    return "missing"
+
+
+def _runtime_auth_error_response(conversation_id: str = None, stream: bool = False):
+    outcome = getattr(g, "runtime_auth", None) or {}
+    if not outcome.get("would_reject"):
+        return None
+
+    logger.warning(
+        "🚫 SERVICE AUTH rejected path=%s ip=%s mode=%s service=%s reason=%s",
+        request.path,
+        outcome.get("ip"),
+        outcome.get("mode"),
+        outcome.get("service_id") or "-",
+        outcome.get("reason"),
+    )
+
+    if request.path == "/api/v1/chat":
+        return jsonify({
+            "error": "Forbidden",
+            "reply": "Доступ к runtime временно запрещён.",
+            "tour_cards": [],
+            "conversation_id": conversation_id or str(uuid.uuid4()),
+        }), 403
+
+    if stream:
+        return jsonify({"error": "Forbidden"}), 403
+
+    return jsonify({"error": "Forbidden"}), 403
+
+
+def _runtime_control_plane_forbidden():
+    return None
+
+
 def _public_widget_route_disabled(api: bool = False):
     if _PUBLIC_WIDGET_ROUTES_ENABLED:
         return None
@@ -786,13 +954,16 @@ def widget_chat_proxy(assistant_id):
     }
 
     try:
+        raw_payload = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        auth_headers = _build_service_auth_headers()
         with httpx.Client(timeout=45.0) as client:
             resp = client.post(
                 f"{bot_url}/api/v1/chat",
-                json=payload,
+                content=raw_payload,
                 headers={
                     "Content-Type": "application/json",
                     "X-Assistant-Id": assistant_id,
+                    **auth_headers,
                 },
             )
         return (resp.content, resp.status_code, {"Content-Type": "application/json"})
@@ -886,6 +1057,25 @@ def _log_request_start():
     except Exception:
         pass
 
+    if request.path == '/api/v1/chat':
+        try:
+            g.runtime_auth = _evaluate_runtime_auth()
+            outcome = g.runtime_auth
+            if outcome.get("mode") != "off":
+                label = _runtime_auth_log_label(outcome)
+                log_level = logging.INFO if outcome.get("valid") or label == "not_configured" else logging.WARNING
+                logger.log(
+                    log_level,
+                    "🔐 SERVICE AUTH path=%s mode=%s result=%s ip=%s service=%s",
+                    request.path,
+                    outcome.get("mode"),
+                    label,
+                    outcome.get("ip"),
+                    outcome.get("service_id") or "-",
+                )
+        except Exception:
+            logger.warning("Runtime auth evaluation failed for %s", request.path, exc_info=True)
+
     # Периодическая очистка устаревших сессий (каждые 5 минут)
     now = time.time()
     if now - _last_cleanup[0] > 300:
@@ -903,6 +1093,10 @@ def _log_request_end(response):
     logger.info("<- %s %s %s %dms rid=%s", request.method, request.path, response.status_code, duration_ms, rid)
     # удобно дергать request-id из фронта при разборе багов
     response.headers["X-Request-Id"] = rid
+    if request.path == '/api/v1/chat':
+        outcome = getattr(g, "runtime_auth", None)
+        if outcome:
+            response.headers["X-Runtime-Auth-Mode"] = outcome.get("mode", "off")
     return response
 
 
@@ -926,6 +1120,9 @@ def chat():
     message = data.get('message', '').strip()
     session_id = data.get('session_id', 'default')
     assistant_id = data.get('assistant_id') or request.headers.get('X-Assistant-Id')
+    auth_error = _runtime_auth_error_response(conversation_id=session_id)
+    if auth_error:
+        return auth_error
     
     if not message:
         return jsonify({'error': 'Empty message'}), 400
@@ -976,6 +1173,9 @@ def chat_v1():
     message = data.get('message', '').strip()
     conversation_id = data.get('conversation_id', str(uuid.uuid4()))
     assistant_id = data.get('assistant_id') or request.headers.get('X-Assistant-Id')
+    auth_error = _runtime_auth_error_response(conversation_id=conversation_id)
+    if auth_error:
+        return auth_error
 
     if not message:
         return jsonify({
@@ -1083,6 +1283,9 @@ def chat_stream():
     message = data.get('message', '').strip()
     session_id = data.get('conversation_id') or data.get('session_id', 'default')
     _stream_assistant_id = data.get('assistant_id') or request.headers.get('X-Assistant-Id')
+    auth_error = _runtime_auth_error_response(conversation_id=session_id, stream=True)
+    if auth_error:
+        return auth_error
 
     if not message:
         return jsonify({'error': 'Empty message'}), 400
@@ -1218,9 +1421,7 @@ def reset():
     return jsonify({'status': 'ok'})
 
 
-@app.route('/api/health')
-def health():
-    """Health check для Docker healthcheck и мониторинга."""
+def _build_health_payload() -> dict:
     checks = {"status": "ok"}
     try:
         from database import check_health as db_health
@@ -1234,6 +1435,87 @@ def health():
         checks["redis"] = "unavailable"
     with _handlers_lock:
         checks["active_sessions"] = len(_handlers)
+    return checks
+
+
+@app.route('/api/health')
+def health():
+    """Health check для Docker healthcheck и мониторинга."""
+    checks = _build_health_payload()
+    all_ok = checks.get("postgres") == "ok" and checks.get("redis") == "ok"
+    return jsonify(checks), 200 if all_ok else 503
+
+
+@app.route('/api/runtime/metadata')
+def runtime_metadata():
+    """Runtime metadata for control-plane and tenant provisioning."""
+    denied = _runtime_control_plane_forbidden()
+    if denied:
+        return denied
+
+    from config import settings
+    from runtime_config import resolve_runtime_config
+
+    assistant_id = request.args.get("assistant_id") or request.headers.get("X-Assistant-Id")
+    runtime = resolve_runtime_config(assistant_id=assistant_id)
+    service_ids = _split_csv(settings.runtime_trusted_service_ids)
+
+    return jsonify({
+        "runtime_instance_id": settings.runtime_instance_id or os.getenv("HOSTNAME") or "mgp-runtime",
+        "runtime_mode": _RUNTIME_MODE,
+        "public_base_url": settings.runtime_public_base_url or request.host_url.rstrip("/"),
+        "config_source": getattr(runtime, "source", "env-default"),
+        "tenant": {
+            "assistant_id": runtime.assistant_id,
+            "assistant_name": runtime.assistant_name,
+            "company_id": runtime.company_id,
+            "company_name": runtime.company_name,
+            "company_slug": runtime.company_slug,
+            "company_logo_url": runtime.company_logo_url,
+            "allowed_domains": runtime.allowed_domains,
+            "bot_server_url": runtime.bot_server_url,
+            "branding": {
+                "title": (runtime.widget_config or {}).get("title"),
+                "subtitle": (runtime.widget_config or {}).get("subtitle"),
+                "primary_color": (runtime.widget_config or {}).get("primary_color"),
+                "logo_url": (runtime.widget_config or {}).get("logo_url") or runtime.company_logo_url,
+            },
+        },
+        "llm": {
+            "provider": runtime.llm_provider,
+            "model": runtime.llm_model or runtime.yandex_model,
+        },
+        "security": {
+            "auth_mode": settings.runtime_service_auth_mode,
+            "trusted_service_ids": service_ids,
+            "trusted_proxy_configured": bool(settings.runtime_trusted_proxy_cidrs),
+            "allow_trusted_proxy_bypass": settings.runtime_allow_trusted_proxy_bypass,
+        },
+        "capabilities": {
+            "chat_v1": True,
+            "chat_stream": True,
+            "health": True,
+            "runtime_metadata": True,
+            "runtime_status": True,
+        },
+    })
+
+
+@app.route('/api/runtime/status')
+def runtime_status():
+    """Control-plane friendly runtime status snapshot."""
+    denied = _runtime_control_plane_forbidden()
+    if denied:
+        return denied
+
+    from config import settings
+
+    checks = _build_health_payload()
+    checks["runtime_mode"] = _RUNTIME_MODE
+    checks["runtime_instance_id"] = settings.runtime_instance_id or os.getenv("HOSTNAME") or "mgp-runtime"
+    checks["service_auth_mode"] = settings.runtime_service_auth_mode
+    checks["trusted_proxy_configured"] = bool(settings.runtime_trusted_proxy_cidrs)
+    checks["reporting_enabled"] = bool(settings.runtime_report_url)
     all_ok = checks.get("postgres") == "ok" and checks.get("redis") == "ok"
     return jsonify(checks), 200 if all_ok else 503
 

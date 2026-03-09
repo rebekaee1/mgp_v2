@@ -12,6 +12,9 @@ logger = logging.getLogger("mgp_bot")
 class RuntimeTenantConfig:
     assistant_id: Optional[str] = None
     company_id: Optional[str] = None
+    company_name: Optional[str] = None
+    company_slug: Optional[str] = None
+    company_logo_url: Optional[str] = None
     assistant_name: Optional[str] = None
     llm_provider: str = "openai"
     llm_api_key: Optional[str] = None
@@ -83,6 +86,9 @@ def resolve_runtime_config(assistant_id: Optional[str] = None) -> RuntimeTenantC
 
             runtime_config.assistant_id = str(assistant.id)
             runtime_config.company_id = str(assistant.company_id)
+            runtime_config.company_name = getattr(assistant.company, "name", None)
+            runtime_config.company_slug = getattr(assistant.company, "slug", None)
+            runtime_config.company_logo_url = getattr(assistant.company, "logo_url", None)
             runtime_config.assistant_name = assistant.name
             runtime_config.llm_provider = (assistant.llm_provider or runtime_config.llm_provider or "openai").strip()
             runtime_config.llm_api_key = assistant.llm_api_key or runtime_config.llm_api_key
