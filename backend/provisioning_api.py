@@ -64,6 +64,28 @@ def _callback_token(payload: Dict[str, Any]) -> Optional[str]:
     return auth.get("token") or payload.get("callback_token")
 
 
+def _runtime_public_base_url_from_request() -> str:
+    return (request.url_root or "").rstrip("/")
+
+
+def _enrich_runtime_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    enriched = deepcopy(payload)
+    runtime = dict(enriched.get("runtime") or {})
+    assistant = dict(enriched.get("assistant") or {})
+    public_base_url = (
+        str(runtime.get("public_base_url") or "").strip()
+        or str(assistant.get("bot_server_url") or "").strip()
+        or _runtime_public_base_url_from_request()
+    )
+    if public_base_url:
+        runtime["public_base_url"] = public_base_url
+        if not str(assistant.get("bot_server_url") or "").strip():
+            assistant["bot_server_url"] = public_base_url
+    enriched["runtime"] = runtime
+    enriched["assistant"] = assistant
+    return enriched
+
+
 def _sanitize_runtime_metadata(runtime_metadata: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     meta = deepcopy(runtime_metadata or {})
     service_auth = meta.get("service_auth")
@@ -359,7 +381,7 @@ def create_tenant():
     if not _check_bearer():
         return _auth_failed()
 
-    payload = request.get_json(silent=True)
+    payload = _enrich_runtime_payload(request.get_json(silent=True) or {})
     validation_error = _validate_request_payload(payload)
     if validation_error:
         return validation_error
