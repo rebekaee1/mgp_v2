@@ -56,6 +56,8 @@ app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_prefix=1)
 
 _MAX_MESSAGE_LENGTH = 2000
 _MAX_SESSIONS = 500
+_RUNTIME_MODE = os.getenv("RUNTIME_MODE", "legacy-web").strip().lower()
+_PUBLIC_WIDGET_ROUTES_ENABLED = _RUNTIME_MODE != "backend-only"
 
 # === ИНИЦИАЛИЗАЦИЯ ИНФРАСТРУКТУРЫ (PostgreSQL, Redis) ===
 _infra_lock = threading.Lock()
@@ -241,22 +243,64 @@ def log(msg: str, level: str = "INFO"):
 # === УПРАВЛЕНИЕ СЕССИЯМИ ===
 # Thread-safe хранилище сессий с автоочисткой
 _handlers_lock = threading.Lock()
-_handlers: dict[str, dict] = {}  # session_id → {"handler": Handler, "last_active": float}
+_handlers: dict[str, dict] = {}  # cache_key → {"handler": Handler, "last_active": float}
 SESSION_TTL_SECONDS = 30 * 60  # 30 минут неактивности → удаление
 
 
-def get_handler(session_id: str):
-    """Получить или создать handler для сессии (thread-safe)"""
+def _session_cache_key(session_id: str, assistant_id: str = None) -> str:
+    return f"{assistant_id or 'default'}::{session_id}"
+
+
+def _build_handler(assistant_id: str = None):
+    from runtime_config import resolve_runtime_config
+
+    runtime_config = resolve_runtime_config(assistant_id=assistant_id)
+    provider = (runtime_config.llm_provider or _llm_provider or "openai").strip().lower()
+
+    if provider == "openai":
+        try:
+            from openai_handler import OpenAIHandler as handler_cls
+        except ImportError:
+            from backend.openai_handler import OpenAIHandler as handler_cls
+    else:
+        try:
+            from yandex_handler import YandexGPTHandler as handler_cls
+        except ImportError:
+            from backend.yandex_handler import YandexGPTHandler as handler_cls
+
+    return handler_cls(runtime_config=runtime_config), runtime_config, provider
+
+
+def get_handler(session_id: str, assistant_id: str = None):
+    """Получить или создать handler для сессии (thread-safe, assistant-aware)."""
+    cache_key = _session_cache_key(session_id, assistant_id)
     with _handlers_lock:
-        if session_id in _handlers:
-            _handlers[session_id]["last_active"] = time.time()
-            return _handlers[session_id]["handler"]
-        handler = _HandlerClass()
+        if cache_key in _handlers:
+            _handlers[cache_key]["last_active"] = time.time()
+            return _handlers[cache_key]["handler"]
+        handler, runtime_config, provider = _build_handler(assistant_id=assistant_id)
         # Подключаем диалоговый лог
         handler._dialogue_log_callback = lambda direction, content: _write_dialogue_log(session_id, direction, content)
-        _handlers[session_id] = {"handler": handler, "last_active": time.time()}
-        logger.info("🆕 New session %s  (provider: %s, total sessions: %d)", session_id[:8], _llm_provider, len(_handlers))
-        _write_dialogue_log(session_id, "SYSTEM", f"New session created (provider: {_llm_provider}, model: {handler.model})")
+        _handlers[cache_key] = {
+            "handler": handler,
+            "last_active": time.time(),
+            "session_id": session_id,
+            "assistant_id": assistant_id,
+            "provider": provider,
+        }
+        logger.info(
+            "🆕 New session %s  (provider: %s, assistant: %s, source: %s, total sessions: %d)",
+            session_id[:8],
+            provider,
+            assistant_id or "-",
+            getattr(runtime_config, "source", "env-default"),
+            len(_handlers),
+        )
+        _write_dialogue_log(
+            session_id,
+            "SYSTEM",
+            f"New session created (provider: {provider}, model: {handler.model}, assistant_id: {assistant_id or '-'}, config_source: {getattr(runtime_config, 'source', 'env-default')})",
+        )
         return handler
 
 
@@ -264,15 +308,15 @@ def _cleanup_stale_sessions():
     """Удалить сессии, неактивные дольше SESSION_TTL_SECONDS"""
     now = time.time()
     with _handlers_lock:
-        stale = [sid for sid, info in _handlers.items()
+        stale = [cache_key for cache_key, info in _handlers.items()
                  if now - info["last_active"] > SESSION_TTL_SECONDS]
-        for sid in stale:
-            handler = _handlers[sid]["handler"]
+        for cache_key in stale:
+            handler = _handlers[cache_key]["handler"]
             try:
                 handler.close_sync()
             except Exception:
-                logger.debug("close_sync failed for session %s", sid[:8], exc_info=True)
-            del _handlers[sid]
+                logger.debug("close_sync failed for session %s", cache_key[:24], exc_info=True)
+            del _handlers[cache_key]
         if stale:
             logger.info("🧹 Cleaned up %d stale sessions (remaining: %d)", len(stale), len(_handlers))
 
@@ -333,6 +377,7 @@ def check_conversation_booking_intent(user_messages: list) -> bool:
 def _log_chat_to_db(session_id: str, user_message: str, reply: str,
                      tour_cards: list, latency_ms: int = None,
                      model_name: str = "unknown",
+                     llm_provider: str = None,
                      ip_address: str = None, user_agent: str = None,
                      history_snapshot: list = None,
                      assistant_id: str = None,
@@ -355,9 +400,19 @@ def _log_chat_to_db(session_id: str, user_message: str, reply: str,
             if db is None:
                 return
 
-            conv = db.query(Conversation).filter(
+            _aid = None
+            if assistant_id:
+                try:
+                    _aid = uuid.UUID(assistant_id) if isinstance(assistant_id, str) else assistant_id
+                except (ValueError, AttributeError):
+                    _aid = None
+
+            conv_query = db.query(Conversation).filter(
                 Conversation.session_id == session_id
-            ).first()
+            )
+            if _aid is not None:
+                conv_query = conv_query.filter(Conversation.assistant_id == _aid)
+            conv = conv_query.first()
 
             if conv is None:
                 ip_addr = ip_address
@@ -368,15 +423,9 @@ def _log_chat_to_db(session_id: str, user_message: str, reply: str,
                         ua = request.headers.get('User-Agent', '')[:500]
                     except RuntimeError:
                         pass
-                _aid = None
-                if assistant_id:
-                    try:
-                        _aid = uuid.UUID(assistant_id) if isinstance(assistant_id, str) else assistant_id
-                    except (ValueError, AttributeError):
-                        pass
                 conv = Conversation(
                     session_id=session_id,
-                    llm_provider=_llm_provider,
+                    llm_provider=llm_provider or _llm_provider,
                     model=model_name,
                     ip_address=ip_addr,
                     user_agent=ua,
@@ -575,31 +624,54 @@ def _is_internal_request() -> bool:
     return ip in ("127.0.0.1", "::1", "172.18.0.1") or ip.startswith("172.") or ip.startswith("10.")
 
 
+def _public_widget_route_disabled(api: bool = False):
+    if _PUBLIC_WIDGET_ROUTES_ENABLED:
+        return None
+    if api:
+        return jsonify({"error": "Not found"}), 404
+    return "Not Found", 404
+
+
 @app.route('/')
 def index():
     """Главная страница — новый чат-виджет"""
+    disabled = _public_widget_route_disabled()
+    if disabled:
+        return disabled
     return send_from_directory(_FRONTEND_DIR, 'index.html')
 
 
 @app.route('/widget')
 def widget():
     """Новый чат-виджет с визуальными карточками туров"""
+    disabled = _public_widget_route_disabled()
+    if disabled:
+        return disabled
     return send_from_directory(_FRONTEND_DIR, 'index.html')
 
 
 @app.route('/frontend/<path:filename>')
 def frontend_static(filename):
     """Статические файлы нового фронтенда (CSS, JS)"""
+    disabled = _public_widget_route_disabled()
+    if disabled:
+        return disabled
     return send_from_directory(_FRONTEND_DIR, filename)
 
 
 @app.route('/widget.js')
 def widget_js():
+    disabled = _public_widget_route_disabled()
+    if disabled:
+        return disabled
     return send_from_directory(_FRONTEND_DIR, 'script.js', mimetype='application/javascript')
 
 
 @app.route('/widget.css')
 def widget_css():
+    disabled = _public_widget_route_disabled()
+    if disabled:
+        return disabled
     return send_from_directory(_FRONTEND_DIR, 'styles.css', mimetype='text/css')
 
 
@@ -616,6 +688,9 @@ WIDGET_DEFAULTS = {
 @app.route('/api/widget/config')
 def public_widget_config():
     """Public widget config (no auth). Widget calls this on init."""
+    disabled = _public_widget_route_disabled(api=True)
+    if disabled:
+        return disabled
     _init_infrastructure()
     from database import get_db
     from models import Assistant
@@ -669,6 +744,9 @@ def public_widget_config():
 @app.route('/api/widget/<assistant_id>/chat', methods=['POST', 'OPTIONS'])
 def widget_chat_proxy(assistant_id):
     """Proxy chat requests to the bot server. Solves mixed-content (HTTPS→HTTP)."""
+    disabled = _public_widget_route_disabled(api=True)
+    if disabled:
+        return disabled
     if request.method == 'OPTIONS':
         return ('', 204)
 
@@ -704,6 +782,7 @@ def widget_chat_proxy(assistant_id):
     payload = {
         "message": str(body["message"])[:500],
         "conversation_id": str(body.get("conversation_id", "")),
+        "assistant_id": assistant_id,
     }
 
     try:
@@ -711,7 +790,10 @@ def widget_chat_proxy(assistant_id):
             resp = client.post(
                 f"{bot_url}/api/v1/chat",
                 json=payload,
-                headers={"Content-Type": "application/json"},
+                headers={
+                    "Content-Type": "application/json",
+                    "X-Assistant-Id": assistant_id,
+                },
             )
         return (resp.content, resp.status_code, {"Content-Type": "application/json"})
     except httpx.TimeoutException:
@@ -727,6 +809,9 @@ def widget_chat_proxy(assistant_id):
 def widget_embed_page(assistant_id):
     """Serve the embeddable widget page (loaded inside iframe).
     Sets dynamic CSP with frame-ancestors based on assistant's allowed_domains."""
+    disabled = _public_widget_route_disabled(api=True)
+    if disabled:
+        return disabled
     _init_infrastructure()
     from database import get_db
     from models import Assistant
@@ -840,13 +925,14 @@ def chat():
     data = request.json or {}
     message = data.get('message', '').strip()
     session_id = data.get('session_id', 'default')
+    assistant_id = data.get('assistant_id') or request.headers.get('X-Assistant-Id')
     
     if not message:
         return jsonify({'error': 'Empty message'}), 400
     if len(message) > _MAX_MESSAGE_LENGTH:
         return jsonify({'error': 'Message too long'}), 400
     
-    handler = get_handler(session_id)
+    handler = get_handler(session_id, assistant_id=assistant_id)
     
     try:
         _hist_before = len(handler.full_history)
@@ -862,7 +948,9 @@ def chat():
         _latency_ms = int((time.perf_counter() - g._req_start) * 1000) if hasattr(g, '_req_start') else None
         _log_chat_to_db(session_id, message, response, tour_cards,
                         _latency_ms, model_name=getattr(handler, 'model', 'unknown'),
+                        llm_provider=getattr(getattr(handler, 'runtime_config', None), 'llm_provider', _llm_provider),
                         history_snapshot=_new_entries,
+                        assistant_id=assistant_id,
                         search_result=getattr(handler, '_last_search_result', None),
                         api_calls_log=getattr(handler, '_pending_api_calls', None))
         
@@ -887,7 +975,7 @@ def chat_v1():
     data = request.json or {}
     message = data.get('message', '').strip()
     conversation_id = data.get('conversation_id', str(uuid.uuid4()))
-    assistant_id = data.get('assistant_id')
+    assistant_id = data.get('assistant_id') or request.headers.get('X-Assistant-Id')
 
     if not message:
         return jsonify({
@@ -910,7 +998,7 @@ def chat_v1():
 
     # Session count limit
     with _handlers_lock:
-        if session_id not in _handlers and len(_handlers) >= _MAX_SESSIONS:
+        if _session_cache_key(session_id, assistant_id) not in _handlers and len(_handlers) >= _MAX_SESSIONS:
             logger.warning("🚫 SESSION LIMIT reached (%d), rejecting new session", _MAX_SESSIONS)
             return jsonify({
                 'error': 'Server busy',
@@ -925,7 +1013,7 @@ def chat_v1():
 
     _write_dialogue_log(session_id, "USER", message)
 
-    handler = get_handler(session_id)
+    handler = get_handler(session_id, assistant_id=assistant_id)
 
     try:
         _hist_before = len(handler.full_history)
@@ -965,6 +1053,7 @@ def chat_v1():
         _latency_ms = int((time.perf_counter() - g._req_start) * 1000) if hasattr(g, '_req_start') else None
         _log_chat_to_db(session_id, message, reply, tour_cards, _latency_ms,
                         model_name=getattr(handler, 'model', 'unknown'),
+                        llm_provider=getattr(getattr(handler, 'runtime_config', None), 'llm_provider', _llm_provider),
                         history_snapshot=_new_entries,
                         assistant_id=assistant_id,
                         search_result=getattr(handler, '_last_search_result', None),
@@ -993,7 +1082,7 @@ def chat_stream():
     data = request.json or {}
     message = data.get('message', '').strip()
     session_id = data.get('conversation_id') or data.get('session_id', 'default')
-    _stream_assistant_id = data.get('assistant_id')
+    _stream_assistant_id = data.get('assistant_id') or request.headers.get('X-Assistant-Id')
 
     if not message:
         return jsonify({'error': 'Empty message'}), 400
@@ -1007,7 +1096,7 @@ def chat_stream():
     # Логируем входящее сообщение пользователя
     _write_dialogue_log(session_id, "USER", message)
     
-    handler = get_handler(session_id)
+    handler = get_handler(session_id, assistant_id=_stream_assistant_id)
     _stream_ip = request.remote_addr
     _stream_ua = request.headers.get('User-Agent', '')[:500]
     _stream_start = time.perf_counter()
@@ -1067,6 +1156,7 @@ def chat_stream():
                 _log_chat_to_db(session_id, message, response, _tour_cards,
                                 latency_ms=_stream_latency,
                                 model_name=getattr(handler, 'model', 'unknown'),
+                                llm_provider=getattr(getattr(handler, 'runtime_config', None), 'llm_provider', _llm_provider),
                                 ip_address=_stream_ip, user_agent=_stream_ua,
                                 history_snapshot=_new_entries,
                                 assistant_id=_stream_assistant_id,

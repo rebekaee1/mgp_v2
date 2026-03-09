@@ -75,12 +75,12 @@ class OpenAIHandler(YandexGPTHandler):
     - close_sync(), reset()
     """
 
-    def __init__(self):
+    def __init__(self, runtime_config=None):
         # Initialize all shared state from parent (tourvisor, history, metrics, etc.)
-        super().__init__()
+        super().__init__(runtime_config=runtime_config)
 
         # Validate OpenAI API key
-        api_key = os.getenv("OPENAI_API_KEY")
+        api_key = getattr(runtime_config, "llm_api_key", None) or os.getenv("OPENAI_API_KEY")
         if not api_key:
             raise ValueError(
                 "OPENAI_API_KEY не указан в .env! "
@@ -89,14 +89,14 @@ class OpenAIHandler(YandexGPTHandler):
 
         # Override with OpenAI client
         # OPENAI_BASE_URL — для прокси (если OpenAI API недоступен напрямую, напр. из России)
-        base_url = os.getenv("OPENAI_BASE_URL")
+        base_url = getattr(runtime_config, "openai_base_url", None) or os.getenv("OPENAI_BASE_URL")
         client_kwargs = {"api_key": api_key}
         if base_url:
             client_kwargs["base_url"] = base_url
             logger.info("🌐 OpenAI proxy: %s", base_url)
 
         self.openai_client = OpenAI(timeout=120.0, **client_kwargs)
-        self.model = os.getenv("OPENAI_MODEL", "gpt-5-mini")
+        self.model = getattr(runtime_config, "llm_model", None) or os.getenv("OPENAI_MODEL", "gpt-5-mini")
 
         # Pinned context survives history trimming (tour cards summary)
         self._pinned_context: Optional[str] = None
@@ -112,8 +112,11 @@ class OpenAIHandler(YandexGPTHandler):
         self.openai_tools = self._build_openai_tools()
 
         logger.info(
-            "🤖 OpenAIHandler INIT  model=%s  tools=%d",
-            self.model, len(self.openai_tools)
+            "🤖 OpenAIHandler INIT  model=%s  tools=%d  assistant=%s  source=%s",
+            self.model,
+            len(self.openai_tools),
+            getattr(runtime_config, "assistant_id", None),
+            getattr(runtime_config, "source", "env-default"),
         )
 
     # ─── Argument sanitizer ──────────────────────────────────────────────

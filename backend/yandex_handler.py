@@ -1267,11 +1267,12 @@ def _strip_trailing_fragment(text: str) -> str:
 
 class YandexGPTHandler:
     """Обработчик запросов к Yandex GPT с Function Calling (Responses API)"""
-    
-    def __init__(self):
-        self.folder_id = os.getenv("YANDEX_FOLDER_ID")
-        self.api_key = os.getenv("YANDEX_API_KEY")
-        self.model = os.getenv("YANDEX_MODEL", "yandexgpt")
+
+    def __init__(self, runtime_config=None):
+        self.runtime_config = runtime_config
+        self.folder_id = getattr(runtime_config, "yandex_folder_id", None) or os.getenv("YANDEX_FOLDER_ID")
+        self.api_key = getattr(runtime_config, "yandex_api_key", None) or os.getenv("YANDEX_API_KEY")
+        self.model = getattr(runtime_config, "yandex_model", None) or os.getenv("YANDEX_MODEL", "yandexgpt")
         
         # Используем Completion API (стабильный, работает с folder_id)
         self.completion_url = "https://llm.api.cloud.yandex.net/foundationModels/v1/completion"
@@ -1282,7 +1283,7 @@ class YandexGPTHandler:
         
         self.model_uri = f"gpt://{self.folder_id}/{self.model}"
         
-        self.tourvisor = TourVisorClient()
+        self.tourvisor = TourVisorClient(runtime_config=runtime_config)
         self.tools = self._load_tools()
         
         # История сообщений для контекста (новый формат)
@@ -1356,8 +1357,14 @@ class YandexGPTHandler:
             "total_messages": 0,                  # Всего сообщений пользователя
         }
         
-        logger.info("🤖 YandexGPTHandler INIT  model=%s  folder=%s  tools=%d",
-                     self.model_uri, self.folder_id, len(self.tools))
+        logger.info(
+            "🤖 YandexGPTHandler INIT  model=%s  folder=%s  tools=%d  assistant=%s  source=%s",
+            self.model_uri,
+            self.folder_id,
+            len(self.tools),
+            getattr(runtime_config, "assistant_id", None),
+            getattr(runtime_config, "source", "env-default"),
+        )
     
     def get_metrics(self) -> Dict[str, int]:
         """Возвращает метрики сессии для мониторинга"""
@@ -1538,11 +1545,20 @@ class YandexGPTHandler:
         try:
             with open(faq_path, "r", encoding="utf-8") as f:
                 faq = f.read()
-            prompt = prompt + "\n\n" + faq
             logger.info("📖 FAQ loaded: %d chars from faq.md", len(faq))
         except FileNotFoundError:
+            faq = ""
             logger.warning("⚠️ faq.md not found — running without FAQ knowledge base")
+        
+        runtime_prompt = getattr(self.runtime_config, "system_prompt", None)
+        runtime_faq = getattr(self.runtime_config, "faq_content", None)
+        if runtime_prompt:
+            prompt = runtime_prompt
+        if runtime_faq:
+            faq = runtime_faq
 
+        if faq:
+            prompt = prompt + "\n\n" + faq
         return prompt
     
     async def _execute_function(self, name: str, arguments: str, call_id: str) -> Dict:

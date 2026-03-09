@@ -52,10 +52,20 @@ class NoResultsError(TourVisorError):
 class TourVisorClient:
     """Асинхронный клиент TourVisor API"""
     
-    def __init__(self):
-        self.base_url = os.getenv("TOURVISOR_BASE_URL", "https://tourvisor.ru/xml")
-        self.auth_login = os.getenv("TOURVISOR_AUTH_LOGIN")
-        self.auth_pass = os.getenv("TOURVISOR_AUTH_PASS")
+    def __init__(self, runtime_config=None):
+        self.runtime_config = runtime_config
+        self.base_url = (
+            getattr(runtime_config, "tourvisor_base_url", None)
+            or os.getenv("TOURVISOR_BASE_URL", "https://tourvisor.ru/xml")
+        )
+        self.auth_login = (
+            getattr(runtime_config, "tourvisor_login", None)
+            or os.getenv("TOURVISOR_AUTH_LOGIN")
+        )
+        self.auth_pass = (
+            getattr(runtime_config, "tourvisor_pass", None)
+            or os.getenv("TOURVISOR_AUTH_PASS")
+        )
         self.api_call_log: List[Dict] = []
     
     async def _request(self, endpoint: str, params: Dict[str, Any] = None, timeout: Optional[float] = None) -> Dict:

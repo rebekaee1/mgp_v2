@@ -1610,6 +1610,8 @@ def widget_config_update():
 @dash_bp.route("/widget/embed-code", methods=["GET"])
 @require_auth
 def widget_embed_code():
+    from config import settings
+
     with get_db() as db:
         if db is None:
             return jsonify({"error": "Database unavailable"}), 503
@@ -1627,12 +1629,8 @@ def widget_embed_code():
                 "assistant_id": str(assistant.id),
             })
 
-        widget_host = os.environ.get("WIDGET_HOST_URL", "").strip()
-        if not widget_host:
-            widget_host = request.host_url.rstrip("/")
-
         code = (
-            f'<script src="{widget_host}/widget-loader.js" '
+            f'<script src="{settings.lk_widget_loader_url}" '
             f'data-assistant-id="{assistant.id}"></script>'
         )
         return jsonify({"embed_code": code, "assistant_id": str(assistant.id)})
