@@ -2,6 +2,7 @@ import json
 import logging
 import os
 import threading
+import time
 import uuid
 from copy import deepcopy
 from datetime import datetime, timezone
@@ -53,6 +54,10 @@ def _normalize_payload(payload: Dict[str, Any]) -> str:
     return json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
+def _normalize_base_url(value: Optional[str]) -> str:
+    return str(value or "").strip().rstrip("/")
+
+
 def _callback_url(payload: Dict[str, Any]) -> Optional[str]:
     callback = payload.get("callback") or {}
     return callback.get("url") or payload.get("callback_url")
@@ -65,7 +70,7 @@ def _callback_token(payload: Dict[str, Any]) -> Optional[str]:
 
 
 def _runtime_public_base_url_from_request() -> str:
-    return (request.url_root or "").rstrip("/")
+    return _normalize_base_url(request.url_root)
 
 
 def _enrich_runtime_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -94,29 +99,82 @@ def _sanitize_runtime_metadata(runtime_metadata: Optional[Dict[str, Any]]) -> Di
     return meta
 
 
+def _runtime_payload(public_base_url: Optional[str], assistant_id: Optional[str],
+                     runtime_metadata: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    base_url = _normalize_base_url(public_base_url)
+    runtime_metadata = dict(runtime_metadata or {})
+    service_auth = dict(runtime_metadata.get("service_auth") or {})
+    assistant_id_str = str(assistant_id) if assistant_id else ""
+    runtime = {
+        "runtime_instance_id": settings.runtime_instance_id or os.getenv("HOSTNAME") or "mgp-runtime",
+        "public_base_url": base_url,
+        "health_url": f"{base_url}/api/health" if base_url else None,
+        "status_url": f"{base_url}/api/runtime/status" if base_url else None,
+        "metadata_url": f"{base_url}/api/runtime/metadata?assistant_id={assistant_id_str}" if base_url and assistant_id_str else None,
+        "service_auth": {
+            "mode": service_auth.get("mode"),
+            "header_name": service_auth.get("header_name"),
+            "scope": service_auth.get("scope"),
+        } if service_auth else None,
+    }
+    return runtime
+
+
 def _assistant_result_payload(assistant: Assistant) -> Dict[str, Any]:
     runtime_metadata = dict(assistant.runtime_metadata or {})
-    service_auth = dict(runtime_metadata.get("service_auth") or {})
+    public_base_url = assistant.bot_server_url or settings.runtime_public_base_url or ""
     return {
         "company_id": str(assistant.company_id),
         "assistant_id": str(assistant.id),
         "runtime_metadata": _sanitize_runtime_metadata(runtime_metadata),
-        "runtime": {
-            "runtime_instance_id": settings.runtime_instance_id or os.getenv("HOSTNAME") or "mgp-runtime",
-            "public_base_url": assistant.bot_server_url or settings.runtime_public_base_url or "",
-            "health_url": f"{(assistant.bot_server_url or settings.runtime_public_base_url or '').rstrip('/')}/api/health" if (assistant.bot_server_url or settings.runtime_public_base_url) else None,
-            "status_url": f"{(assistant.bot_server_url or settings.runtime_public_base_url or '').rstrip('/')}/api/runtime/status" if (assistant.bot_server_url or settings.runtime_public_base_url) else None,
-            "metadata_url": f"{(assistant.bot_server_url or settings.runtime_public_base_url or '').rstrip('/')}/api/runtime/metadata?assistant_id={assistant.id}" if (assistant.bot_server_url or settings.runtime_public_base_url) else None,
-            "service_auth": {
-                "mode": service_auth.get("mode"),
-                "header_name": service_auth.get("header_name"),
-                "scope": service_auth.get("scope"),
-            } if service_auth else None,
-        },
+        "runtime": _runtime_payload(public_base_url, str(assistant.id), runtime_metadata),
     }
 
 
-def _request_public_payload(req: ProvisioningRequest) -> Dict[str, Any]:
+def _request_runtime_payload(req: ProvisioningRequest,
+                             assistant: Optional[Assistant] = None) -> Optional[Dict[str, Any]]:
+    if assistant is not None:
+        return _assistant_result_payload(assistant)["runtime"]
+
+    request_payload = dict(req.request_payload or {})
+    assistant_payload = dict(request_payload.get("assistant") or {})
+    runtime_payload = dict(request_payload.get("runtime") or {})
+    runtime_metadata = dict((req.latest_result or {}).get("runtime_metadata") or {})
+    if not runtime_metadata:
+        runtime_metadata = {
+            "service_auth": dict(runtime_payload.get("service_auth") or {})
+        }
+
+    public_base_url = (
+        runtime_payload.get("public_base_url")
+        or assistant_payload.get("bot_server_url")
+        or settings.runtime_public_base_url
+        or ""
+    )
+    assistant_id = req.assistant_id or assistant_payload.get("assistant_id")
+    runtime = _runtime_payload(public_base_url, str(assistant_id) if assistant_id else None, runtime_metadata)
+    if not any([runtime["public_base_url"], runtime["health_url"], runtime["status_url"], runtime["metadata_url"]]):
+        return None
+    return runtime
+
+
+def _request_tenant_payload(req: ProvisioningRequest,
+                            assistant: Optional[Assistant] = None) -> Optional[Dict[str, Any]]:
+    company_id = req.company_id or getattr(assistant, "company_id", None)
+    assistant_id = req.assistant_id or getattr(assistant, "id", None)
+    if not company_id and not assistant_id:
+        result = dict(req.latest_result or {})
+        tenant = dict(result.get("tenant") or {})
+        if tenant:
+            return tenant
+        return None
+    return {
+        "company_id": str(company_id) if company_id else None,
+        "assistant_id": str(assistant_id) if assistant_id else None,
+    }
+
+
+def _request_public_payload(req: ProvisioningRequest, assistant: Optional[Assistant] = None) -> Dict[str, Any]:
     payload = {
         "provisioning_request_id": req.provisioning_request_id,
         "status": req.status,
@@ -126,12 +184,18 @@ def _request_public_payload(req: ProvisioningRequest) -> Dict[str, Any]:
         "runtime": None,
         "tenant": None,
         "error": None,
+        "callback": {
+            "configured": bool(req.callback_url),
+            "delivery_status": req.callback_delivery_status,
+            "attempts": req.callback_attempts,
+            "last_status_code": req.callback_last_status_code,
+            "last_error": req.callback_last_error,
+        },
     }
-    result = dict(req.latest_result or {})
-    runtime = result.get("runtime")
+    runtime = _request_runtime_payload(req, assistant=assistant)
     if runtime:
         payload["runtime"] = runtime
-    tenant = result.get("tenant")
+    tenant = _request_tenant_payload(req, assistant=assistant)
     if tenant:
         payload["tenant"] = tenant
     if req.error_code or req.error_message:
@@ -159,29 +223,106 @@ def _update_request_status(req: ProvisioningRequest, status: str,
         req.error_code = None
         req.error_message = None
         req.error_retryable = None
+    logger.info(
+        "Provisioning status updated request=%s status=%s company_id=%s assistant_id=%s error_code=%s",
+        req.provisioning_request_id,
+        status,
+        req.company_id or "-",
+        req.assistant_id or "-",
+        req.error_code or "-",
+    )
+
+
+def _mark_callback_attempt(req_id: str, attempt: int) -> Optional[Dict[str, Any]]:
+    with get_db() as db:
+        if db is None:
+            return None
+        req = db.get(ProvisioningRequest, req_id)
+        if req is None:
+            return None
+        req.callback_attempts = attempt
+        req.callback_last_attempt_at = datetime.now(timezone.utc)
+        req.callback_delivery_status = "in_progress"
+        req.callback_last_error = None
+        req.callback_last_status_code = None
+        assistant = db.get(Assistant, req.assistant_id) if req.assistant_id else None
+        body = _request_public_payload(req, assistant=assistant)
+        return {
+            "callback_url": req.callback_url,
+            "callback_token": req.callback_token,
+            "body": body,
+        }
+
+
+def _mark_callback_result(req_id: str, delivery_status: str,
+                          status_code: Optional[int] = None,
+                          error_message: Optional[str] = None) -> None:
+    with get_db() as db:
+        if db is None:
+            return
+        req = db.get(ProvisioningRequest, req_id)
+        if req is None:
+            return
+        req.callback_delivery_status = delivery_status
+        req.callback_last_status_code = status_code
+        req.callback_last_error = error_message
+        req.callback_last_attempt_at = datetime.now(timezone.utc)
 
 
 def _send_callback(req_id: str, status: str) -> None:
+    max_attempts = max(1, int(settings.runtime_provisioning_callback_max_attempts))
+    backoff_seconds = max(1, int(settings.runtime_provisioning_callback_backoff_seconds))
+    timeout_seconds = max(1, int(settings.runtime_provisioning_callback_timeout_seconds))
+
     try:
-        with get_db() as db:
-            if db is None:
+        for attempt in range(1, max_attempts + 1):
+            callback_data = _mark_callback_attempt(req_id, attempt)
+            if callback_data is None:
                 return
-            req = db.get(ProvisioningRequest, req_id)
-            if req is None or not req.callback_url:
+            callback_url = callback_data.get("callback_url")
+            if not callback_url:
+                _mark_callback_result(req_id, "not_configured")
                 return
-            body = _request_public_payload(req)
+
+            body = dict(callback_data["body"] or {})
             body["status"] = status
             headers = {"Content-Type": "application/json"}
-            if req.callback_token:
-                headers["Authorization"] = f"Bearer {req.callback_token}"
-            with httpx.Client(timeout=15.0) as client:
-                resp = client.post(req.callback_url, json=body, headers=headers)
-                logger.info(
-                    "Provisioning callback sent request=%s status=%s code=%s",
-                    req_id, status, resp.status_code,
+            callback_token = callback_data.get("callback_token")
+            if callback_token:
+                headers["Authorization"] = f"Bearer {callback_token}"
+
+            try:
+                with httpx.Client(timeout=float(timeout_seconds)) as client:
+                    resp = client.post(callback_url, json=body, headers=headers)
+                if 200 <= resp.status_code < 300:
+                    _mark_callback_result(req_id, "delivered", status_code=resp.status_code)
+                    logger.info(
+                        "Provisioning callback delivered request=%s status=%s attempt=%s code=%s",
+                        req_id, status, attempt, resp.status_code,
+                    )
+                    return
+                error_message = f"callback_http_{resp.status_code}"
+                _mark_callback_result(req_id, "retrying", status_code=resp.status_code, error_message=error_message)
+                logger.warning(
+                    "Provisioning callback non-2xx request=%s status=%s attempt=%s code=%s",
+                    req_id, status, attempt, resp.status_code,
                 )
+            except Exception as exc:
+                error_message = str(exc)[:500]
+                _mark_callback_result(req_id, "retrying", error_message=error_message)
+                logger.warning(
+                    "Provisioning callback error request=%s status=%s attempt=%s error=%s",
+                    req_id, status, attempt, error_message,
+                    exc_info=True,
+                )
+
+            if attempt < max_attempts:
+                time.sleep(backoff_seconds * attempt)
+
+        _mark_callback_result(req_id, "failed", error_message="callback_delivery_failed")
     except Exception:
         logger.warning("Provisioning callback failed for %s status=%s", req_id, status, exc_info=True)
+        _mark_callback_result(req_id, "failed", error_message="callback_delivery_failed")
 
 
 def _start_callback(req_id: str, status: str) -> None:
@@ -348,6 +489,7 @@ def _apply_provisioning(req_id: str) -> None:
 
             latest_result = {
                 "runtime": _assistant_result_payload(assistant)["runtime"],
+                "runtime_metadata": _sanitize_runtime_metadata(runtime_metadata),
                 "tenant": {
                     "company_id": str(company.id),
                     "assistant_id": str(assistant.id),
@@ -410,7 +552,8 @@ def create_tenant():
             existing_payload = _normalize_payload(existing.request_payload or {})
             if existing_payload != normalized_payload:
                 return _json_error(409, "idempotency_conflict", "Idempotency key already used with different payload")
-            return jsonify(_request_public_payload(existing)), 200
+            assistant = db.get(Assistant, existing.assistant_id) if existing.assistant_id else None
+            return jsonify(_request_public_payload(existing, assistant=assistant)), 200
 
         req = ProvisioningRequest(
             provisioning_request_id=provisioning_request_id,
@@ -419,13 +562,31 @@ def create_tenant():
             callback_url=_callback_url(payload),
             callback_token=_callback_token(payload),
             status="accepted",
+            callback_delivery_status="pending" if _callback_url(payload) else "not_configured",
             request_payload=payload,
             latest_result={
-                "runtime": None,
-                "tenant": None,
+                "runtime": _request_runtime_payload(
+                    ProvisioningRequest(
+                        provisioning_request_id=provisioning_request_id,
+                        status="accepted",
+                        control_plane_request_id=control_plane_request_id,
+                        request_payload=payload,
+                    )
+                ),
+                "tenant": {
+                    "company_id": None,
+                    "assistant_id": str((payload.get("assistant") or {}).get("assistant_id") or "") or None,
+                },
             },
         )
         db.add(req)
+        logger.info(
+            "Provisioning request accepted request=%s idempotency_key=%s assistant_id=%s callback=%s",
+            provisioning_request_id,
+            idempotency_key,
+            (payload.get("assistant") or {}).get("assistant_id") or "-",
+            "configured" if req.callback_url else "not_configured",
+        )
 
     _start_callback(provisioning_request_id, "accepted")
     worker = threading.Thread(target=_apply_provisioning, args=(provisioning_request_id,), daemon=True)
@@ -449,4 +610,5 @@ def get_tenant_status(provisioning_request_id: str):
         req = db.get(ProvisioningRequest, provisioning_request_id)
         if req is None:
             return _json_error(404, "not_found", "Provisioning request not found")
-        return jsonify(_request_public_payload(req))
+        assistant = db.get(Assistant, req.assistant_id) if req.assistant_id else None
+        return jsonify(_request_public_payload(req, assistant=assistant))

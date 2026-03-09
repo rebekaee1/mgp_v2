@@ -677,21 +677,27 @@ def _build_service_auth_headers() -> dict:
     }
 
 
-def _resolve_request_runtime_secret() -> str:
+def _resolve_request_assistant_id() -> str:
+    assistant_id = (request.headers.get("X-Assistant-Id") or "").strip()
+    if assistant_id:
+        return assistant_id
+
+    payload = request.get_json(silent=True) or {}
+    return str(payload.get("assistant_id") or "").strip()
+
+
+def _resolve_request_runtime_secret() -> tuple[str, str]:
     from config import settings
     from runtime_config import resolve_runtime_config
 
-    assistant_id = (request.headers.get("X-Assistant-Id") or "").strip()
-    if not assistant_id:
-        payload = request.get_json(silent=True) or {}
-        assistant_id = str(payload.get("assistant_id") or "").strip()
+    assistant_id = _resolve_request_assistant_id()
     if assistant_id:
         runtime_config = resolve_runtime_config(assistant_id=assistant_id)
         assistant_secret = (runtime_config.runtime_service_auth_secret or "").strip()
         if assistant_secret:
-            return assistant_secret
+            return assistant_secret, "assistant"
 
-    return (settings.runtime_service_auth_secret or "").strip()
+    return (settings.runtime_service_auth_secret or "").strip(), "env"
 
 
 def _evaluate_runtime_auth(path: str = None) -> dict:
@@ -701,7 +707,8 @@ def _evaluate_runtime_auth(path: str = None) -> dict:
     ip = request.remote_addr or ""
     trusted_ip = _ip_matches_trusted_cidrs(ip, settings.runtime_trusted_proxy_cidrs)
     trusted_service_ids = set(_split_csv(settings.runtime_trusted_service_ids))
-    secret = _resolve_request_runtime_secret()
+    assistant_id = _resolve_request_assistant_id()
+    secret, secret_source = _resolve_request_runtime_secret()
     service_id = (request.headers.get("X-MGP-Service-Id") or "").strip()
     timestamp = (request.headers.get("X-MGP-Timestamp") or "").strip()
     signature = (request.headers.get("X-MGP-Signature") or "").strip().lower()
@@ -766,6 +773,8 @@ def _evaluate_runtime_auth(path: str = None) -> dict:
         "valid": valid,
         "trusted_ip": trusted_ip,
         "service_id": service_id or None,
+        "assistant_id": assistant_id or None,
+        "secret_source": secret_source,
         "reason": reason,
         "would_reject": would_reject,
     }
@@ -785,11 +794,13 @@ def _runtime_auth_error_response(conversation_id: str = None, stream: bool = Fal
         return None
 
     logger.warning(
-        "🚫 SERVICE AUTH rejected path=%s ip=%s mode=%s service=%s reason=%s",
+        "🚫 SERVICE AUTH rejected path=%s ip=%s mode=%s service=%s assistant_id=%s secret_source=%s reason=%s",
         request.path,
         outcome.get("ip"),
         outcome.get("mode"),
         outcome.get("service_id") or "-",
+        outcome.get("assistant_id") or "-",
+        outcome.get("secret_source") or "-",
         outcome.get("reason"),
     )
 

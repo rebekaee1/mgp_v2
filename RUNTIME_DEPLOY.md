@@ -38,6 +38,9 @@
 - `RUNTIME_REPORT_URL=...`
 - `RUNTIME_REPORT_TOKEN=...`
 - `RUNTIME_PROVISIONING_API_TOKEN=...`
+- `RUNTIME_PROVISIONING_CALLBACK_TIMEOUT_SECONDS=15`
+- `RUNTIME_PROVISIONING_CALLBACK_MAX_ATTEMPTS=3`
+- `RUNTIME_PROVISIONING_CALLBACK_BACKOFF_SECONDS=2`
 
 ## Backend-only profile
 
@@ -74,6 +77,8 @@
 Ключ: `RUNTIME_SERVICE_AUTH_SECRET`.
 
 Совместимые fallback-варианты тоже поддерживаются, но phase-1 target contract именно `X-MGP-Service-Token`.
+
+Для tenant-specific runtime auth в `enforce` mode `LK` должен передавать `assistant_id` в body и/или `X-Assistant-Id` в header вместе с `X-MGP-Service-Token`, чтобы runtime выбрал корректный per-tenant secret.
 
 ## Control-Plane API
 
@@ -118,6 +123,13 @@
 - передаёт его в `runtime.service_auth.secret`
 - `MGP` сохраняет и применяет его в новом runtime
 - `callback/status API` secret не возвращают
+
+Стабильное поведение runtime payload:
+
+- `poll` и `callback` должны всегда возвращать полный `runtime` payload
+- минимум: `runtime.public_base_url`
+- target payload: `public_base_url`, `health_url`, `status_url`, `metadata_url`
+- если `LK` не прислал `runtime.public_base_url` или `assistant.bot_server_url`, runtime использует base URL самого provisioning endpoint как fallback
 
 Поддерживаемая структура:
 
@@ -175,6 +187,7 @@ Status model:
 - `tenant.company_id`
 - `tenant.assistant_id`
 - runtime URLs/metadata без `service_auth.secret`
+- callback delivery diagnostics: `callback.configured`, `callback.delivery_status`, `callback.attempts`, `callback.last_status_code`, `callback.last_error`
 - `error` при `failed`
 
 ## Template / Provisioning

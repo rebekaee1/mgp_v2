@@ -335,6 +335,13 @@ class ProvisioningRequest(Base):
     error_code: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
     error_message: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     error_retryable: Mapped[Optional[bool]] = mapped_column(Boolean, nullable=True)
+    callback_delivery_status: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
+    callback_attempts: Mapped[int] = mapped_column(Integer, default=0)
+    callback_last_status_code: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    callback_last_error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    callback_last_attempt_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow
     )
