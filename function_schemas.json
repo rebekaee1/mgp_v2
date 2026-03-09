@@ -146,7 +146,7 @@
           },
           "hideregular": {
             "type": "integer",
-            "description": "1=скрыть регулярные рейсы.",
+            "description": "Фильтр рейсов: 0=все рейсы, 1=только чартерные. НЕ ставь этот параметр, если клиент не просил явно 'только чартер'. Система ищет все рейсы по умолчанию.",
             "enum": [0, 1]
           },
           "services": {
@@ -277,34 +277,6 @@
           "hotrating": {
             "type": "number",
             "description": "Для hotel: мин. рейтинг."
-          },
-          "hotactive": {
-            "type": "integer",
-            "enum": [0, 1]
-          },
-          "hotrelax": {
-            "type": "integer",
-            "enum": [0, 1]
-          },
-          "hotfamily": {
-            "type": "integer",
-            "enum": [0, 1]
-          },
-          "hothealth": {
-            "type": "integer",
-            "enum": [0, 1]
-          },
-          "hotcity": {
-            "type": "integer",
-            "enum": [0, 1]
-          },
-          "hotbeach": {
-            "type": "integer",
-            "enum": [0, 1]
-          },
-          "hotdeluxe": {
-            "type": "integer",
-            "enum": [0, 1]
           },
           "name": {
             "type": "string",

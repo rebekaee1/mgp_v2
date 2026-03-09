@@ -558,6 +558,11 @@ def _check_cascade_slots(full_history: List[Dict], args: Dict, is_follow_up: boo
         r'(?:первой|второй)\s+половин[еы]',                           # "в первой половине"
         r'ближе\s+к\s+(?:начал|конц|середин)',                        # "ближе к концу"
         r'(?:под|к)\s+конец',                                          # "под конец мая"
+        r'(?:ближайш\w+\s+(?:вылет|дат|рейс))',                       # "ближайший вылет"
+        r'(?:всё?\s*равно\s*(?:когда|какая?\s+дат))',                  # "все равно когда"
+        r'(?:какой\s+есть|какая\s+есть|что\s+есть)',                   # "какой есть"
+        r'(?:любой\s+(?:период|ближайший|вылет|дат))',                 # "любой период"
+        r'(?:не\s*важно\s+когда|неважно\s+когда)',                     # "неважно когда"
         r'(?:весь|целый)\s+\w*' + _MONTH_NAMES_RX.replace('|', r'\w*|').replace(r'(?:', '(?:'),  # "весь октябрь"
     ]
     has_specific_date = any(re.search(p, user_text) for p in specific_date_patterns)
@@ -602,17 +607,16 @@ def _check_cascade_slots(full_history: List[Dict], args: Dict, is_follow_up: boo
     
     # ─── Слот 4: Состав путешественников ───
     travelers_patterns = [
-        r'(?:взрослы[хй]|взр\.?|вз\.?|adults)',  # "взрослых", "взр", "вз", "adults"
+        r'(?:взрослы[хй]|взр\.?|вз\.?|adults)',
         r'(?:дет(?:ей|и|ьми|ям)?|ребен(?:ок|ка)|child)',
         r'(?:я\s+)?(?:один|одна|сам|одиночк)',
-        r'(?:двое|два|две)\s+(?:взрослы[хй]|человек|чел\.?)',  # "двое взрослых", "два человека"
+        r'(?:двое|два|две)\s+(?:взрослы[хй]|человек|чел\.?)',
         r'(?:трое|три|четыре|пять|шесть)\s+(?:взрослы[хй]|человек|чел\.?)',
-        r'\d+\s*(?:взрослы[хй]|человек|чел\.?|взр|вз)',  # "2 взрослых", "3 человека", "1 вз"
-        r'\d+\s*(?:в|вз)\s*\+',  # "2в+", "1 вз+" — shorthand
+        r'\d+\s*(?:взрослы[хй]|человек|чел\.?|взр|вз)',
+        r'\d+\s*(?:в|вз)\s*\+',
         r'(?:с\s+)?(?:мужем|женой|парнем|девушкой|подругой|другом)',
         r'(?:вдво[её]м|втро[её]м|вчетвером|впятером)',
-        # НЕ включаем "семьёй/компанией/группой" — они слишком расплывчаты,
-        # не дают точного состава (кол-во взрослых/детей), AI должен уточнить
+        r'\d+[-–]\d+\(\d+',  # "2-1(4)" = 2 взрослых, 1 ребёнок (4 года)
         r'(?:мы\s+с\s+)',
     ]
     has_travelers_mention = any(re.search(p, user_text) for p in travelers_patterns)
@@ -645,7 +649,7 @@ def _check_cascade_slots(full_history: List[Dict], args: Dict, is_follow_up: boo
     # Также skip если клиент назвал конкретный отель/бренд (stars берётся из базы)
     
     stars_patterns = [
-        r'\d[\s\-]*(?:зв[её]зд|\*|⭐)',                        # "5 звёзд", "4*", "5⭐", "5-звёздочный"
+        r'\d[\s\-\+]*(?:зв[её]зд|\*|⭐)',                      # "5 звёзд", "4*", "5⭐", "3+ звёзд", "5-звёздочный"
         r'(?:пяти|четыр[её]х|тр[её]х)зв[её]зд',               # "пятизвёздочный", "четырёхзвёздочный"
         r'\b(?:пять|четыре|три|два)\s+зв[её]зд',             # "пять звезд", "четыре звезды"
         r'\b(?:пят[её]рк|четв[её]рк|тройк)',                    # разг. "пятёрка"/"пятерка", "четвёрка"/"четверка"
@@ -667,7 +671,7 @@ def _check_cascade_slots(full_history: List[Dict], args: Dict, is_follow_up: boo
         # Контекстные паттерны: "любой" только в связке со звёздностью/отелем/питанием
         r'(?:любой|любую|любое|любые)\s+(?:отель|категори|звёзд|звезд|питани)',
         r'(?:любой|любая|любое)\b',  # одиночный ответ "любой" на вопрос QC (последнее сообщение)
-        r'(?:без\s*разницы|всё\s*равно|все\s*равно)',
+        r'(?:без\s*разницы|(?:всё|все)\s*равно(?!\s*когда))',
         r'(?:не\s*важно|неважно|не\s*принципиально)',
         r'(?:на\s+(?:ваше?|твоё?|твое?)\s+усмотрени)',
         r'(?:рассмотрим\s+вариант|покажите?\s+что\s+есть|какие\s+есть)',
@@ -693,13 +697,13 @@ def _check_cascade_slots(full_history: List[Dict], args: Dict, is_follow_up: boo
     if has_brand:
         for i in range(len(full_history) - 1, -1, -1):
             msg = full_history[i]
-            content = msg.get("content", "")
+            content = msg.get("content") or ""
             # Ищем сообщение ассистента с вызовом get_dictionaries для отелей
             if msg.get("role") == "assistant" and "get_dictionaries" in content and ("hotel" in content or "name" in content):
                 # Проверяем следующее сообщение (результат функции)
                 if i + 1 < len(full_history):
                     result_msg = full_history[i + 1]
-                    result_content = result_msg.get("content", "")
+                    result_content = result_msg.get("content") or ""
                     if "[get_dictionaries]: []" in result_content or '"hotels": []' in result_content:
                         has_brand = False
                         break
@@ -894,17 +898,28 @@ def _nights_penalty(nights: int, nf: int = None, nt: int = None) -> float:
     return min(abs(nights - lo), abs(nights - hi)) * 2.0
 
 
+_MEAL_ID_TO_KEYWORDS = {
+    7: ["все включено", "all inclusive", "ai"],
+    9: ["ультра все включено", "ultra all inclusive", "uai"],
+    3: ["завтрак", "bb"],
+    4: ["полупансион", "hb"],
+    5: ["полный пансион", "fb"],
+    6: ["расширенный полупансион", "hb+"],
+    8: ["расширенный полный пансион", "fb+"],
+    2: ["без питания", "ro", "only"],
+}
+
+
 def _pick_best_tour(tours: list, ideal_datefrom: str = None,
-                    nightsfrom: int = None, nightsto: int = None) -> dict:
+                    nightsfrom: int = None, nightsto: int = None,
+                    requested_meal: int = None) -> dict:
     """
     Выбрать тур из списка, максимально совпадающий с запросом клиента.
-    Приоритет сортировки: ночи (tier) > дата > цена.
-    Tier 0 = точно nightsto (то что клиент назвал), tier 1+ = ниже в диапазоне,
-    tier 100+ = вне диапазона.
+    Приоритет сортировки: ночи (tier) > питание (match) > дата > цена.
     """
     if not tours:
         return {}
-    if not ideal_datefrom and nightsfrom is None and nightsto is None:
+    if not ideal_datefrom and nightsfrom is None and nightsto is None and requested_meal is None:
         return tours[0]
 
     ideal_dt = None
@@ -913,6 +928,8 @@ def _pick_best_tour(tours: list, ideal_datefrom: str = None,
             ideal_dt = _dt.strptime(ideal_datefrom, "%d.%m.%Y")
         except (ValueError, TypeError):
             pass
+
+    _meal_kw = _MEAL_ID_TO_KEYWORDS.get(requested_meal, [])
 
     scored = []
     for t in tours:
@@ -932,14 +949,19 @@ def _pick_best_tour(tours: list, ideal_datefrom: str = None,
         else:
             nights_tier = 0
 
+        meal_match = 0
+        if _meal_kw:
+            _meal_str = (t.get("mealrussian") or "").lower()
+            meal_match = 0 if any(kw in _meal_str for kw in _meal_kw) else 1
+
         price = _safe_int(t.get("price"), 999999999)
-        scored.append((nights_tier, date_diff, price, t))
+        scored.append((nights_tier, meal_match, date_diff, price, t))
 
-    scored.sort(key=lambda x: (x[0], x[1], x[2]))
-    return scored[0][3]
+    scored.sort(key=lambda x: (x[0], x[1], x[2], x[3]))
+    return scored[0][4]
 
 
-def _map_hotel_to_card(hotel: dict, departure_city: str = "Москва") -> dict:
+def _map_hotel_to_card(hotel: dict, departure_city: str = "Москва", adults: int = 2) -> dict:
     """
     Маппинг отеля из get_search_results → формат tour_card для фронтенда.
     Структура совпадает с ожиданиями createTourCardHTML в script.js.
@@ -971,7 +993,8 @@ def _map_hotel_to_card(hotel: dict, departure_city: str = "Москва") -> dic
         "date_to": _calc_end_date(flydate_raw, nights),
         "nights": nights,
         "price": tour_price,
-        "price_per_person": None,
+        "price_per_person": tour_price // adults if tour_price and adults > 1 else None,
+        "adults": adults,
         "food_type": "",                      # Код питания (для JS fallback)
         "meal_description": meal_desc,        # Русское описание питания
         "room_type": tour.get("room") or "Standard",
@@ -1127,6 +1150,54 @@ def _strip_reasoning_leak(text: str) -> str:
     return text
 
 
+# ── Fix merged questions (adjacent ?Capital without separator) ────────────
+def _fix_merged_questions(text: str) -> str:
+    """Insert separator between adjacent questions that are merged without whitespace."""
+    if not text or '?' not in text:
+        return text
+    text = re.sub(r'\?([А-ЯA-Z])', r'?\n\n\1', text)
+    parts = re.split(r'(\?)', text)
+    if len(parts) >= 5:
+        for i, part in enumerate(parts):
+            if part == '?' and i >= 1 and i + 2 < len(parts):
+                prev_q = parts[i - 1]
+                next_q = parts[i + 2] if i + 2 < len(parts) else ""
+                prev_words = prev_q.strip().split()[-5:]
+                next_words = next_q.strip().split()[:5]
+                overlap = len(set(w.lower() for w in prev_words) & set(w.lower() for w in next_words))
+                if overlap >= 3:
+                    truncated = '?\n'.join(text.split('?')[:1]) + '?'
+                    logger.info("🧹 FIX-MERGED-Q: truncated duplicate question tail")
+                    return truncated
+    return text
+
+
+# ── Grammar fixes and forbidden promises ──────────────────────────────────
+_GRAMMAR_FIXES = [
+    (re.compile(r'любой\s+страну', re.IGNORECASE), 'любая страна'),
+    (re.compile(r'любой\s+стран(?:а|е|ы)', re.IGNORECASE), 'любая страна'),
+]
+
+_FORBIDDEN_PROMISES = re.compile(
+    r'(?:свяжусь|уточню|узнаю|запрошу|обращусь|перезвоню|переведу)\s+'
+    r'(?:с\s+менеджером|у\s+менеджера|у\s+оператора|к\s+менеджеру)',
+    re.IGNORECASE
+)
+_MANAGER_RECOMMENDATION = "Рекомендую уточнить у менеджера по телефону: +7 (800) 555-35-35"
+
+
+def _apply_grammar_and_compliance(text: str) -> str:
+    """Fix known grammar errors and replace forbidden promises."""
+    if not text:
+        return text
+    for pattern, replacement in _GRAMMAR_FIXES:
+        text = pattern.sub(replacement, text)
+    if _FORBIDDEN_PROMISES.search(text):
+        text = _FORBIDDEN_PROMISES.sub(_MANAGER_RECOMMENDATION, text)
+        logger.info("🛡️ COMPLIANCE: replaced forbidden promise with manager recommendation")
+    return text
+
+
 # ── Sentence-level deduplication ──────────────────────────────────────────
 def _dedup_sentences(text: str) -> str:
     """
@@ -1223,9 +1294,10 @@ class YandexGPTHandler:
         
         # Максимальный размер full_history (в сообщениях).
         # При превышении — обрезаем старые сообщения, оставляя последние.
-        # 50 сообщений: с учётом tool_call/tool_result в OpenAI handler
+        # 80 сообщений: с учётом tool_call/tool_result в OpenAI handler
         # один поиск = ~8 сообщений, полный цикл (каскад+поиск+консультация+повторный поиск) = ~40-45.
-        self._max_history_len = 50
+        # Предупреждения показываются на 60 и 72 сообщениях.
+        self._max_history_len = 80
         
         # Счётчик пустых итераций подряд (для детекции зависаний)
         self._empty_iterations = 0
@@ -1264,6 +1336,16 @@ class YandexGPTHandler:
         # и используется как fallback для пропущенных параметров.
         self._last_search_params: Dict = {}
         self._user_stated_budget: Optional[int] = None
+        
+        # ── Прогрессивный "ближайший вылет": счётчик попыток и последняя страна ──
+        self._nearest_search_attempt: int = 0
+        self._last_nearest_country: Optional[int] = None
+        
+        # ── Для логирования результатов поиска (hotels_found/tours_found/min_price) ──
+        self._last_search_result: Optional[Dict] = None
+        
+        # ── Для логирования API-вызовов ──
+        self._pending_api_calls: List[Dict] = []
         
         # ── Метрики для мониторинга качества (Этап 3) ──
         self._metrics = {
@@ -1353,7 +1435,7 @@ class YandexGPTHandler:
     async def _fetch_one(self, tid: str, hotel: str):
         """Fetch actdetail for a single tour and cache if valid."""
         try:
-            result = await self.tourvisor.get_tour_details(tour_id=tid, timeout=15.0)
+            result = await self.tourvisor.get_tour_details(tour_id=tid, timeout=25.0)
             if isinstance(result, dict) and not result.get("iserror"):
                 self._tour_details_cache[tid] = result
                 logger.info("PREFETCH cached tourid=%s (%s)", tid, hotel)
@@ -1493,6 +1575,10 @@ class YandexGPTHandler:
             result_str = json.dumps(result, ensure_ascii=False, default=str)
             elapsed_ms = int((time.perf_counter() - t0) * 1000)
             logger.info("🔧 FUNC CALL << %s  OK  %dms  result_size=%d chars", name, elapsed_ms, len(result_str))
+            
+            if hasattr(self.tourvisor, 'api_call_log') and self.tourvisor.api_call_log:
+                self._pending_api_calls.extend(self.tourvisor.api_call_log)
+                self.tourvisor.api_call_log.clear()
             logger.debug("🔧 FUNC RESULT [%s]: %s", name, result_str[:800] + ("…" if len(result_str) > 800 else ""))
             
             # Пишем в диалоговый лог результат функции (первые 2000 символов)
@@ -2032,6 +2118,18 @@ class YandexGPTHandler:
                         args.pop("regions", None)
                         logger.info("📋 PARAM-CACHE: cleared stale regions (country changed)")
             
+            # ── Safety-net: country=0 недопустим в TourVisor API ──
+            _raw_country = args.get("country")
+            if _raw_country is not None and _raw_country != "" and _safe_int(_raw_country) == 0:
+                logger.warning("SAFETY-NET: country=0 → блокируем search_tours")
+                return {
+                    "status": "error",
+                    "error": (
+                        "ОШИБКА: country=0 недопустим. API не поддерживает поиск по всем странам одновременно. "
+                        "Предложи клиенту 3-4 популярных направления по сезону, или используй get_hot_tours для обзора."
+                    )
+                }
+
             # ── Проверка полноты каскада (Fix 3B — блокирующая проверка) ──
             # Анализируем историю диалога, чтобы убедиться, что клиент ЯВНО указал критичные слоты
             is_cascade_complete, missing_slots = _check_cascade_slots(self.full_history, args, is_follow_up=bool(self._last_search_params))
@@ -2123,7 +2221,7 @@ class YandexGPTHandler:
             # Сначала проверяем skip QC — если пользователь сказал "всё равно" / "без разницы",
             # удаляем stars/meal фильтры полностью (API вернёт все категории)
             _skip_qc_patterns = [
-                r'(?:без\s*разницы|всё\s*равно|все\s*равно)',
+                r'(?:без\s*разницы|(?:всё|все)\s*равно(?!\s*когда))',
                 r'(?:не\s*важно|неважно|не\s*принципиально)',
                 r'(?:на\s+(?:ваше?|твоё?|твое?)\s+усмотрени)',
                 r'(?:рассмотрим\s+вариант|покажите?\s+что\s+есть|какие\s+есть)',
@@ -2134,18 +2232,32 @@ class YandexGPTHandler:
                 msg.get("content", "") for msg in self.full_history[-4:]
                 if msg.get("role") == "user" and msg.get("content")
             ]
-            _last_user_text = _last_user_msgs[-1].lower() if _last_user_msgs else ""
-            _is_skip_qc = any(re.search(p, _last_user_text) for p in _skip_qc_patterns)
+            _all_recent_user_text = " ".join(_last_user_msgs).lower()
+            _is_skip_qc = any(re.search(p, _all_recent_user_text) for p in _skip_qc_patterns)
 
             if _is_skip_qc and args.get("stars") is not None:
-                logger.info(
-                    "🛡️ SAFETY-NET SKIP-QC: обнаружен skip quality check → удаляем stars=%s, starsbetter=%s, meal=%s, mealbetter=%s",
-                    args.get("stars"), args.get("starsbetter"), args.get("meal"), args.get("mealbetter")
-                )
-                args.pop("stars", None)
-                args.pop("starsbetter", None)
-                args.pop("meal", None)
-                args.pop("mealbetter", None)
+                _has_explicit_stars = bool(re.search(
+                    r'\d[\s\-\+]*(?:зв[её]зд|\*|⭐)', _all_recent_user_text
+                ))
+                _has_explicit_meal = bool(re.search(
+                    r'(?:вс[её]\s*включен|завтрак|полупансион|полный\s*пансион|без\s*питани|all\s*incl|ол+\s*инклюзив)',
+                    _all_recent_user_text
+                ))
+                if _has_explicit_stars or _has_explicit_meal:
+                    logger.info(
+                        "🛡️ SAFETY-NET SKIP-QC ОТМЕНЁН: пользователь явно указал stars/meal в том же тексте "
+                        "(explicit_stars=%s, explicit_meal=%s) → сохраняем stars=%s, meal=%s",
+                        _has_explicit_stars, _has_explicit_meal, args.get("stars"), args.get("meal")
+                    )
+                else:
+                    logger.info(
+                        "🛡️ SAFETY-NET SKIP-QC: обнаружен skip quality check → удаляем stars=%s, starsbetter=%s, meal=%s, mealbetter=%s",
+                        args.get("stars"), args.get("starsbetter"), args.get("meal"), args.get("mealbetter")
+                    )
+                    args.pop("stars", None)
+                    args.pop("starsbetter", None)
+                    args.pop("meal", None)
+                    args.pop("mealbetter", None)
             elif args.get("stars") is not None:
                 if args.get("starsbetter") is None:
                     args["starsbetter"] = 0
@@ -2159,7 +2271,7 @@ class YandexGPTHandler:
                         if msg.get("role") == "user" and msg.get("content")
                     ]).lower()
                     _wants_better = bool(re.search(
-                        r'(?:от\s+\d|\d\s*[-–]\s*\d\s*(?:зв|★|\*)|не\s+ниже|минимум\s+\d|и\s+выше|выше)',
+                        r'(?:от\s+\d|\d\s*\+|\d\s*[-–]\s*\d\s*(?:зв|★|\*)|не\s+ниже|минимум\s+\d|и\s+выше|выше)',
                         _user_stars_text
                     ))
                     if not _wants_better:
@@ -2206,6 +2318,95 @@ class YandexGPTHandler:
                         _original_price, args["pricefrom"], args["priceto"]
                     )
             
+            # ── Safety-net: dateto==datefrom при диапазонных словах → расширяем ──
+            if (args.get("dateto") and args.get("datefrom")
+                    and args["dateto"] == args["datefrom"]):
+                _user_date_text = " ".join([
+                    msg.get("content", "") for msg in self.full_history[-10:]
+                    if msg.get("role") == "user" and msg.get("content")
+                ]).lower()
+                _has_range = re.search(
+                    r'(?:январ\w*[\s\-–]+феврал|феврал\w*[\s\-–]+март|'
+                    r'март\w*[\s\-–]+апрел|апрел\w*[\s\-–]+ма[йя]|'
+                    r'ма[йя]\w*[\s\-–]+июн|июн\w*[\s\-–]+июл|'
+                    r'июл\w*[\s\-–]+август|август\w*[\s\-–]+сентябр|'
+                    r'сентябр\w*[\s\-–]+октябр|октябр\w*[\s\-–]+ноябр|'
+                    r'ноябр\w*[\s\-–]+декабр|'
+                    r'ближайш|любую?\s+дат|всё?\s*равно.*когда|'
+                    r'диапазон|с\s+\d{1,2}\s*(?:по|-)\s*\d{1,2})',
+                    _user_date_text
+                )
+                if _has_range:
+                    from datetime import datetime as _dt_cls, timedelta as _td_cls
+                    try:
+                        _df = _dt_cls.strptime(args["datefrom"], "%d.%m.%Y")
+                        _new_dt = _df + _td_cls(days=14)
+                        args["dateto"] = _new_dt.strftime("%d.%m.%Y")
+                        logger.warning(
+                            "SAFETY-NET: dateto==datefrom при диапазоне → расширено до %s",
+                            args["dateto"]
+                        )
+                    except ValueError:
+                        pass
+
+            # ── Safety-net: прогрессивный dateto для «ближайший вылет» ──
+            if args.get("datefrom"):
+                _nearest_text = " ".join([
+                    msg.get("content", "") for msg in self.full_history[-6:]
+                    if msg.get("role") == "user" and msg.get("content")
+                ]).lower()
+                _is_nearest = re.search(
+                    r'(?:ближайш|всё?\s*равно.*когда|неважно\s*когда|какой\s+есть|любую?\s+дат)',
+                    _nearest_text
+                )
+                if _is_nearest:
+                    _current_country = _safe_int(args.get("country"))
+                    if _current_country and _current_country != self._last_nearest_country:
+                        self._nearest_search_attempt = 0
+                        self._last_nearest_country = _current_country
+
+                    from datetime import datetime as _dt_cls2, timedelta as _td_cls2
+                    _expansion_days = [14, 30, 60]
+                    _attempt = min(self._nearest_search_attempt, len(_expansion_days) - 1)
+                    _days = _expansion_days[_attempt]
+                    try:
+                        _df2 = _dt_cls2.strptime(args["datefrom"], "%d.%m.%Y")
+                        _new_dt2 = _df2 + _td_cls2(days=_days)
+                        args["dateto"] = _new_dt2.strftime("%d.%m.%Y")
+                        logger.info(
+                            "🛡️ PROGRESSIVE-DATETO: attempt=%d → dateto=datefrom+%d (%s)",
+                            self._nearest_search_attempt, _days, args["dateto"]
+                        )
+                    except ValueError:
+                        pass
+                    self._nearest_search_attempt += 1
+
+            # ── Safety-net: вычисление ночей из «с X по Y [месяц]» ──
+            if args.get("datefrom") and not args.get("nightsfrom"):
+                _user_nights_text = " ".join([
+                    msg.get("content", "") for msg in self.full_history[-6:]
+                    if msg.get("role") == "user" and msg.get("content")
+                ]).lower()
+                _date_range_match = re.search(
+                    r'с\s+(\d{1,2})\s*(?:по|до|-|–)\s*(\d{1,2})\s*'
+                    r'(?:январ|феврал|март|апрел|ма[йя]|июн|июл|август|сентябр|октябр|ноябр|декабр)',
+                    _user_nights_text
+                )
+                if _date_range_match:
+                    try:
+                        _day_from = int(_date_range_match.group(1))
+                        _day_to = int(_date_range_match.group(2))
+                        _computed_nights = _day_to - _day_from
+                        if 1 <= _computed_nights <= 30:
+                            args["nightsfrom"] = _computed_nights
+                            args["nightsto"] = _computed_nights
+                            logger.info(
+                                "🛡️ SAFETY-NET NIGHTS: 'с %d по %d' → nightsfrom=%d, nightsto=%d",
+                                _day_from, _day_to, _computed_nights, _computed_nights
+                            )
+                    except (ValueError, TypeError):
+                        pass
+
             # ── Логирование пропущенных ключевых параметров (информационное) ──
             missing_params = []
             if not args.get("adults"):
@@ -2225,12 +2426,14 @@ class YandexGPTHandler:
                     ", ".join(missing_params)
                 )
             
-            # ── Charter-only: скрываем регулярные рейсы для международных направлений ──
+            # ── Фильтр чартер/регулярные рейсы ──
             _country_code = _safe_int(args.get("country"))
-            _departure_code = _safe_int(args.get("departure"))
-            if _country_code != 47 and _departure_code != 99 and not args.get("hideregular"):
-                args["hideregular"] = 1
-                logger.info("✈️ CHARTER-ONLY: hideregular=1 (country=%s, international)", _country_code)
+            _hr = args.get("hideregular")
+
+            if _hr is not None and str(_hr).strip() != "":
+                logger.info("✈️ FLIGHT-FILTER: hideregular=%s (LLM explicit)", _hr)
+            else:
+                logger.info("✈️ FLIGHT-FILTER: all flights (country=%s)", _country_code)
             
             self._metrics["total_searches"] += 1
             request_id = await self.tourvisor.search_tours(
@@ -2287,9 +2490,11 @@ class YandexGPTHandler:
                          "stars", "starsbetter", "meal", "mealbetter")
                 and v is not None
             }
-            # Запоминаем страну и регион для детекции смены направления
+            # Запоминаем страну, регион и hideregular для детекции смены направления / подсказок
             self._last_search_params["_country"] = args.get("country")
             self._last_search_params["_regions"] = args.get("regions")
+            if args.get("hideregular") is not None:
+                self._last_search_params["_hideregular"] = args["hideregular"]
             if args.get("hotels"):
                 self._last_search_params["_hotels"] = args.get("hotels")
             logger.info("📋 PARAM-CACHE: saved %d params from search", len(self._last_search_params))
@@ -2351,15 +2556,13 @@ class YandexGPTHandler:
                     if hotels_found == 0 or tours_found == 0:
                         _dep_code = self._last_search_params.get("departure")
                         _dep_city = _DEPARTURE_CITIES.get(_dep_code, "") if _dep_code else ""
-                        _major_cities = {1, 3, 5}  # Москва, Екатеринбург, СПб
                         _dep_hint = ""
-                        if _dep_code and _dep_code not in _major_cities:
+                        if _dep_code:
                             _dep_hint = (
                                 f" ⚠️ Из города '{_dep_city}' (departure={_dep_code}) — ноль туров. "
-                                f"Вероятно, из этого города нет рейсов в данную страну. "
                                 f"Проверь через get_dictionaries(type=country, cndep={_dep_code}) "
-                                f"какие направления доступны и предложи клиенту ближайшие "
-                                f"альтернативные города вылета."
+                                f"какие направления доступны из этого города и предложи клиенту "
+                                f"доступные альтернативы."
                             )
                         _hotel_hint = ""
                         _hotel_code_str = self._last_search_params.get("_hotels", "")
@@ -2374,10 +2577,24 @@ class YandexGPTHandler:
                                 f"доступны в этом отеле, и предложи клиенту доступный вариант. "
                                 f"НЕ предлагай другие отели, пока не проверил питание в этом!"
                             )
+                        _hideregular_hint = ""
+                        _hr_val = self._last_search_params.get("_hideregular")
+                        if _hr_val == 1:
+                            _hideregular_hint = (
+                                " HINT: Поиск был с hideregular=1 (только чартеры). "
+                                "Для этого направления могут быть только регулярные рейсы. "
+                                "Повтори search_tours БЕЗ параметра hideregular или с hideregular=0."
+                            )
                         raise NoResultsError(
-                            f"Поиск завершён: найдено {hotels_found} отелей, {tours_found} туров.{_dep_hint}{_hotel_hint}",
+                            f"Поиск завершён: найдено {hotels_found} отелей, {tours_found} туров.{_dep_hint}{_hotel_hint}{_hideregular_hint}",
                             filters_hint="Попробуйте расширить даты, увеличить бюджет или убрать фильтры"
                         )
+
+                    self._last_search_result = {
+                        "hotels_found": hotels_found,
+                        "tours_found": tours_found,
+                        "min_price": _safe_int(last_status.get("minprice"), None),
+                    }
 
                     last_status["_hint"] = (
                         f"Поиск завершён! Найдено {hotels_found} отелей, {tours_found} туров. "
@@ -2406,6 +2623,11 @@ class YandexGPTHandler:
                    (hotels_found >= 1 and elapsed >= 12):
                     logger.info("📊 SEARCH READY (partial)  requestid=%s  progress=%s%%  hotels=%s — returning early",
                                 request_id, progress, hotels_found)
+                    self._last_search_result = {
+                        "hotels_found": hotels_found,
+                        "tours_found": tours_found,
+                        "min_price": _safe_int(last_status.get("minprice"), None),
+                    }
                     last_status["_hint"] = (
                         f"Поиск ещё идёт ({progress}%), но уже найдено {hotels_found} отелей. "
                         f"Вызови get_search_results с этим requestid для показа результатов."
@@ -2476,9 +2698,11 @@ class YandexGPTHandler:
                     len(tours),
                     sorted(set(int(t.get("nights", 0)) for t in tours if t.get("nights")))
                 )
+                _req_meal = _safe_int(self._last_search_params.get("meal"), None)
                 best_tour = _pick_best_tour(
                     tours, self._ideal_datefrom,
-                    self._ideal_nightsfrom, self._ideal_nightsto
+                    self._ideal_nightsfrom, self._ideal_nightsto,
+                    requested_meal=_req_meal
                 )
                 
                 picture = h.get("picturelink", "")
@@ -2560,8 +2784,9 @@ class YandexGPTHandler:
             simplified = [item[2] for item in _scored_hotels[:5]]
             
             # ── Строим tour_cards для нового фронтенда ──
+            _adults = self._last_search_params.get("adults", 2) if self._last_search_params else 2
             self._pending_tour_cards = [
-                _map_hotel_to_card(h, self._last_departure_city)
+                _map_hotel_to_card(h, self._last_departure_city, adults=_adults)
                 for h in simplified
             ]
             logger.info("🎴 Built %d tour cards for frontend", len(self._pending_tour_cards))
@@ -2623,11 +2848,38 @@ class YandexGPTHandler:
                     ),
                 }
 
+            _result_hint = "Карточки с фото, ценами, датами, питанием, звёздами УЖЕ отображены фронтендом. НЕ перечисляй отели, цены, описания, даты, питание, звёзды в тексте! Напиши ТОЛЬКО краткий комментарий (1-2 предложения) и спроси клиента."
+
+            _req_meal_code = _safe_int(self._last_search_params.get("meal"), None)
+            if _req_meal_code and simplified:
+                _req_meal_kw = _MEAL_ID_TO_KEYWORDS.get(_req_meal_code, [])
+                if _req_meal_kw:
+                    _actual_meals = set()
+                    _match_count = 0
+                    for h_item in simplified:
+                        _tour_data = h_item.get("tour") or {}
+                        _meal_str = (_tour_data.get("meal") or "").lower()
+                        if _meal_str:
+                            _actual_meals.add(_tour_data.get("meal", ""))
+                        if any(kw in _meal_str for kw in _req_meal_kw):
+                            _match_count += 1
+                    if _match_count == 0 and _actual_meals:
+                        _req_name = {7: "всё включено", 9: "ультра всё включено", 3: "завтраки",
+                                     4: "полупансион", 5: "полный пансион", 6: "расш. полупансион",
+                                     8: "расш. полный пансион", 2: "без питания"}.get(_req_meal_code, "")
+                        _actual_list = ", ".join(sorted(_actual_meals))
+                        _result_hint += (
+                            f" ⚠️ ВАЖНО: клиент просил '{_req_name}', но в карточках — {_actual_list}. "
+                            f"ОБЯЗАТЕЛЬНО предупреди: «По вашему запросу '{_req_name}' варианты не найдены, "
+                            f"показаны варианты с {_actual_list.lower()}.»"
+                        )
+                        logger.warning("🍽️ MEAL MISMATCH: requested=%s(%d) actual=%s", _req_name, _req_meal_code, _actual_list)
+
             return {
                 "hotels_found": status.get("hotelsfound", len(hotels)),
                 "tours_found": status.get("toursfound", 0),
                 "hotels": ai_hotels,
-                "_hint": "Карточки с фото, ценами, датами, питанием, звёздами УЖЕ отображены фронтендом. НЕ перечисляй отели, цены, описания, даты, питание, звёзды в тексте! Напиши ТОЛЬКО краткий комментарий (1-2 предложения) и спроси клиента."
+                "_hint": _result_hint
             }
         
         elif name == "get_dictionaries":
@@ -2751,12 +3003,15 @@ class YandexGPTHandler:
             await loop.run_in_executor(None, self._wait_prefetch, _tid_str)
             if _tid_str in self._tour_details_cache:
                 logger.info("PREFETCH CACHE HIT tourid=%s — skipping API call", _tid_str)
-                result = self._tour_details_cache.pop(_tid_str)
+                result = self._tour_details_cache[_tid_str]
             else:
                 result = await self.tourvisor.get_tour_details(
                     tour_id=args["tourid"],
                     currency=args.get("currency", 0)
                 )
+                if isinstance(result, dict) and not result.get("iserror"):
+                    self._tour_details_cache[_tid_str] = result
+                    logger.info("ACTDETAIL CACHED tourid=%s for reuse", _tid_str)
             
             # Fix F2 + C4: При iserror от actdetail — сначала проверяем кэш, потом параллельный fallback
             if isinstance(result, dict) and result.get("iserror") and self._tourid_map:
@@ -2766,7 +3021,14 @@ class YandexGPTHandler:
                     alt_tid = entry["tourid"]
                     if alt_tid != current_tid and alt_tid in self._tour_details_cache:
                         logger.info("✅ ACTDETAIL FALLBACK from CACHE: tourid %s (%s)", alt_tid, entry.get("hotelname", "?"))
-                        result = self._tour_details_cache.pop(alt_tid)
+                        result = {**self._tour_details_cache[alt_tid]}
+                        result["_fallback_note"] = (
+                            f"Данные о перелёте получены от ДРУГОГО тура из выдачи "
+                            f"(отель: {entry.get('hotelname', '?')}). "
+                            f"Рейсы типичны для данного направления. "
+                            f"Покажи клиенту данные о рейсе, добавь: "
+                            f"«Точные рейсы будут подтверждены при бронировании.»"
+                        )
                         break
 
                 if isinstance(result, dict) and result.get("iserror"):
@@ -2796,7 +3058,14 @@ class YandexGPTHandler:
                             if alt_result is not None:
                                 alt_tid = alt_entries[i][1]["tourid"]
                                 logger.info("✅ ACTDETAIL FALLBACK SUCCESS: alt tourid %s returned flight data", alt_tid)
-                                result = alt_result
+                                result = {**alt_result}
+                                result["_fallback_note"] = (
+                                    f"Данные о перелёте получены от ДРУГОГО тура из выдачи "
+                                    f"(отель: {alt_entries[i][1].get('hotelname', '?')}). "
+                                    f"Рейсы типичны для данного направления. "
+                                    f"Покажи клиенту данные о рейсе, добавь: "
+                                    f"«Точные рейсы будут подтверждены при бронировании.»"
+                                )
                                 break
 
             if isinstance(result, dict) and result.get("iserror"):
@@ -2838,6 +3107,38 @@ class YandexGPTHandler:
                             break
                     _container["flights"] = [_default]
                     logger.info("✂️ ACTDETAIL TRIMMED: %d → 1 flight option (removed alternatives)", len(_all_flights))
+
+            # Strip decorative fields from flight segments to reduce JSON size
+            # (~336 chars saved per segment; 4 segments = ~1344 chars)
+            if isinstance(result, dict) and not result.get("iserror"):
+                _sc = result.get("data") if isinstance(result.get("data"), dict) else result
+                _sf = _sc.get("flights") if isinstance(_sc, dict) else None
+                if isinstance(_sf, list):
+                    for _f in _sf:
+                        if not isinstance(_f, dict):
+                            continue
+                        for _dir in ("forward", "backward"):
+                            for _leg in (_f.get(_dir) or []):
+                                if not isinstance(_leg, dict):
+                                    continue
+                                _co = _leg.get("company")
+                                if isinstance(_co, dict):
+                                    _co.pop("thumb", None)
+                                    _co.pop("logo", None)
+                                    _co.pop("id", None)
+                                for _pt in ("departure", "arrival"):
+                                    _p = _leg.get(_pt)
+                                    if isinstance(_p, dict):
+                                        _port = _p.get("port")
+                                        if isinstance(_port, dict):
+                                            _port.pop("id", None)
+                                            _port.pop("timeZone", None)
+                                            _port.pop("shortName", None)
+                                _leg.pop("fuelCharges", None)
+                                _leg.pop("plane", None)
+                                _leg.pop("class", None)
+                                _leg.pop("onDemand", None)
+                                _leg.pop("noPlaces", None)
 
             return result
         
@@ -3567,6 +3868,12 @@ class YandexGPTHandler:
 
                 # Sentence-level dedup (catches intra-paragraph question repeats)
                 final_text = _dedup_sentences(final_text)
+
+                # Fix merged questions (?Capital → ?\n\nCapital) and duplicate question tails
+                final_text = _fix_merged_questions(final_text)
+
+                # Grammar fixes and forbidden promises compliance
+                final_text = _apply_grammar_and_compliance(final_text)
 
                 # Strip orphaned dialogue-continuation fragments after last '?'
                 final_text = _strip_trailing_fragment(final_text)

@@ -335,7 +335,9 @@ def _log_chat_to_db(session_id: str, user_message: str, reply: str,
                      model_name: str = "unknown",
                      ip_address: str = None, user_agent: str = None,
                      history_snapshot: list = None,
-                     assistant_id: str = None):
+                     assistant_id: str = None,
+                     search_result: dict = None,
+                     api_calls_log: list = None):
     """
     Записать в PostgreSQL ПОЛНЫЙ ПУТЬ без исключений:
     - КАЖДАЯ запись из history_snapshot (user, assistant, tool, синтетические retry)
@@ -421,7 +423,13 @@ def _log_chat_to_db(session_id: str, user_message: str, reply: str,
                     msg_count += 1
 
                     if tc_data:
-                        _log_tour_searches(db, conv.id, tc_data, tour_cards=tour_cards)
+                        _log_tour_searches(
+                            db,
+                            conv.id,
+                            tc_data,
+                            tour_cards=tour_cards,
+                            search_result=search_result,
+                        )
 
             if not final_reply_in_snapshot:
                 if not history_snapshot:
@@ -466,11 +474,28 @@ def _log_chat_to_db(session_id: str, user_message: str, reply: str,
                 if check_conversation_booking_intent(user_texts):
                     conv.has_booking_intent = True
 
+            if api_calls_log:
+                try:
+                    from models import ApiCall
+                    for ac in api_calls_log:
+                        db.add(ApiCall(
+                            conversation_id=conv.id,
+                            service=ac.get("service", "unknown"),
+                            endpoint=ac.get("endpoint", ""),
+                            response_code=ac.get("response_code"),
+                            response_bytes=ac.get("response_bytes"),
+                            tokens_used=ac.get("tokens_used"),
+                            latency_ms=ac.get("latency_ms", 0),
+                            error=ac.get("error"),
+                        ))
+                except Exception:
+                    pass
+
     except Exception as e:
         logger.warning("DB logging failed (non-critical): %s", e)
 
 
-def _log_tour_searches(db, conv_id, tool_calls_data, tour_cards=None):
+def _log_tour_searches(db, conv_id, tool_calls_data, tour_cards=None, search_result=None):
     """Извлечь параметры поисков туров из tool_calls и записать в tour_searches."""
     try:
         from models import TourSearch
@@ -531,6 +556,10 @@ def _log_tour_searches(db, conv_id, tool_calls_data, tour_cards=None):
                 hotels_found=hotels_found,
                 min_price=min_price,
             )
+            if search_result:
+                search.hotels_found = search_result.get("hotels_found")
+                search.tours_found = search_result.get("tours_found")
+                search.min_price = search_result.get("min_price")
             db.add(search)
     except Exception as e:
         logger.warning("_log_tour_searches failed: %s", e)
@@ -833,7 +862,9 @@ def chat():
         _latency_ms = int((time.perf_counter() - g._req_start) * 1000) if hasattr(g, '_req_start') else None
         _log_chat_to_db(session_id, message, response, tour_cards,
                         _latency_ms, model_name=getattr(handler, 'model', 'unknown'),
-                        history_snapshot=_new_entries)
+                        history_snapshot=_new_entries,
+                        search_result=getattr(handler, '_last_search_result', None),
+                        api_calls_log=getattr(handler, '_pending_api_calls', None))
         
         return jsonify({'response': response})
     except Exception as e:
@@ -906,6 +937,9 @@ def chat_v1():
 
         tour_cards = list(handler._pending_tour_cards)
         handler._pending_tour_cards = []
+        _api_calls_snapshot = list(getattr(handler, '_pending_api_calls', []))
+        if hasattr(handler, '_pending_api_calls'):
+            handler._pending_api_calls.clear()
 
         _write_dialogue_log(session_id, "ASSISTANT", reply)
 
@@ -932,7 +966,9 @@ def chat_v1():
         _log_chat_to_db(session_id, message, reply, tour_cards, _latency_ms,
                         model_name=getattr(handler, 'model', 'unknown'),
                         history_snapshot=_new_entries,
-                        assistant_id=assistant_id)
+                        assistant_id=assistant_id,
+                        search_result=getattr(handler, '_last_search_result', None),
+                        api_calls_log=_api_calls_snapshot)
 
         return jsonify({
             'reply': reply,
@@ -1019,6 +1055,9 @@ def chat_stream():
                 _new_entries = handler.full_history[_hist_before:]
                 _tour_cards = getattr(handler, '_pending_tour_cards', []) or []
                 handler._pending_tour_cards = []
+                _stream_api_calls = list(getattr(handler, '_pending_api_calls', []))
+                if hasattr(handler, '_pending_api_calls'):
+                    handler._pending_api_calls.clear()
                 result['response'] = response
                 result['tour_cards'] = _tour_cards
                 log(f"✅ Ответ получен: {len(response)} символов, {token_count[0]} токенов", "OK")
@@ -1030,7 +1069,9 @@ def chat_stream():
                                 model_name=getattr(handler, 'model', 'unknown'),
                                 ip_address=_stream_ip, user_agent=_stream_ua,
                                 history_snapshot=_new_entries,
-                                assistant_id=_stream_assistant_id)
+                                assistant_id=_stream_assistant_id,
+                                search_result=getattr(handler, '_last_search_result', None),
+                                api_calls_log=_stream_api_calls)
                 token_queue.put(('done', response))
             except Exception as e:
                 result['error'] = str(e)

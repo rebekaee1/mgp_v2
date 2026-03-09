@@ -105,6 +105,9 @@ class OpenAIHandler(YandexGPTHandler):
         # Collected cascade slots — injected as system message to prevent "forgetting"
         self._collected_slots: Dict[str, str] = {}
 
+        # 0 = не показывали, 1 = мягкое (60 msgs), 2 = финальное (72 msgs)
+        self._context_warning_stage = 0
+
         # Build OpenAI-formatted tools from function_schemas.json
         self.openai_tools = self._build_openai_tools()
 
@@ -112,6 +115,27 @@ class OpenAIHandler(YandexGPTHandler):
             "🤖 OpenAIHandler INIT  model=%s  tools=%d",
             self.model, len(self.openai_tools)
         )
+
+    # ─── Argument sanitizer ──────────────────────────────────────────────
+
+    @staticmethod
+    def _sanitize_arguments(arguments: str) -> str:
+        """Strip \\r, trailing garbage, and self-correction narratives from model JSON."""
+        if not arguments:
+            return "{}"
+        cleaned = arguments.replace('\r', '').replace('\t', ' ')
+        brace_end = cleaned.rfind('}')
+        if brace_end >= 0 and brace_end < len(cleaned) - 1:
+            cleaned = cleaned[:brace_end + 1]
+        brace_start = cleaned.find('{')
+        if brace_start > 0:
+            cleaned = cleaned[brace_start:]
+        if len(cleaned) > 2000:
+            cleaned = cleaned[:2000]
+            brace_end = cleaned.rfind('}')
+            if brace_end > 0:
+                cleaned = cleaned[:brace_end + 1]
+        return cleaned
 
     # ─── Tools ────────────────────────────────────────────────────────────
 
@@ -224,13 +248,16 @@ class OpenAIHandler(YandexGPTHandler):
         "Город вылета": [
             (r'\b(?:москв|питер|спб|санкт.?петербург|екатеринбург|екб|казан[ьи]|'
              r'новосибирск|нск|краснодар|красноярск|ростов|уф[аеы]|пермь?|'
-             r'челябинск|самар[аеу]|нижн\w+ новгород|сочи)\w*', None),
+             r'челябинск|самар[аеу]|нижн\w+ новгород)\w*', None),
             (r'без\s*перел[её]т', "без перелёта"),
         ],
         "Даты": [
             (r'(\d{1,2}[./]\d{1,2}(?:[./]\d{2,4})?)', None),
             (r'(\d{1,2})\s+(?:января|февраля|марта|апреля|мая|июня|июля|августа|'
              r'сентября|октября|ноября|декабря)', None),
+            (r'ближайш\w*\s*(?:вылет|дат|рейс)?', "ближайший вылет"),
+            (r'(?:всё?\s*равно|не\s*важно|неважно)\s*когда', "ближайший вылет"),
+            (r'какой\s+есть\s+(?:вылет|рейс)', "ближайший вылет"),
         ],
         "Длительность": [
             (r'(\d+)\s*(?:ноч|ночей)', None),
@@ -259,6 +286,34 @@ class OpenAIHandler(YandexGPTHandler):
             (r'(\d)\s*(?:звёзд|звезд|★|\*)', None),
             (r'\b(люб\w+)\b.*(?:звёзд|звезд|★|\*|категори|вариант)', "любая"),
         ],
+        "Отель": [
+            # Латинские бренды (международные сети и турецкие/мировые цепочки)
+            (r'\b(?:rixos|hilton|delphin|swissotel|kempinski|calista|titanic|gloria|'
+             r'regnum|maxx\s*royal|limak|barut|voyage|selectum|papillon|granada|'
+             r'nirvana|ic\s+hotels?|ela\s+quality|xanadu|trendy|liberty|sueno|'
+             r'crystal|adalya|orange\s*county|club\s*sera|starlight|lara\s*barut|'
+             r'sheraton|marriott|radisson|accor|hyatt|intercontinental|iberostar|'
+             r'vinpearl|centara|pullman|novotel|melia|riu|sandals|cornelia|'
+             r'susesi|cullinan|dobedan|tui\s*blue|amara|royal\s*wings|bellis|'
+             r'max\s*royal|asteria|kirman|side\s*star|pine\s*bay|paloma|kaya|'
+             r'vogue|amelia|utopia|siam\s*elegant|four\s*seasons|ritz|w\s+hotel|'
+             r'jw\s+marriott|st\.\s*regis|waldorf|conrad|sofitel|fairmont)\b', None),
+            # Кириллические бренды (как пользователь может написать)
+            (r'\b(?:риксос|хилтон|дельфин|шератон|марриотт|радиссон|калиста|'
+             r'титаник|глория|регнум|лимак|барут|макс\s*роял|кемпински|'
+             r'свиссотель|ибэростар|хаятт|интерконтиненталь|пульман|новотель|'
+             r'фор\s*сизонс|мелиа|амара|палома|астериа|вояж|корнелиа|утопия)\b', None),
+            # Российские отели (Сочи, Крым, Абхазия, КМВ) — кириллица И латиница
+            (r'\b(?:аквамарин|аквалоо|бридж\s*резорт|космос|жемчужина|литфонд|'
+             r'маринс\s*парк|богатырь|имеретинск|бархатн\w*|сириус|санрайз|'
+             r'sunrise|bridge\s*resort|marins\s*park|bogatyr|mriya|мрия|'
+             r'swissotel\s*сочи|гранд\s*отель|парк\s*инн|рэдиссон|азимут|'
+             r'cosmos|amaks|амакс|alean|алеан|rosa\s*khutor|роза\s*хутор|'
+             r'горки\s*город|radisson\s*rosa|green\s*park|грин\s*парк|'
+             r'гранд\s*каньон)\b', None),
+            # Контекстный паттерн: "отель X" / "hotel X" / "в отеле X"
+            (r'(?:(?:в\s+)?отел[ьеи]|hotel)\s+([а-яёa-z]{3,})', None),
+        ],
     }
 
     def _update_collected_slots(self, user_message: str):
@@ -272,6 +327,22 @@ class OpenAIHandler(YandexGPTHandler):
                     self._collected_slots[slot_name] = value
                     break
 
+        # Date-range → nights: "с 16 по 28 апреля" = 12 ночей
+        _range_m = re.search(
+            r'с\s+(\d{1,2})\s*(?:по|до)\s*(\d{1,2})\s*'
+            r'(?:январ|феврал|март|апрел|ма[яй]|июн|июл|август|'
+            r'сентябр|октябр|ноябр|декабр)',
+            text, re.IGNORECASE
+        )
+        if _range_m:
+            _day_from = int(_range_m.group(1))
+            _day_to = int(_range_m.group(2))
+            _nights = _day_to - _day_from
+            if 1 <= _nights <= 30:
+                self._collected_slots["Даты"] = _range_m.group(0)
+                self._collected_slots["Длительность"] = f"{_nights} ночей"
+                logger.debug("📌 NIGHTS-FROM-RANGE: %d ночей из '%s'", _nights, _range_m.group(0))
+
         # Context-aware: bare "любой/любая/без разницы" → check what model asked
         if re.match(r'^(?:любой|любая|любые|без разницы|все равно|всё равно|неважно|не важно)$', text):
             last_assistant = ""
@@ -284,8 +355,27 @@ class OpenAIHandler(YandexGPTHandler):
             elif any(w in last_assistant for w in ("питани", "meal")):
                 self._collected_slots["Питание"] = "любое"
 
+        # Авто-заполнение звёздности при обнаружении отеля/бренда
+        if "Отель" in self._collected_slots and "Звёздность" not in self._collected_slots:
+            self._collected_slots["Звёздность"] = "авто (из каталога отеля, НЕ спрашивать)"
+            logger.debug("📌 HOTEL-AUTO-STARS: %s -> stars auto", self._collected_slots["Отель"])
+
         if self._collected_slots:
             logger.debug("📌 SLOTS: %s", self._collected_slots)
+
+    # ─── Context Summary (for limit warning) ───────────────────────────────
+
+    def _build_context_summary(self) -> str:
+        """Собрать сводку параметров клиента для предупреждения о лимите."""
+        lines = []
+        if self._collected_slots:
+            for k, v in self._collected_slots.items():
+                lines.append(f"  {k}: {v}")
+        if self._pinned_context:
+            for line in self._pinned_context.split("\n"):
+                if line.strip() and not line.startswith("["):
+                    lines.append(f"  {line.strip()}")
+        return "\n".join(lines)
 
     # ─── History Trimming (tool_call-aware) ───────────────────────────────
 
@@ -409,7 +499,9 @@ class OpenAIHandler(YandexGPTHandler):
 
                 # Token usage logging
                 usage = response.usage
+                _total_tokens = None
                 if usage:
+                    _total_tokens = usage.total_tokens
                     logger.info(
                         "🤖 OPENAI API <<  %dms  finish=%s  "
                         "tokens: prompt=%d completion=%d total=%d",
@@ -422,6 +514,14 @@ class OpenAIHandler(YandexGPTHandler):
                         "🤖 OPENAI API <<  %dms  finish=%s",
                         api_ms, finish_reason
                     )
+
+                self._pending_api_calls.append({
+                    "service": "openai",
+                    "endpoint": f"chat.completions/{self.model}",
+                    "response_code": 200,
+                    "tokens_used": _total_tokens,
+                    "latency_ms": api_ms,
+                })
 
             except Exception as e:
                 api_ms = int((time.perf_counter() - t0) * 1000)
@@ -550,16 +650,24 @@ class OpenAIHandler(YandexGPTHandler):
                 _LARGE_FUNCS = {
                     'get_search_results', 'get_hotel_info', 'get_hot_tours'
                 }
+                _DETAIL_FUNCS = {
+                    'get_tour_details'
+                }
 
                 def _truncate_tool_output(func_name, output):
-                    limit = 2000 if func_name in _LARGE_FUNCS else 1000
+                    if func_name in _DETAIL_FUNCS:
+                        limit = 4000
+                    elif func_name in _LARGE_FUNCS:
+                        limit = 2000
+                    else:
+                        limit = 1000
                     if len(output) > limit:
                         return output[:limit] + "…"
                     return output
 
                 if len(message.tool_calls) == 1:
                     tc = message.tool_calls[0]
-                    arguments = tc.function.arguments or "{}"
+                    arguments = self._sanitize_arguments(tc.function.arguments or "{}")
                     result = await self._execute_function(
                         tc.function.name, arguments, tc.id
                     )
@@ -572,7 +680,7 @@ class OpenAIHandler(YandexGPTHandler):
                     })
                 else:
                     async def _exec_tool_call(tool_call):
-                        args = tool_call.function.arguments or "{}"
+                        args = self._sanitize_arguments(tool_call.function.arguments or "{}")
                         return (
                             tool_call.id,
                             tool_call.function.name,
@@ -674,6 +782,91 @@ class OpenAIHandler(YandexGPTHandler):
                 })
                 continue
 
+            # Safety-net: bot asks about dates but user said "ближайший"
+            _asks_date = re.search(
+                r'(?:как\w+\s*месяц|какие\s*дат|когда\s*план|на\s*как\w+\s*месяц|'
+                r'промежут\w*\s*дат|уточн\w+\s*дат)',
+                final_text, re.IGNORECASE
+            )
+            if _asks_date:
+                _user_said_nearest = any(
+                    re.search(r'ближайш|всё?\s*равно.*когда|неважно\s*когда|не\s*важно\s*когда',
+                              m.get("content", ""), re.IGNORECASE)
+                    for m in self.full_history[-8:] if m.get("role") == "user"
+                )
+                if _user_said_nearest:
+                    empty_retries += 1
+                    logger.warning(
+                        "⚠️ DATE-ASK-OVERRIDE: bot asks date but user said 'ближайший' (#%d)",
+                        empty_retries
+                    )
+                    if empty_retries < 2:
+                        self.full_history.append({"role": "assistant", "content": final_text})
+                        self.full_history.append({"role": "user", "content":
+                            "СИСТЕМНАЯ ОШИБКА: Клиент сказал 'ближайший вылет'. "
+                            "НЕ спрашивай дату! НЕМЕДЛЕННО вызови search_tours "
+                            "с datefrom=завтра, dateto=+14 дней. "
+                            "Слот Даты ЗАПОЛНЕН."
+                        })
+                        continue
+
+            # Safety-net: bot asks about nights but user gave "с X по Y"
+            _asks_nights = re.search(
+                r'(?:сколько\s*ноч|на\s*сколько\s*ноч|длительн|количеств\w*\s*ноч)',
+                final_text, re.IGNORECASE
+            )
+            if _asks_nights:
+                _all_user = " ".join(
+                    m.get("content", "") for m in self.full_history[-8:]
+                    if m.get("role") == "user"
+                ).lower()
+                _range_match = re.search(
+                    r'с\s+(\d{1,2})\s*(?:по|до)\s*(\d{1,2})\s*'
+                    r'(?:январ|феврал|март|апрел|ма[яй]|июн|июл|август|'
+                    r'сентябр|октябр|ноябр|декабр)',
+                    _all_user, re.IGNORECASE
+                )
+                if _range_match:
+                    _n = int(_range_match.group(2)) - int(_range_match.group(1))
+                    if 1 <= _n <= 30:
+                        empty_retries += 1
+                        logger.warning(
+                            "⚠️ NIGHTS-ASK-OVERRIDE: bot asks nights but range=%d (#%d)",
+                            _n, empty_retries
+                        )
+                        if empty_retries < 2:
+                            self.full_history.append({"role": "assistant", "content": final_text})
+                            self.full_history.append({"role": "user", "content":
+                                f"СИСТЕМНАЯ ОШИБКА: Клиент указал 'с {_range_match.group(1)} "
+                                f"по {_range_match.group(2)}' = {_n} ночей. НЕ спрашивай ночи! "
+                                f"nightsfrom={_n}, nightsto={_n}. "
+                                f"НЕМЕДЛЕННО вызови search_tours."
+                            })
+                            continue
+
+            # Safety-net: bot asks about stars but user named a specific hotel/brand
+            _asks_stars = re.search(
+                r'(?:как\w+\s*(?:категори|звёзд)|какую?\s*(?:категори|звёзд)|'
+                r'сколько\s*звёзд|звёздност\w*\s*(?:отел|предпочит)|'
+                r'категори\w+\s*отел)',
+                final_text, re.IGNORECASE
+            )
+            if _asks_stars and "Отель" in self._collected_slots:
+                empty_retries += 1
+                logger.warning(
+                    "⚠️ STARS-ASK-OVERRIDE: bot asks stars but hotel='%s' (#%d)",
+                    self._collected_slots["Отель"], empty_retries
+                )
+                if empty_retries < 2:
+                    self.full_history.append({"role": "assistant", "content": final_text})
+                    self.full_history.append({"role": "user", "content":
+                        f"СИСТЕМНАЯ ОШИБКА: Клиент назвал конкретный отель "
+                        f"'{self._collected_slots['Отель']}'. НЕ спрашивай звёздность! "
+                        f"Звёздность определяется автоматически из каталога. "
+                        f"Найди отель через get_dictionaries(type=hotel) и продолжи."
+                    })
+                    continue
+
             # Promised search detection (safety-net)
             if _is_promised_search(final_text):
                 empty_retries += 1
@@ -768,10 +961,59 @@ class OpenAIHandler(YandexGPTHandler):
             final_text = _RE_FUNC_NAMES.sub('', final_text)
             final_text = re.sub(r'\s{2,}', ' ', final_text).strip()
 
+            # Hide technical error messages from user
+            final_text = re.sub(
+                r'(?:возникла\s+)?техническ\w+\s+ошибк\w+',
+                'не удалось выполнить поиск',
+                final_text, flags=re.IGNORECASE
+            )
+
             # Save to history
             self.full_history.append({
                 "role": "assistant", "content": final_text
             })
+
+            # ── Context limit warning ──
+            _hist_len = len(self.full_history)
+            _is_error_response = final_text.startswith(("Извините", "Произошла", "К сожалению"))
+
+            if not _is_error_response and self._context_warning_stage < 2:
+                _WARNING_SOFT = 60
+                _WARNING_HARD = 72
+
+                if _hist_len >= _WARNING_HARD and self._context_warning_stage < 2:
+                    summary = self._build_context_summary()
+                    warning = (
+                        "\n\n---\n"
+                        "Диалог подходит к завершению. Рекомендую связаться с менеджером: "
+                        "+7 (499) 685-25-57 или начать новый чат."
+                    )
+                    if summary:
+                        warning += (
+                            "\nВот данные из нашего разговора, чтобы не пришлось повторять:\n"
+                            + summary
+                        )
+                    final_text += warning
+                    self._context_warning_stage = 2
+                    logger.info(
+                        "⚠️ CONTEXT-WARNING stage=2 (hard)  history=%d",
+                        _hist_len
+                    )
+
+                elif _hist_len >= _WARNING_SOFT and self._context_warning_stage < 1:
+                    final_text += (
+                        "\n\n---\n"
+                        "Наш диалог уже достаточно длинный. Для максимального "
+                        "качества подбора рекомендую связаться с менеджером "
+                        "по телефону +7 (499) 685-25-57 — он поможет оформить "
+                        "бронирование и ответит на все вопросы. "
+                        "Также вы можете начать новый чат."
+                    )
+                    self._context_warning_stage = 1
+                    logger.info(
+                        "⚠️ CONTEXT-WARNING stage=1 (soft)  history=%d",
+                        _hist_len
+                    )
 
             total_ms = int((time.perf_counter() - chat_start) * 1000)
             logger.info(
@@ -876,6 +1118,7 @@ class OpenAIHandler(YandexGPTHandler):
         self._user_stated_budget = None
         self._empty_iterations = 0
         self.previous_response_id = None
+        self._context_warning_stage = 0
         self._metrics = {
             "promised_search_detections": 0,
             "cascade_incomplete_detections": 0,

@@ -56,6 +56,7 @@ class TourVisorClient:
         self.base_url = os.getenv("TOURVISOR_BASE_URL", "https://tourvisor.ru/xml")
         self.auth_login = os.getenv("TOURVISOR_AUTH_LOGIN")
         self.auth_pass = os.getenv("TOURVISOR_AUTH_PASS")
+        self.api_call_log: List[Dict] = []
     
     async def _request(self, endpoint: str, params: Dict[str, Any] = None, timeout: Optional[float] = None) -> Dict:
         """
@@ -101,9 +102,16 @@ class TourVisorClient:
         # ждать дольше бессмысленно; при ReadTimeout сработает retry P14 + fallback F2)
         _default_timeout = 30.0 if endpoint in ("actdetail.php", "actualize.php") else 30.0
         _timeout = timeout if timeout is not None else _default_timeout
-        # Fix P14: Ретрай при ReadTimeout для actdetail/actualize
-        _max_attempts = 2 if endpoint in ("actdetail.php", "actualize.php") else 1
-        for _attempt in range(_max_attempts):
+        # Fix P14: ReadTimeout retry ТОЛЬКО для actdetail/actualize
+        _max_timeout_attempts = 2 if endpoint in ("actdetail.php", "actualize.php") else 1
+        # DNS/network retry для расширенного набора endpoint'ов
+        _network_retry_endpoints = {"actdetail.php", "actualize.php", "search.php", "result.php", "list.php"}
+        _max_network_attempts = 3 if endpoint in _network_retry_endpoints else 1
+
+        _timeout_attempts_done = 0
+        _network_attempts_done = 0
+        _total_max = max(_max_timeout_attempts, _max_network_attempts) * 2
+        for _loop in range(_total_max):
             try:
                 async with httpx.AsyncClient(timeout=_timeout) as client:
                     response = await client.get(url, params=params)
@@ -112,16 +120,17 @@ class TourVisorClient:
                                 endpoint, response.status_code, elapsed_ms, len(response.content))
                     response.raise_for_status()
                     data = response.json()
-                break  # Успешно — выходим из цикла
+                break
             except httpx.ReadTimeout:
+                _timeout_attempts_done += 1
                 elapsed_ms = int((time.perf_counter() - t0) * 1000)
-                if _attempt < _max_attempts - 1:
+                if _timeout_attempts_done < _max_timeout_attempts:
                     logger.warning("⏱️ TOURVISOR TIMEOUT %s  %dms — retrying (attempt %d/%d)",
-                                   endpoint, elapsed_ms, _attempt + 1, _max_attempts)
+                                   endpoint, elapsed_ms, _timeout_attempts_done, _max_timeout_attempts)
                     t0 = time.perf_counter()
                     continue
                 logger.error("🌐 TOURVISOR !! %s  TIMEOUT  %dms  (all %d attempts failed)",
-                             endpoint, elapsed_ms, _max_attempts)
+                             endpoint, elapsed_ms, _max_timeout_attempts)
                 self._log_api_call(endpoint, 0, 0, elapsed_ms, error="ReadTimeout")
                 raise
             except httpx.HTTPStatusError as e:
@@ -132,17 +141,33 @@ class TourVisorClient:
                                    error=str(e)[:500])
                 raise
             except httpx.RequestError as e:
+                _network_attempts_done += 1
                 elapsed_ms = int((time.perf_counter() - t0) * 1000)
-                logger.error("🌐 TOURVISOR !! %s  NETWORK ERROR  %dms  error=%s",
-                             endpoint, elapsed_ms, str(e)[:200])
+                if _network_attempts_done < _max_network_attempts:
+                    logger.warning("🔄 TOURVISOR DNS/NETWORK %s  %dms — retrying (attempt %d/%d): %s",
+                                   endpoint, elapsed_ms, _network_attempts_done, _max_network_attempts, str(e)[:150])
+                    await asyncio.sleep(1)
+                    t0 = time.perf_counter()
+                    continue
+                logger.error("🌐 TOURVISOR !! %s  NETWORK ERROR  %dms  (all %d attempts failed): %s",
+                             endpoint, elapsed_ms, _max_network_attempts, str(e)[:200])
                 self._log_api_call(endpoint, 0, 0, elapsed_ms, error=str(e)[:500])
                 raise
         
         # Логируем ключевые поля ответа
+        _final_elapsed = int((time.perf_counter() - t0) * 1000) if 'elapsed_ms' not in dir() else elapsed_ms
         preview = json.dumps(data, ensure_ascii=False, default=str)
         if len(preview) > 500:
             preview = preview[:500] + "…"
         logger.debug("🌐 TOURVISOR << %s  body=%s", endpoint, preview)
+
+        self.api_call_log.append({
+            "service": "tourvisor",
+            "endpoint": endpoint,
+            "response_code": response.status_code if 'response' in dir() else None,
+            "response_bytes": len(response.content) if 'response' in dir() else None,
+            "latency_ms": _final_elapsed,
+        })
         
         # --- Запись в api_calls (PostgreSQL) ---
         self._log_api_call(endpoint, response.status_code, len(response.content), elapsed_ms)

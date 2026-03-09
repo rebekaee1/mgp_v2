@@ -449,10 +449,12 @@ body.mgp-demo {
     display: none;
     font-size: 12px;
     line-height: 1.4;
+    animation: fadeIn 0.4s ease;
     color: var(--mgp-text-muted);
     font-style: italic;
-    animation: fadeIn 0.4s ease;
-    white-space: nowrap;
+    white-space: normal;
+    max-width: 240px;
+    overflow-wrap: break-word;
     padding: 2px 0 4px;
 }
 
@@ -464,6 +466,7 @@ body.mgp-demo {
     border-radius: 18px;
     border-bottom-left-radius: 6px;
     box-shadow: var(--mgp-shadow-light);
+    width: fit-content;
 }
 
 #mgp-chat-root .typing-dots span {
@@ -505,6 +508,7 @@ body.mgp-demo {
     display: flex;
     flex-direction: row;
     gap: 12px;
+    align-items: stretch;
     overflow-x: auto;
     overflow-y: hidden;
     padding: 4px 4px 12px 4px;
@@ -595,6 +599,8 @@ body.mgp-demo {
     width: 240px;
     max-width: 240px;
     flex-shrink: 0;
+    display: flex;
+    flex-direction: column;
     scroll-snap-align: start;
     background: var(--mgp-white);
     border-radius: 10px;
@@ -690,7 +696,12 @@ body.mgp-demo {
     box-shadow: 0 1px 4px rgba(0, 0, 0, 0.15);
 }
 
-#mgp-chat-root .tour-card-body { padding: 10px 12px 12px; }
+#mgp-chat-root .tour-card-body {
+    padding: 10px 12px 12px;
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+}
 
 #mgp-chat-root .tour-card-hotel {
     font-size: 13px;
@@ -773,7 +784,12 @@ body.mgp-demo {
 #mgp-chat-root .tour-card-price-per-person { font-size: 10px; color: var(--mgp-text-muted); text-align: right; }
 #mgp-chat-root .tour-card-price-per-person strong { color: var(--mgp-text-light); font-weight: 600; }
 
-#mgp-chat-root .tour-card-actions { display: flex; flex-direction: column; gap: 6px; }
+#mgp-chat-root .tour-card-actions {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    margin-top: auto;
+}
 
 #mgp-chat-root .btn-book {
     display: flex;

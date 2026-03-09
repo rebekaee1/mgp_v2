@@ -451,10 +451,9 @@
         const nightsWord = getNightsWord(nights);
         
         const price = formatPrice(tour.price);
-        /* [M3] Calculate price per person when not provided by API */
         const pricePerPerson = tour.price_per_person 
             ? formatPrice(tour.price_per_person) 
-            : (tour.price ? formatPrice(Math.round(tour.price / 2)) : null);
+            : null;
         
         const rawMeal = tour.meal_description || getMealDescription(tour.food_type);
         const mealDesc = cleanMealDescription(rawMeal) || rawMeal;
@@ -886,7 +885,7 @@
                 </div>
                 <div class="message-content">
                     <div class="message-bubble">
-                        Извините, произошла ошибка соединения.
+                        К сожалению, не удалось получить ответ. Попробуйте повторить запрос или позвоните менеджеру: +7 (499) 685-25-57
                         <div class="error-actions">
                             <button class="btn-retry" data-action="retry">🔄 Повторить</button>
                             <button class="btn-retry btn-new-chat" data-action="new-chat">💬 Новый чат</button>
