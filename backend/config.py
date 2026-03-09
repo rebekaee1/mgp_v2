@@ -49,7 +49,7 @@ class Settings(BaseSettings):
     # --- Widget ---
     widget_host_url: str = ""
     lk_widget_loader_url: str = "https://lk.navilet.ru/widget-loader.js"
-    runtime_mode: str = "legacy-web"  # legacy-web | backend-only
+    runtime_mode: str = "backend-only"  # legacy-web | backend-only
     backend_port: int = 8080
 
     # --- Rate Limiting ---

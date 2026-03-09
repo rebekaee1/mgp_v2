@@ -56,7 +56,7 @@ app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_prefix=1)
 
 _MAX_MESSAGE_LENGTH = 2000
 _MAX_SESSIONS = 500
-_RUNTIME_MODE = os.getenv("RUNTIME_MODE", "legacy-web").strip().lower()
+_RUNTIME_MODE = os.getenv("RUNTIME_MODE", "backend-only").strip().lower()
 _PUBLIC_WIDGET_ROUTES_ENABLED = _RUNTIME_MODE != "backend-only"
 
 # === ИНИЦИАЛИЗАЦИЯ ИНФРАСТРУКТУРЫ (PostgreSQL, Redis) ===
