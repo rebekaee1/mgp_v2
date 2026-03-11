@@ -671,9 +671,28 @@ def _log_chat_to_db(session_id: str, user_message: str, reply: str,
             msg_count = 0
             final_reply_in_snapshot = False
             tool_outputs_by_call_id = {}
+            snapshot_entries = list(history_snapshot or [])
 
-            if history_snapshot:
-                for entry in history_snapshot:
+            if snapshot_entries:
+                # Some handler flows can return a snapshot that already contains tool/final
+                # assistant entries but omits the current user turn. Persist it explicitly
+                # so LK snapshots and analytics do not lose the latest user message.
+                has_current_user_in_snapshot = any(
+                    entry.get("role") == "user" and (entry.get("content") or "") == user_message
+                    for entry in snapshot_entries
+                )
+                if user_message and not has_current_user_in_snapshot:
+                    last_user_idx = -1
+                    for idx, entry in enumerate(snapshot_entries):
+                        if entry.get("role") == "user":
+                            last_user_idx = idx
+                    snapshot_entries.insert(last_user_idx + 1, {
+                        "role": "user",
+                        "content": user_message,
+                    })
+
+            if snapshot_entries:
+                for entry in snapshot_entries:
                     if entry.get("role") != "tool":
                         continue
                     tool_call_id = entry.get("tool_call_id")
@@ -686,18 +705,24 @@ def _log_chat_to_db(session_id: str, user_message: str, reply: str,
                     if isinstance(parsed_output, dict):
                         tool_outputs_by_call_id[tool_call_id] = parsed_output
 
-            if history_snapshot:
-                last_idx = len(history_snapshot) - 1
+            if snapshot_entries:
+                last_reply_idx = -1
+                for idx, entry in enumerate(snapshot_entries):
+                    if (
+                        entry.get("role") == "assistant"
+                        and not entry.get("tool_calls")
+                        and (entry.get("content") or "") == reply
+                    ):
+                        last_reply_idx = idx
 
-                for i, entry in enumerate(history_snapshot):
+                for i, entry in enumerate(snapshot_entries):
                     role = entry.get("role", "")
                     content = entry.get("content") or ""
                     tc_data = entry.get("tool_calls")
                     tc_id = entry.get("tool_call_id")
-                    is_last = (i == last_idx)
 
                     is_final_reply = (
-                        is_last and role == "assistant"
+                        i == last_reply_idx and role == "assistant"
                         and not tc_data and content == reply
                     )
 
@@ -744,7 +769,7 @@ def _log_chat_to_db(session_id: str, user_message: str, reply: str,
                         )
 
             if not final_reply_in_snapshot:
-                if not history_snapshot:
+                if not snapshot_entries:
                     db.add(Message(
                         conversation_id=conv.id,
                         role="user",
@@ -774,8 +799,8 @@ def _log_chat_to_db(session_id: str, user_message: str, reply: str,
                 conv.tour_cards_shown = (conv.tour_cards_shown or 0) + len(tour_cards)
 
             search_call_count = 0
-            if history_snapshot:
-                for entry in history_snapshot:
+            if snapshot_entries:
+                for entry in snapshot_entries:
                     for tc in (entry.get("tool_calls") or []):
                         fn = tc.get("function", {}).get("name", "")
                         if fn in ("search_tours", "get_hot_tours"):
