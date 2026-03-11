@@ -6,6 +6,7 @@ APScheduler integration for the ЛК backend.
 Periodic jobs:
   1. sync_mgp   — pull new data from remote MGP bot (every 5 min)
   2. daily_stats — aggregate daily analytics (daily at 00:30 UTC)
+  3. dialog_sender — deliver MGP -> LK runtime snapshots
 
 Integrates with Flask app via `init_scheduler(app)`.
 """
@@ -110,6 +111,17 @@ def _job_daily_stats():
         logger.exception("daily_stats job failed")
 
 
+def _job_dialog_sender():
+    """Deliver pending runtime event snapshots to LK."""
+    try:
+        from dialog_sender import run_dialog_sender_once
+        processed = run_dialog_sender_once()
+        if processed:
+            logger.info("dialog_sender processed=%d", processed)
+    except Exception:
+        logger.exception("dialog_sender job failed")
+
+
 def _is_main_process() -> bool:
     """With Gunicorn pre-fork, only the FIRST worker (or the dev server) should run the scheduler.
     Uses a file lock so that only one process wins."""
@@ -139,6 +151,7 @@ def init_scheduler(app=None):
         return None
 
     import os
+    from config import settings
     sync_enabled = os.environ.get("SYNC_MGP_ENABLED", "true").lower() in ("1", "true", "yes")
     sync_interval = int(os.environ.get("SYNC_MGP_INTERVAL_MINUTES", "5"))
 
@@ -166,6 +179,22 @@ def init_scheduler(app=None):
         max_instances=1,
     )
     logger.info("Daily stats job scheduled: 00:30 UTC")
+
+    if settings.runtime_dialog_sender_enabled:
+        _scheduler.add_job(
+            _job_dialog_sender,
+            trigger=IntervalTrigger(seconds=max(2, int(settings.runtime_dialog_sender_interval_seconds))),
+            id="dialog_sender",
+            name="Deliver runtime event snapshots",
+            replace_existing=True,
+            max_instances=1,
+        )
+        logger.info(
+            "Dialog sender job scheduled: every %d sec",
+            max(2, int(settings.runtime_dialog_sender_interval_seconds)),
+        )
+    else:
+        logger.info("Dialog sender disabled (RUNTIME_DIALOG_SENDER_ENABLED=false)")
 
     _scheduler.start()
     logger.info("Scheduler started with %d jobs", len(_scheduler.get_jobs()))

@@ -353,3 +353,42 @@ class ProvisioningRequest(Base):
         Index("ix_provisioning_requests_status", "status", "created_at"),
         Index("ix_provisioning_requests_idempotency", "idempotency_key"),
     )
+
+
+class RuntimeEventOutbox(Base):
+    """Durable outbox for MGP -> LK runtime dialog delivery."""
+    __tablename__ = "runtime_event_outbox"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    assistant_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(),
+        ForeignKey("assistants.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    conversation_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(),
+        ForeignKey("conversations.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    event_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    event_type: Mapped[str] = mapped_column(String(32), nullable=False, default="conversation_snapshot")
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="pending")
+    payload: Mapped[dict] = mapped_column(JSON, nullable=False)
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+    next_retry_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_status_code: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    last_error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    locked_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    sent_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, onupdate=_utcnow
+    )
+
+    __table_args__ = (
+        Index("uq_runtime_event_outbox_assistant_event", "assistant_id", "event_id", unique=True),
+        Index("ix_runtime_event_outbox_status_retry", "status", "next_retry_at", "created_at"),
+        Index("ix_runtime_event_outbox_conversation", "conversation_id", "created_at"),
+    )

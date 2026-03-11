@@ -11,7 +11,7 @@ import os
 import time
 import uuid
 import logging
-from flask import Flask, render_template, request, Response, jsonify, stream_with_context, g, send_from_directory
+from flask import Flask, request, Response, jsonify, stream_with_context, g, send_from_directory
 from flask_cors import CORS
 from werkzeug.exceptions import HTTPException
 def _import_handler_class():
@@ -45,7 +45,6 @@ _cors_origins = os.getenv("CORS_ORIGINS", "").strip()
 _allowed_origins = [o.strip() for o in _cors_origins.split(",") if o.strip()] if _cors_origins else ["*"]
 
 CORS(app, resources={
-    r"/api/widget/*": {"origins": "*"},
     r"/api/v1/chat": {"origins": "*"},
     r"/api/*": {"origins": _allowed_origins},
 }, supports_credentials=False)
@@ -62,7 +61,6 @@ app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_prefix=1)
 _MAX_MESSAGE_LENGTH = 2000
 _MAX_SESSIONS = 500
 _RUNTIME_MODE = os.getenv("RUNTIME_MODE", "backend-only").strip().lower()
-_PUBLIC_WIDGET_ROUTES_ENABLED = _RUNTIME_MODE != "backend-only"
 
 # === ИНИЦИАЛИЗАЦИЯ ИНФРАСТРУКТУРЫ (PostgreSQL, Redis) ===
 _infra_lock = threading.Lock()
@@ -932,8 +930,8 @@ def _log_tour_searches(db, conv_id, tool_calls_data, tour_cards=None, search_res
         logger.warning("_log_tour_searches failed: %s", e)
 
 
-# Путь к новому фронтенду (frontend/) — абсолютный путь для корректной работы send_from_directory
-_FRONTEND_DIR = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "frontend"))
+# Dashboard SPA is built into the backend image and served directly by Flask.
+_DASHBOARD_DIR = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "dashboard_dist"))
 
 
 def _is_internal_request() -> bool:
@@ -1150,296 +1148,24 @@ def _runtime_control_plane_forbidden():
     return None
 
 
-def _public_widget_route_disabled(api: bool = False):
-    if _PUBLIC_WIDGET_ROUTES_ENABLED:
+def _dashboard_file_response(path: str):
+    rel_path = (path or "").lstrip("/")
+    if not rel_path:
         return None
-    if api:
-        return jsonify({"error": "Not found"}), 404
-    return "Not Found", 404
+    full_path = os.path.abspath(os.path.join(_DASHBOARD_DIR, rel_path))
+    if not full_path.startswith(_DASHBOARD_DIR + os.sep):
+        return None
+    if not os.path.isfile(full_path):
+        return None
+    return send_from_directory(_DASHBOARD_DIR, rel_path)
 
 
-@app.route('/')
-def index():
-    """Главная страница — новый чат-виджет"""
-    disabled = _public_widget_route_disabled()
-    if disabled:
-        return disabled
-    return send_from_directory(_FRONTEND_DIR, 'index.html')
-
-
-@app.route('/widget')
-def widget():
-    """Новый чат-виджет с визуальными карточками туров"""
-    disabled = _public_widget_route_disabled()
-    if disabled:
-        return disabled
-    return send_from_directory(_FRONTEND_DIR, 'index.html')
-
-
-@app.route('/frontend/<path:filename>')
-def frontend_static(filename):
-    """Статические файлы нового фронтенда (CSS, JS)"""
-    disabled = _public_widget_route_disabled()
-    if disabled:
-        return disabled
-    return send_from_directory(_FRONTEND_DIR, filename)
-
-
-@app.route('/widget.js')
-def widget_js():
-    disabled = _public_widget_route_disabled()
-    if disabled:
-        return disabled
-    return send_from_directory(_FRONTEND_DIR, 'script.js', mimetype='application/javascript')
-
-
-@app.route('/widget.css')
-def widget_css():
-    disabled = _public_widget_route_disabled()
-    if disabled:
-        return disabled
-    return send_from_directory(_FRONTEND_DIR, 'styles.css', mimetype='text/css')
-
-
-WIDGET_DEFAULTS = {
-    "welcome_message": "\U0001f44b Здравствуйте! Я — ИИ-ассистент туристического агентства.\n\nЯ помогу вам:\n• \U0001f50d Подобрать тур по вашим параметрам\n• \U0001f525 Найти горящие предложения\n• \u2753 Ответить на вопросы о визах, оплате, документах\n\nКуда бы вы хотели поехать?",
-    "primary_color": "#E30613",
-    "position": "bottom-right",
-    "title": "AI Ассистент",
-    "subtitle": "Турагентство",
-    "logo_url": None,
-}
-
-
-@app.route('/api/widget/config')
-def public_widget_config():
-    """Public widget config (no auth). Widget calls this on init."""
-    disabled = _public_widget_route_disabled(api=True)
-    if disabled:
-        return disabled
-    _init_infrastructure()
-    from database import get_db
-    from models import Assistant
-    from cache import rate_limit_check, cache_get, cache_set
-
-    assistant_id = request.args.get('assistant_id')
-    if not assistant_id:
-        return jsonify({"error": "assistant_id is required"}), 400
-
-    ip = request.remote_addr
-    rl_key = f"rl:wconfig:{ip}:{int(time.time()) // 60}"
-    if not rate_limit_check(rl_key, 30, 60):
-        return jsonify({"error": "Rate limit exceeded"}), 429
-
-    cache_key = f"widget:config:{assistant_id}"
-    cached = cache_get(cache_key)
-    if cached and isinstance(cached, dict):
-        resp = jsonify(cached)
-        resp.headers["Cache-Control"] = "public, max-age=60"
-        return resp
-
-    with get_db() as db:
-        if db is None:
-            return jsonify(WIDGET_DEFAULTS), 503
-
-        assistant = db.query(Assistant).filter(
-            Assistant.id == assistant_id,
-            Assistant.is_active.is_(True),
-        ).first()
-
-        if not assistant:
-            return jsonify({"error": "Assistant not found"}), 404
-
-        cfg = assistant.widget_config or {}
-        data = {
-            "assistant_id": str(assistant.id),
-            "welcome_message": cfg.get("welcome_message") or WIDGET_DEFAULTS["welcome_message"],
-            "primary_color": cfg.get("primary_color") or WIDGET_DEFAULTS["primary_color"],
-            "position": cfg.get("position") or WIDGET_DEFAULTS["position"],
-            "title": cfg.get("title") or WIDGET_DEFAULTS["title"],
-            "subtitle": cfg.get("subtitle") or WIDGET_DEFAULTS["subtitle"],
-            "logo_url": cfg.get("logo_url") or None,
-        }
-        cache_set(cache_key, data, ttl_seconds=300)
-
-        resp = jsonify(data)
-        resp.headers["Cache-Control"] = "public, max-age=60"
-        return resp
-
-
-@app.route('/api/widget/<assistant_id>/chat', methods=['POST', 'OPTIONS'])
-def widget_chat_proxy(assistant_id):
-    """Proxy chat requests to the bot server. Solves mixed-content (HTTPS→HTTP)."""
-    disabled = _public_widget_route_disabled(api=True)
-    if disabled:
-        return disabled
-    if request.method == 'OPTIONS':
-        return ('', 204)
-
-    _init_infrastructure()
-    from database import get_db
-    from models import Assistant
-    from cache import rate_limit_check
-    import httpx
-
-    ip = request.remote_addr
-    rl_key = f"rl:wchat:{ip}:{assistant_id}:{int(time.time()) // 60}"
-    if not rate_limit_check(rl_key, 30, 60):
-        return jsonify({"error": "Rate limit exceeded"}), 429
-
-    with get_db() as db:
-        if db is None:
-            return jsonify({"error": "Service temporarily unavailable"}), 503
-
-        assistant = db.query(Assistant).filter(
-            Assistant.id == assistant_id,
-            Assistant.is_active.is_(True),
-        ).first()
-
-        if not assistant or not assistant.bot_server_url:
-            return jsonify({"error": "Assistant not configured"}), 503
-
-        bot_url = assistant.bot_server_url.rstrip('/')
-
-    body = request.get_json(silent=True)
-    if not body or 'message' not in body:
-        return jsonify({"error": "message is required"}), 400
-
-    payload = {
-        "message": str(body["message"])[:500],
-        "conversation_id": str(body.get("conversation_id", "")),
-        "assistant_id": assistant_id,
-    }
-
-    try:
-        raw_payload = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-        auth_headers = _build_service_auth_headers(assistant_id=assistant_id)
-        with httpx.Client(timeout=45.0) as client:
-            resp = client.post(
-                f"{bot_url}/api/v1/chat",
-                content=raw_payload,
-                headers={
-                    "Content-Type": "application/json",
-                    "X-Assistant-Id": assistant_id,
-                    **auth_headers,
-                },
-            )
-        return (resp.content, resp.status_code, {"Content-Type": "application/json"})
-    except httpx.TimeoutException:
-        return jsonify({"error": "Бот-сервер не отвечает. Попробуйте позже."}), 504
-    except httpx.ConnectError:
-        return jsonify({"error": "Бот-сервер недоступен. Попробуйте позже."}), 502
-    except Exception as e:
-        logger.exception("Widget chat proxy error")
-        return jsonify({"error": "Внутренняя ошибка сервера"}), 500
-
-
-@app.route('/api/widget/<assistant_id>/history')
-def public_widget_history(assistant_id):
-    """Proxy widget history requests to the bot server."""
-    disabled = _public_widget_route_disabled(api=True)
-    if disabled:
-        return disabled
-    _init_infrastructure()
-    from database import get_db
-    from models import Assistant
-    from cache import rate_limit_check
-    import httpx
-
-    conversation_id = (request.args.get('conversation_id') or request.args.get('cid') or '').strip()
-    if not conversation_id:
-        return jsonify({"conversation_id": "", "messages": []})
-
-    ip = request.remote_addr
-    rl_key = f"rl:whistory:{ip}:{assistant_id}:{int(time.time()) // 60}"
-    if not rate_limit_check(rl_key, 30, 60):
-        return jsonify({"error": "Rate limit exceeded"}), 429
-
-    with get_db() as db:
-        if db is None:
-            return jsonify({"error": "Service temporarily unavailable"}), 503
-
-        assistant = db.query(Assistant).filter(
-            Assistant.id == assistant_id,
-            Assistant.is_active.is_(True),
-        ).first()
-
-        if not assistant or not assistant.bot_server_url:
-            return jsonify({"error": "Assistant not configured"}), 503
-
-        bot_url = assistant.bot_server_url.rstrip('/')
-
-    try:
-        auth_headers = _build_service_auth_headers(assistant_id=assistant_id)
-        with httpx.Client(timeout=20.0) as client:
-            resp = client.get(
-                f"{bot_url}/api/runtime/history",
-                params={
-                    "assistant_id": assistant_id,
-                    "conversation_id": conversation_id,
-                },
-                headers={
-                    "X-Assistant-Id": assistant_id,
-                    **auth_headers,
-                },
-            )
-        return (resp.content, resp.status_code, {"Content-Type": "application/json"})
-    except httpx.TimeoutException:
-        return jsonify({"error": "Бот-сервер не отвечает. Попробуйте позже."}), 504
-    except httpx.ConnectError:
-        return jsonify({"error": "Бот-сервер недоступен. Попробуйте позже."}), 502
-    except Exception:
-        logger.exception("Widget history proxy error")
-        return jsonify({"error": "Внутренняя ошибка сервера"}), 500
-
-
-@app.route('/widget/embed/<assistant_id>')
-def widget_embed_page(assistant_id):
-    """Serve the embeddable widget page (loaded inside iframe).
-    Sets dynamic CSP with frame-ancestors based on assistant's allowed_domains."""
-    disabled = _public_widget_route_disabled(api=True)
-    if disabled:
-        return disabled
-    _init_infrastructure()
-    from database import get_db
-    from models import Assistant
-    from cache import cache_get, cache_set
-
-    frame_ancestors = "*"
-    cache_key = f"widget:fa:{assistant_id}"
-    cached_fa = cache_get(cache_key)
-    if cached_fa and isinstance(cached_fa, str):
-        frame_ancestors = cached_fa
-    else:
-        try:
-            with get_db() as db:
-                if db:
-                    assistant = db.query(Assistant).filter(
-                        Assistant.id == assistant_id,
-                        Assistant.is_active.is_(True),
-                    ).first()
-                    if not assistant:
-                        return jsonify({"error": "Assistant not found"}), 404
-                    if assistant.allowed_domains:
-                        domains = [d.strip() for d in assistant.allowed_domains.split(',') if d.strip()]
-                        if domains:
-                            frame_ancestors = ' '.join(domains)
-            cache_set(cache_key, frame_ancestors, ttl_seconds=300)
-        except Exception:
-            logger.debug("widget_embed_page: allowed_domains lookup failed", exc_info=True)
-
-    resp = send_from_directory(_FRONTEND_DIR, 'widget-embed.html')
-    csp = (
-        "default-src 'self' 'unsafe-inline'; "
-        "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; "
-        "connect-src 'self'; "
-        "img-src 'self' data: blob: https:; "
-        "font-src 'self' https://fonts.gstatic.com; "
-        f"frame-ancestors {frame_ancestors};"
-    )
-    resp.headers['Content-Security-Policy'] = csp
-    resp.headers.pop('X-Frame-Options', None)
-    return resp
+def _dashboard_index_response():
+    index_path = os.path.join(_DASHBOARD_DIR, "index.html")
+    if not os.path.isfile(index_path):
+        logger.error("Dashboard bundle is missing: %s", index_path)
+        return "Dashboard bundle is not available", 503
+    return send_from_directory(_DASHBOARD_DIR, "index.html")
 
 
 @app.route('/favicon.ico')
@@ -2045,6 +1771,25 @@ def get_metrics():
                 aggregated[key] += metrics.get(key, 0)
         
         return jsonify(aggregated)
+
+
+@app.route("/", defaults={"path": ""})
+@app.route("/<path:path>")
+def dashboard_spa(path):
+    """Serve the admin dashboard SPA from the backend bundle."""
+    if path.startswith(("api/", "static/", "frontend/")):
+        return "Not Found", 404
+    if path == "widget/embed" or path.startswith("widget/embed/"):
+        return "Not Found", 404
+
+    asset_response = _dashboard_file_response(path)
+    if asset_response is not None:
+        return asset_response
+
+    if path and "." in os.path.basename(path):
+        return "Not Found", 404
+
+    return _dashboard_index_response()
 
 
 if __name__ == '__main__':

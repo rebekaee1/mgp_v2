@@ -1347,6 +1347,7 @@ class YandexGPTHandler:
         
         # ── Для логирования API-вызовов ──
         self._pending_api_calls: List[Dict] = []
+        self._last_message_usage: Optional[Dict[str, int]] = None
         
         # ── Метрики для мониторинга качества (Этап 3) ──
         self._metrics = {
@@ -2607,9 +2608,11 @@ class YandexGPTHandler:
                         )
 
                     self._last_search_result = {
+                        "requestid": request_id,
                         "hotels_found": hotels_found,
                         "tours_found": tours_found,
                         "min_price": _safe_int(last_status.get("minprice"), None),
+                        "duration_ms": elapsed * 1000,
                     }
 
                     last_status["_hint"] = (
@@ -2640,9 +2643,11 @@ class YandexGPTHandler:
                     logger.info("📊 SEARCH READY (partial)  requestid=%s  progress=%s%%  hotels=%s — returning early",
                                 request_id, progress, hotels_found)
                     self._last_search_result = {
+                        "requestid": request_id,
                         "hotels_found": hotels_found,
                         "tours_found": tours_found,
                         "min_price": _safe_int(last_status.get("minprice"), None),
+                        "duration_ms": elapsed * 1000,
                     }
                     last_status["_hint"] = (
                         f"Поиск ещё идёт ({progress}%), но уже найдено {hotels_found} отелей. "
@@ -2808,6 +2813,13 @@ class YandexGPTHandler:
             logger.info("🎴 Built %d tour cards for frontend", len(self._pending_tour_cards))
             
             status = full_results.get("status", {})
+            self._last_search_result = {
+                "requestid": args.get("requestid"),
+                "hotels_found": status.get("hotelsfound"),
+                "tours_found": status.get("toursfound"),
+                "min_price": _safe_int(status.get("minprice"), None),
+                "duration_ms": (self._last_search_result or {}).get("duration_ms"),
+            }
 
             # ── Сокращённые данные для AI (без описаний/цен/дат — они на карточках) ──
             ai_hotels = []
@@ -3545,6 +3557,7 @@ class YandexGPTHandler:
         """
         # Сбрасываем tour_cards перед каждым новым сообщением
         self._pending_tour_cards = []
+        self._last_message_usage = None
         
         # Инкрементируем счётчик сообщений
         self._metrics["total_messages"] += 1
@@ -4413,6 +4426,8 @@ class YandexGPTHandler:
         self.previous_response_id = None
         self._empty_iterations = 0
         self._pending_tour_cards = []
+        self._pending_api_calls = []
+        self._last_message_usage = None
         self._last_departure_city = "Москва"
         self._tour_details_cache = {}
         logger.info("🔄 HANDLER RESET  cleared %d messages from full_history", old_len)

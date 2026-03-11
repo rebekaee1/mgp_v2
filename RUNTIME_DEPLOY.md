@@ -11,8 +11,8 @@
 - PostgreSQL / Redis / runtime logs
 
 Что не используется как production entrypoint:
-- `frontend` сервис
-- публичная раздача frontend/виджета с домена MGP
+- отдельный `frontend` сервис
+- публичная раздача widget UI с домена MGP
 
 ## Runtime env
 
@@ -37,6 +37,13 @@
 - `RUNTIME_TRUSTED_PROXY_CIDRS=...`
 - `RUNTIME_REPORT_URL=...`
 - `RUNTIME_REPORT_TOKEN=...`
+- `RUNTIME_DIALOG_SENDER_ENABLED=true`
+- `RUNTIME_DIALOG_SENDER_BATCH_SIZE=20`
+- `RUNTIME_DIALOG_SENDER_INTERVAL_SECONDS=10`
+- `RUNTIME_DIALOG_SENDER_TIMEOUT_SECONDS=15`
+- `RUNTIME_DIALOG_SENDER_MAX_ATTEMPTS=5`
+- `RUNTIME_DIALOG_SENDER_RETRY_BACKOFF_SECONDS=10`
+- `RUNTIME_DIALOG_SENDER_RETRY_BACKOFF_MAX_SECONDS=300`
 - `RUNTIME_PROVISIONING_API_TOKEN=...`
 - `RUNTIME_PROVISIONING_CALLBACK_TIMEOUT_SECONDS=15`
 - `RUNTIME_PROVISIONING_CALLBACK_MAX_ATTEMPTS=3`
@@ -52,10 +59,11 @@
 
 Что делает скрипт:
 
-1. Останавливает и удаляет `frontend`
-2. Поднимает `postgres + redis + backend` через `docker-compose.runtime.yml`
-3. Публикует backend на `APP_PORT` (`80` по умолчанию)
-4. Проверяет `GET /api/health`
+1. Удаляет старый `frontend` контейнер, если он ещё остался после legacy-деплоя
+2. Поднимает `postgres + redis + backend` через основной `docker-compose.yml`
+3. Собирает dashboard SPA внутрь backend image
+4. Публикует backend на `APP_PORT` (`80` по умолчанию)
+5. Проверяет `GET /api/health`
 
 ## Phase-1 LK Auth
 
@@ -106,6 +114,7 @@
 - `runtime_mode`
 - `service_auth_mode`
 - флаг включенного reporting/webhook слоя
+- backlog sender-а: `dialog_sender_backlog.pending|retrying|failed`
 
 ### Provisioning Contract
 
@@ -167,6 +176,17 @@
       "header_name": "X-MGP-Service-Token",
       "scope": "runtime",
       "secret": "generated-by-lk"
+    },
+    "reporting": {
+      "mode": "batch_snapshot",
+      "contract_version": "2026-03-09",
+      "endpoint_url": "https://lk.example.com/api/control-plane/runtime/events",
+      "accepted_event_types": ["conversation_snapshot"],
+      "auth": {
+        "type": "shared_secret",
+        "header_name": "X-MGP-Service-Token",
+        "secret": "generated-by-lk"
+      }
     }
   }
 }
@@ -189,6 +209,27 @@ Status model:
 - runtime URLs/metadata без `service_auth.secret`
 - callback delivery diagnostics: `callback.configured`, `callback.delivery_status`, `callback.attempts`, `callback.last_status_code`, `callback.last_error`
 - `error` при `failed`
+
+## Runtime Reporting
+
+Новый `MGP -> LK` канал больше не зависит от legacy SSH-sync.
+
+Что делает runtime:
+
+- после успешной записи чата в PostgreSQL формирует versioned `conversation_snapshot`
+- кладёт snapshot в durable `runtime_event_outbox`
+- фоновой job доставляет snapshot в `LK`
+- при ошибках применяет retry/backoff и сохраняет `last_status_code` / `last_error`
+
+Текущий transport-контракт:
+
+- endpoint: `runtime.reporting.endpoint_url`
+- auth: `runtime.reporting.auth.header_name` + plain shared secret
+- event type: `conversation_snapshot`
+- payload: полная snapshot-модель диалога (`conversation`, `messages`, `tour_searches`, `api_calls`)
+- idempotency: `event_id` уникален на snapshot; receiver может дедуплицировать по `assistant_id + event_id`
+
+Секрет `runtime.reporting.auth.secret` сохраняется в `assistant.runtime_metadata`, но не возвращается в callback/status API.
 
 ## Template / Provisioning
 

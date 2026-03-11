@@ -58,6 +58,109 @@ def _normalize_base_url(value: Optional[str]) -> str:
     return str(value or "").strip().rstrip("/")
 
 
+def _llm_validation_error(code: str, message: str, *, retryable: bool = False) -> Dict[str, Any]:
+    return {
+        "code": code,
+        "message": message,
+        "retryable": retryable,
+    }
+
+
+def _validate_openai_runtime_access(api_key: str, model: str) -> Optional[Dict[str, Any]]:
+    base_url = _normalize_base_url(settings.openai_base_url or "https://openrouter.ai/api/v1")
+    try:
+        with httpx.Client(timeout=30.0) as client:
+            resp = client.post(
+                f"{base_url}/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": model,
+                    "messages": [{"role": "user", "content": "ping"}],
+                    "max_tokens": 8,
+                },
+            )
+        if 200 <= resp.status_code < 300:
+            return None
+        retryable = resp.status_code in (408, 409, 425, 429) or resp.status_code >= 500
+        error_body = (resp.text or "").strip()[:300]
+        return _llm_validation_error(
+            "llm_credentials_invalid",
+            f"OpenAI/OpenRouter chat validation failed: HTTP {resp.status_code} {error_body}".strip(),
+            retryable=retryable,
+        )
+    except Exception as exc:
+        return _llm_validation_error(
+            "llm_validation_unavailable",
+            f"OpenAI/OpenRouter chat validation error: {str(exc)[:300]}",
+            retryable=True,
+        )
+
+
+def _validate_yandex_runtime_access(api_key: str, model: str) -> Optional[Dict[str, Any]]:
+    folder_id = str(settings.yandex_folder_id or "").strip()
+    if not folder_id:
+        return _llm_validation_error(
+            "llm_validation_misconfigured",
+            "YANDEX_FOLDER_ID is not configured for runtime validation",
+            retryable=False,
+        )
+    try:
+        with httpx.Client(timeout=30.0) as client:
+            resp = client.post(
+                "https://llm.api.cloud.yandex.net/foundationModels/v1/completion",
+                headers={
+                    "Authorization": f"Api-Key {api_key}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "modelUri": f"gpt://{folder_id}/{model}",
+                    "completionOptions": {
+                        "stream": False,
+                        "temperature": 0,
+                        "maxTokens": 8,
+                    },
+                    "messages": [{"role": "user", "text": "ping"}],
+                },
+            )
+        if 200 <= resp.status_code < 300:
+            return None
+        retryable = resp.status_code in (408, 409, 425, 429) or resp.status_code >= 500
+        error_body = (resp.text or "").strip()[:300]
+        return _llm_validation_error(
+            "llm_credentials_invalid",
+            f"Yandex chat validation failed: HTTP {resp.status_code} {error_body}".strip(),
+            retryable=retryable,
+        )
+    except Exception as exc:
+        return _llm_validation_error(
+            "llm_validation_unavailable",
+            f"Yandex chat validation error: {str(exc)[:300]}",
+            retryable=True,
+        )
+
+
+def _validate_runtime_llm_access(llm_provider: str, api_key: str, model: str) -> Optional[Dict[str, Any]]:
+    provider = str(llm_provider or "").strip().lower()
+    key = str(api_key or "").strip()
+    model_name = str(model or "").strip()
+    if not key:
+        return _llm_validation_error("missing_llm_api_key", "LLM API key is empty", retryable=False)
+    if not model_name:
+        return _llm_validation_error("missing_llm_model", "LLM model is empty", retryable=False)
+    if provider == "openai":
+        return _validate_openai_runtime_access(key, model_name)
+    if provider == "yandex":
+        return _validate_yandex_runtime_access(key, model_name)
+    return _llm_validation_error(
+        "unsupported_llm_provider",
+        f"Unsupported llm_provider for runtime validation: {provider or '-'}",
+        retryable=False,
+    )
+
+
 def _callback_url(payload: Dict[str, Any]) -> Optional[str]:
     callback = payload.get("callback") or {}
     return callback.get("url") or payload.get("callback_url")
@@ -96,7 +199,48 @@ def _sanitize_runtime_metadata(runtime_metadata: Optional[Dict[str, Any]]) -> Di
     service_auth = meta.get("service_auth")
     if isinstance(service_auth, dict):
         service_auth.pop("secret", None)
+    reporting = meta.get("reporting")
+    if isinstance(reporting, dict):
+        auth = reporting.get("auth")
+        if isinstance(auth, dict):
+            auth.pop("secret", None)
     return meta
+
+
+def _reporting_config_from_payload(runtime_payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    reporting = runtime_payload.get("reporting")
+    if not isinstance(reporting, dict):
+        return None
+    auth = dict(reporting.get("auth") or {})
+    return {
+        "mode": str(reporting.get("mode") or "batch_snapshot").strip() or "batch_snapshot",
+        "contract_version": str(reporting.get("contract_version") or "2026-03-09").strip() or "2026-03-09",
+        "endpoint_url": str(reporting.get("endpoint_url") or "").strip(),
+        "accepted_event_types": list(reporting.get("accepted_event_types") or ["conversation_snapshot"]),
+        "auth": {
+            "type": str(auth.get("type") or "shared_secret").strip() or "shared_secret",
+            "header_name": str(auth.get("header_name") or "X-MGP-Service-Token").strip() or "X-MGP-Service-Token",
+            "secret": str(auth.get("secret") or "").strip(),
+        },
+    }
+
+
+def _public_reporting_config(runtime_metadata: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    reporting = dict((runtime_metadata or {}).get("reporting") or {})
+    if not reporting:
+        return None
+    auth = dict(reporting.get("auth") or {})
+    return {
+        "mode": reporting.get("mode"),
+        "contract_version": reporting.get("contract_version"),
+        "endpoint_url": reporting.get("endpoint_url"),
+        "accepted_event_types": reporting.get("accepted_event_types") or ["conversation_snapshot"],
+        "auth": {
+            "type": auth.get("type") or "shared_secret",
+            "header_name": auth.get("header_name") or "X-MGP-Service-Token",
+            "secret_configured": bool(auth.get("secret")),
+        },
+    }
 
 
 def _runtime_payload(public_base_url: Optional[str], assistant_id: Optional[str],
@@ -116,6 +260,7 @@ def _runtime_payload(public_base_url: Optional[str], assistant_id: Optional[str]
             "header_name": service_auth.get("header_name"),
             "scope": service_auth.get("scope"),
         } if service_auth else None,
+        "reporting": _public_reporting_config(runtime_metadata),
     }
     return runtime
 
@@ -144,6 +289,9 @@ def _request_runtime_payload(req: ProvisioningRequest,
         runtime_metadata = {
             "service_auth": dict(runtime_payload.get("service_auth") or {})
         }
+        reporting = _reporting_config_from_payload(runtime_payload)
+        if reporting:
+            runtime_metadata["reporting"] = reporting
 
     public_base_url = (
         runtime_payload.get("public_base_url")
@@ -368,6 +516,18 @@ def _validate_request_payload(payload: Dict[str, Any]) -> Optional[tuple]:
     if scope != "runtime":
         return _json_error(422, "invalid_service_auth_scope", "runtime.service_auth.scope must be runtime")
 
+    reporting = _reporting_config_from_payload(runtime)
+    if reporting is not None:
+        if reporting.get("mode") != "batch_snapshot":
+            return _json_error(422, "invalid_reporting_mode", "runtime.reporting.mode must be batch_snapshot")
+        if not str(reporting.get("endpoint_url") or "").strip():
+            return _json_error(422, "missing_reporting_endpoint", "runtime.reporting.endpoint_url is required")
+        reporting_auth = dict(reporting.get("auth") or {})
+        if str(reporting_auth.get("type") or "").strip() != "shared_secret":
+            return _json_error(422, "invalid_reporting_auth_type", "runtime.reporting.auth.type must be shared_secret")
+        if not str(reporting_auth.get("secret") or "").strip():
+            return _json_error(422, "missing_reporting_secret", "runtime.reporting.auth.secret is required")
+
     try:
         uuid.UUID(str(assistant.get("assistant_id")).strip())
     except (ValueError, TypeError, AttributeError):
@@ -395,9 +555,12 @@ def _apply_provisioning(req_id: str) -> None:
             assistant_payload = payload.get("assistant") or {}
             runtime = payload.get("runtime") or {}
             service_auth = runtime.get("service_auth") or {}
+            reporting = _reporting_config_from_payload(runtime)
             llm_provider = (assistant_payload.get("llm_provider") or settings.llm_provider or "openai").strip().lower()
             default_llm_model = settings.openai_model if llm_provider == "openai" else settings.yandex_model
             default_llm_api_key = settings.openai_api_key if llm_provider == "openai" else settings.yandex_api_key
+            effective_llm_model = assistant_payload.get("llm_model") or default_llm_model
+            effective_llm_api_key = assistant_payload.get("llm_api_key") or default_llm_api_key
             runtime_public_base_url = (
                 assistant_payload.get("bot_server_url")
                 or runtime.get("public_base_url")
@@ -420,6 +583,17 @@ def _apply_provisioning(req_id: str) -> None:
             admin_email = str(admin_user["email"]).strip()
             assistant_name = str(assistant_payload["name"]).strip()
             assistant_id = uuid.UUID(str(assistant_payload["assistant_id"]).strip())
+
+            llm_validation_error = _validate_runtime_llm_access(
+                llm_provider=llm_provider,
+                api_key=effective_llm_api_key,
+                model=effective_llm_model,
+            )
+            if llm_validation_error:
+                _update_request_status(req, "failed", error=llm_validation_error)
+                db.flush()
+                _start_callback(req_id, "failed")
+                return
 
             existing_company = db.query(Company).filter(Company.slug == company_slug).first()
             existing_user = db.query(User).filter(User.email == admin_email).first()
@@ -466,6 +640,8 @@ def _apply_provisioning(req_id: str) -> None:
                     "provisioned_at": _now_iso(),
                 },
             }
+            if reporting:
+                runtime_metadata["reporting"] = reporting
 
             assistant = Assistant(
                 id=assistant_id,
@@ -474,8 +650,8 @@ def _apply_provisioning(req_id: str) -> None:
                 tourvisor_login=assistant_payload.get("tourvisor_login") or settings.tourvisor_auth_login,
                 tourvisor_pass=assistant_payload.get("tourvisor_pass") or settings.tourvisor_auth_pass,
                 llm_provider=llm_provider,
-                llm_api_key=assistant_payload.get("llm_api_key") or default_llm_api_key,
-                llm_model=assistant_payload.get("llm_model") or default_llm_model,
+                llm_api_key=effective_llm_api_key,
+                llm_model=effective_llm_model,
                 system_prompt=assistant_payload.get("system_prompt") or None,
                 faq_content=assistant_payload.get("faq_content") or None,
                 widget_config=assistant_payload.get("widget_config") or None,

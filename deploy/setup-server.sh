@@ -55,7 +55,7 @@ ufw default deny incoming
 ufw default allow outgoing
 ufw allow 22/tcp    # SSH
 ufw allow 80/tcp    # HTTP
-ufw allow 443/tcp   # HTTPS (для будущего SSL)
+ufw allow 443/tcp   # HTTPS (если внешний proxy/LB завершает TLS)
 ufw --force enable
 echo "  UFW статус: $(ufw status | head -1)"
 
@@ -75,8 +75,8 @@ echo "  1. cd /opt/mgp"
 echo "  2. git clone <ваш-репозиторий> ."
 echo "  3. cp .env.example .env"
 echo "  4. nano .env  (заполнить API ключи, сменить POSTGRES_PASSWORD)"
-echo "  5. docker compose up -d --build"
-echo "  6. docker compose logs -f  (наблюдать за запуском)"
+echo "  5. ./deploy/deploy-runtime.sh"
+echo "  6. docker compose logs -f backend  (наблюдать за запуском)"
 echo ""
 echo "  Проверка: curl http://localhost/api/health"
 echo "════════════════════════════════════════════════════════"

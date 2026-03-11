@@ -233,11 +233,11 @@ if [ -f "$APP_DIR/docker-compose.yml" ]; then
     if grep -q "REPLACE_ME" "$APP_DIR/.env" 2>/dev/null; then
         echo ">>> .env contains REPLACE_ME placeholders!"
         echo ">>> Fill in secrets first: nano $APP_DIR/.env"
-        echo ">>> Then run: cd $APP_DIR && docker compose up -d --build"
+        echo ">>> Then run: cd $APP_DIR && ./deploy/deploy-runtime.sh"
     else
         echo ">>> Building and starting..."
         cd "$APP_DIR"
-        docker compose up -d --build 2>&1 | tail -50
+        ./deploy/deploy-runtime.sh 2>&1 | tail -50
         echo ">>> Waiting 30s for startup..."
         sleep 30
         docker compose ps

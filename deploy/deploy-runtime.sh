@@ -12,23 +12,18 @@ if [ ! -f ".env" ]; then
   exit 1
 fi
 
-# Backend-only runtime profile:
+# Runtime-only profile:
 # - keeps postgres + redis + backend
-# - does NOT run frontend service
+# - dashboard is bundled into backend image
 # - publishes backend on APP_PORT (80 by default)
 
 docker compose stop frontend >/dev/null 2>&1 || true
 docker rm -f mgp-frontend-1 >/dev/null 2>&1 || true
 
-COMPOSE_ARGS="-f docker-compose.runtime.yml"
-if [ -f "docker-compose.override.yml" ]; then
-  COMPOSE_ARGS="$COMPOSE_ARGS -f docker-compose.override.yml"
-fi
-
-docker compose $COMPOSE_ARGS up -d --build
+docker compose up -d --build
 
 echo "--- runtime ps ---"
-docker compose $COMPOSE_ARGS ps
+docker compose ps
 
 echo "--- runtime health ---"
 sleep 5

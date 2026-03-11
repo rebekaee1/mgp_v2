@@ -49,7 +49,7 @@ class Settings(BaseSettings):
     # --- Widget ---
     widget_host_url: str = ""
     lk_widget_loader_url: str = "https://lk.navilet.ru/widget-loader.js"
-    runtime_mode: str = "backend-only"  # legacy-web | backend-only
+    runtime_mode: str = "backend-only"  # runtime-only production mode
     backend_port: int = 8080
 
     # --- Runtime Security / Control Plane ---
@@ -63,6 +63,13 @@ class Settings(BaseSettings):
     runtime_allow_trusted_proxy_bypass: bool = True
     runtime_report_url: str = ""
     runtime_report_token: str = ""
+    runtime_dialog_sender_enabled: bool = True
+    runtime_dialog_sender_batch_size: int = 20
+    runtime_dialog_sender_interval_seconds: int = 10
+    runtime_dialog_sender_timeout_seconds: int = 15
+    runtime_dialog_sender_max_attempts: int = 5
+    runtime_dialog_sender_retry_backoff_seconds: int = 10
+    runtime_dialog_sender_retry_backoff_max_seconds: int = 300
     runtime_provisioning_api_token: str = ""
     runtime_provisioning_callback_timeout_seconds: int = 15
     runtime_provisioning_callback_max_attempts: int = 3

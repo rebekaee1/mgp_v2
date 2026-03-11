@@ -2,15 +2,15 @@
 
 AI-ассистент турагентства с поиском туров через TourVisor API.
 
-Текущий production-профиль: `backend-only runtime`.
-Публичный widget/embed живёт в `LK`, а `MGP` принимает runtime chat traffic и отдает health/runtime metadata.
+Текущий production-профиль: `runtime-only backend`.
+Публичный widget/embed живёт в `LK`, а `MGP` держит runtime API, БД/кеш и встроенный admin dashboard.
 
 ## Стек
 
 | Компонент     | Технология                                |
 |---------------|-------------------------------------------|
 | Backend       | Flask + Gunicorn (Python 3.12)            |
-| Frontend      | Legacy only; production widget is served from LK |
+| Frontend      | Dashboard SPA, собирается внутрь backend image |
 | LLM           | OpenAI (OpenRouter) / YandexGPT           |
 | Database      | PostgreSQL 16                             |
 | Cache         | Redis 7                                   |
@@ -26,7 +26,7 @@ cp .env.example .env
 nano .env  # заполнить API ключи
 
 # 2. Запустить
-docker compose up -d --build
+./deploy/deploy-runtime.sh
 
 # 3. Открыть
 open http://localhost
@@ -35,11 +35,17 @@ open http://localhost
 ## Локальная разработка (без Docker)
 
 ```bash
-cd backend
+cd dashboard
+npm ci
+npm run dev
+
+# во втором терминале:
+cd ../backend
 pip install -r requirements.txt
 cp .env.example ../.env  # или используйте backend/.env
 python app.py
-# → http://localhost:8080
+# → backend API: http://localhost:8080
+# → dashboard dev UI: http://localhost:5173
 ```
 
 ## Деплой на Timeweb
@@ -68,12 +74,11 @@ cp .env.example .env && nano .env
 │   ├── alembic/            # Database migrations
 │   ├── Dockerfile
 │   └── entrypoint.sh
-├── frontend/
-│   ├── index.html
-│   ├── styles.css
-│   ├── script.js
-│   ├── nginx.conf
-│   └── Dockerfile
+├── dashboard/
+│   ├── src/                # React admin SPA
+│   ├── public/
+│   ├── vite.config.js
+│   └── package.json
 ├── system_prompt.md        # System prompt for LLM
 ├── function_schemas.json   # Tool definitions
 ├── faq.md                  # Knowledge base
@@ -89,6 +94,14 @@ cp .env.example .env && nano .env
 - `GET /api/metrics` — AI assistant metrics
 - `GET /api/runtime/metadata` — runtime metadata для control-plane
 - `GET /api/runtime/status` — runtime status для provisioning/orchestration
+
+Dashboard SPA теперь тоже раздаётся самим backend; отдельный `frontend`/`nginx` сервис больше не нужен.
+
+`MGP -> LK` reporting теперь рассчитан на новый event/API flow:
+
+- runtime складывает `conversation_snapshot` в durable outbox
+- background sender отправляет snapshot в receiver `LK`
+- retry/backoff и backlog видны через `runtime/status`
 
 ## Логирование
 
@@ -115,3 +128,5 @@ python backend/cli.py provision-tenant \
 ```
 
 Дополнительные tenant-настройки (`allowed_domains`, `bot_server_url`, branding, prompt/faq, ключи) передаются через env/CLI.
+
+Если tenant создаётся через `POST /api/provisioning/tenants`, можно сразу передать `runtime.reporting` и включить новый sender без ручной правки runtime.

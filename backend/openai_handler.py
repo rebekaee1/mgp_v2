@@ -479,6 +479,7 @@ class OpenAIHandler(YandexGPTHandler):
         empty_retries = 0
         timeout_retries = 0
         geo_retries = 0
+        self._last_message_usage = None
 
         while iteration < max_iterations:
             iteration += 1
@@ -503,8 +504,13 @@ class OpenAIHandler(YandexGPTHandler):
                 # Token usage logging
                 usage = response.usage
                 _total_tokens = None
+                _usage_payload = None
                 if usage:
                     _total_tokens = usage.total_tokens
+                    _usage_payload = {
+                        "tokens_prompt": usage.prompt_tokens,
+                        "tokens_completion": usage.completion_tokens,
+                    }
                     logger.info(
                         "🤖 OPENAI API <<  %dms  finish=%s  "
                         "tokens: prompt=%d completion=%d total=%d",
@@ -517,6 +523,7 @@ class OpenAIHandler(YandexGPTHandler):
                         "🤖 OPENAI API <<  %dms  finish=%s",
                         api_ms, finish_reason
                     )
+                self._last_message_usage = _usage_payload
 
                 self._pending_api_calls.append({
                     "service": "openai",
@@ -641,6 +648,8 @@ class OpenAIHandler(YandexGPTHandler):
                         for tc in message.tool_calls
                     ]
                 }
+                if _usage_payload:
+                    assistant_msg.update(_usage_payload)
                 self.full_history.append(assistant_msg)
 
                 # Log
@@ -972,9 +981,10 @@ class OpenAIHandler(YandexGPTHandler):
             )
 
             # Save to history
-            self.full_history.append({
-                "role": "assistant", "content": final_text
-            })
+            assistant_entry = {"role": "assistant", "content": final_text}
+            if _usage_payload:
+                assistant_entry.update(_usage_payload)
+            self.full_history.append(assistant_entry)
 
             # ── Context limit warning ──
             _hist_len = len(self.full_history)
@@ -1121,6 +1131,8 @@ class OpenAIHandler(YandexGPTHandler):
         self._user_stated_budget = None
         self._empty_iterations = 0
         self.previous_response_id = None
+        self._pending_api_calls = []
+        self._last_message_usage = None
         self._context_warning_stage = 0
         self._metrics = {
             "promised_search_detections": 0,
