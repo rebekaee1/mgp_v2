@@ -270,6 +270,7 @@ html, body {
 var assistantId = null;
 var apiUrl = '';
 var configUrl = '';
+var historyUrl = '';
 var baseUrl = window.location.origin;
 var logoUrl = null;
 var conversationId = null;
@@ -277,6 +278,7 @@ var isTyping = false;
 var cardSetCounter = 0;
 var cardSets = new Map();
 var lastFailedMessage = null;
+var welcomeTemplateHtml = '';
 
 var path = window.location.pathname;
 var m = path.match(/\/widget\/embed\/([^/?#]+)/);
@@ -288,6 +290,7 @@ conversationId = cidFromParent || generateUUID();
 
 apiUrl = baseUrl + '/api/widget/' + assistantId + '/chat';
 configUrl = baseUrl + '/api/widget/config?assistant_id=' + assistantId;
+historyUrl = baseUrl + '/api/widget/' + assistantId + '/history';
 
 var els = {
   messages: document.getElementById('chatMessages'),
@@ -342,6 +345,16 @@ function botAvatarHTML() {
   return '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-1 17.93c-3.95-.49-7-3.85-7-7.93 0-.62.08-1.21.21-1.79L9 15v1c0 1.1.9 2 2 2v1.93zm6.9-2.54c-.26-.81-1-1.39-1.9-1.39h-1v-3c0-.55-.45-1-1-1H8v-2h2c.55 0 1-.45 1-1V7h2c1.1 0 2-.9 2-2v-.41c2.93 1.19 5 4.06 5 7.41 0 2.08-.8 3.97-2.1 5.39z"/></svg>';
 }
 
+function cacheWelcomeTemplate() {
+  welcomeTemplateHtml = els.messages.innerHTML;
+}
+
+function resetMessages(showWelcome) {
+  els.messages.innerHTML = showWelcome && welcomeTemplateHtml ? welcomeTemplateHtml : '';
+  cardSetCounter = 0;
+  cardSets.clear();
+}
+
 function applyConfig(cfg) {
   var root = document.documentElement;
   if (cfg.primary_color) {
@@ -362,9 +375,11 @@ function applyConfig(cfg) {
   if (cfg.welcome_message) {
     document.getElementById('welcomeBubble').innerHTML = parseFormatting(escapeHtml(cfg.welcome_message));
   }
+  cacheWelcomeTemplate();
 }
 
-function addMessage(role, content) {
+function addMessage(role, content, options) {
+  options = options || {};
   var isBot = role === 'bot' || role === 'assistant';
   var cls = isBot ? 'bot-message' : 'user-message';
   var avatar = isBot
@@ -373,7 +388,7 @@ function addMessage(role, content) {
   var safe = escapeHtml(content);
   var html = '<div class="message '+cls+'"><div class="message-avatar">'+avatar+'</div><div class="message-content"><div class="message-bubble">'+parseFormatting(safe)+'</div></div></div>';
   els.messages.insertAdjacentHTML('beforeend', html);
-  scrollToBottom();
+  if (options.scroll !== false) scrollToBottom();
 }
 
 var _typingPhase = 0, _typingTimer = null;
@@ -433,7 +448,8 @@ function createTourCardHTML(tour, idx) {
     +'</div><div><a href="'+escapeHtml(link)+'" class="btn-book" target="_blank" rel="noopener">'+(ho?'🏨 Забронировать':'✈️ Оформить тур')+'</a></div></div></div>';
 }
 
-function renderTourCards(cards) {
+function renderTourCards(cards, options) {
+  options = options || {};
   if (!cards||!cards.length) return;
   var setId = ++cardSetCounter;
   var show = cards.slice(0,3);
@@ -444,7 +460,31 @@ function renderTourCards(cards) {
   var nav = '<div class="tour-cards-nav"><span class="tour-count">Найдено '+cards.length+' '+getToursWord(cards.length)+'</span>'+(show.length>1?'<span class="swipe-hint">← листайте →</span>':'')+'</div>';
   var html = '<div class="message bot-message"><div class="message-avatar">'+botAvatarHTML()+'</div><div class="message-content"><div class="tour-cards-container" id="tc-'+setId+'"><div class="tour-cards-carousel"><div class="tour-cards-wrapper">'+ch+'</div></div>'+nav+more+'</div></div></div>';
   els.messages.insertAdjacentHTML('beforeend', html);
+  if (options.scroll !== false) scrollToBottom();
+}
+
+function renderHistory(entries) {
+  if (!entries || !entries.length) return false;
+  resetMessages(false);
+  entries.forEach(function(entry) {
+    if (entry.content) addMessage(entry.role, entry.content, {scroll:false});
+    if (entry.tour_cards && entry.tour_cards.length) renderTourCards(entry.tour_cards, {scroll:false});
+  });
   scrollToBottom();
+  return true;
+}
+
+async function loadHistory() {
+  if (!conversationId) return false;
+  try {
+    var resp = await fetch(historyUrl + '?conversation_id=' + encodeURIComponent(conversationId));
+    if (!resp.ok) return false;
+    var data = await resp.json();
+    return renderHistory(data.messages || []);
+  } catch(e) {
+    console.warn('History load failed:', e);
+    return false;
+  }
 }
 
 function showMoreCards(setId) {
@@ -510,10 +550,8 @@ async function sendMessage(text) {
 function startNewChat() {
   conversationId = generateUUID();
   window.parent.postMessage({type:'aimpact:updateCid', cid: conversationId}, '*');
-  cardSetCounter = 0; cardSets.clear(); lastFailedMessage = null;
-  var welcome = els.messages.querySelector('.message');
-  els.messages.innerHTML = '';
-  if (welcome) els.messages.appendChild(welcome);
+  lastFailedMessage = null;
+  resetMessages(true);
   els.input.focus();
 }
 
@@ -547,7 +585,9 @@ window.addEventListener('message', function(e) {
   } catch(e) {
     console.warn('Config load failed:', e);
     document.getElementById('welcomeBubble').innerHTML = '👋 Здравствуйте! Чем могу помочь?';
+    cacheWelcomeTemplate();
   }
+  await loadHistory();
   window.parent.postMessage({type:'aimpact:ready'}, '*');
 })();
 

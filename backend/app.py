@@ -256,6 +256,234 @@ def _session_cache_key(session_id: str, assistant_id: str = None) -> str:
     return f"{assistant_id or 'default'}::{session_id}"
 
 
+_DEPARTURE_CITY_NAMES = {
+    1: "Москва",
+    2: "Пермь",
+    3: "Екатеринбург",
+    4: "Уфа",
+    5: "Санкт-Петербург",
+    6: "Челябинск",
+    7: "Самара",
+    8: "Нижний Новгород",
+    9: "Новосибирск",
+    10: "Казань",
+    11: "Краснодар",
+    12: "Красноярск",
+    18: "Ростов-на-Дону",
+    56: "Сочи",
+    99: "Без перелёта",
+}
+
+
+def _assistant_uuid_or_none(raw_value):
+    if not raw_value:
+        return None
+    try:
+        return uuid.UUID(str(raw_value))
+    except (ValueError, TypeError, AttributeError):
+        return None
+
+
+def _restore_handler_from_db(handler, session_id: str, assistant_id: str = None) -> bool:
+    """Restore saved conversation state into a fresh handler instance."""
+    try:
+        from database import get_db, is_db_available
+        from models import Conversation, Message, TourSearch
+
+        if not is_db_available():
+            return False
+
+        assistant_uuid = _assistant_uuid_or_none(assistant_id)
+        with get_db() as db:
+            if db is None:
+                return False
+
+            conv_query = db.query(Conversation).filter(
+                Conversation.session_id == session_id
+            )
+            if assistant_uuid is not None:
+                conv_query = conv_query.filter(Conversation.assistant_id == assistant_uuid)
+            conv = conv_query.first()
+            if conv is None and assistant_uuid is not None:
+                conv = db.query(Conversation).filter(
+                    Conversation.session_id == session_id
+                ).first()
+            if conv is None:
+                return False
+
+            messages = db.query(Message).filter(
+                Message.conversation_id == conv.id
+            ).order_by(Message.created_at.asc(), Message.id.asc()).all()
+
+            handler.reset()
+
+            restored_history = []
+            latest_tour_cards = None
+            for msg in messages:
+                if msg.role not in ("user", "assistant", "tool"):
+                    continue
+                entry = {
+                    "role": msg.role,
+                    "content": msg.content or "",
+                }
+                if msg.tool_calls:
+                    entry["tool_calls"] = msg.tool_calls
+                if msg.tool_call_id:
+                    entry["tool_call_id"] = msg.tool_call_id
+                if msg.tokens_prompt is not None:
+                    entry["tokens_prompt"] = int(msg.tokens_prompt)
+                if msg.tokens_completion is not None:
+                    entry["tokens_completion"] = int(msg.tokens_completion)
+                restored_history.append(entry)
+                if msg.tour_cards:
+                    latest_tour_cards = list(msg.tour_cards)
+
+            if not restored_history:
+                return False
+
+            handler.full_history = restored_history
+            handler.input_list = []
+            handler._pending_tour_cards = []
+            handler._last_message_usage = None
+            if hasattr(handler, "_search_awaiting_results"):
+                handler._search_awaiting_results = False
+
+            if hasattr(handler, "_update_collected_slots"):
+                for entry in restored_history:
+                    if entry.get("role") == "user" and entry.get("content"):
+                        handler._update_collected_slots(entry["content"])
+
+            latest_search = db.query(TourSearch).filter(
+                TourSearch.conversation_id == conv.id
+            ).order_by(TourSearch.created_at.desc(), TourSearch.id.desc()).first()
+
+            if latest_search is not None:
+                params = {}
+                if latest_search.departure is not None:
+                    params["departure"] = latest_search.departure
+                    handler._last_departure_city = _DEPARTURE_CITY_NAMES.get(
+                        latest_search.departure,
+                        getattr(handler, "_last_departure_city", "Москва"),
+                    )
+                if latest_search.country is not None:
+                    params["country"] = latest_search.country
+                    params["_country"] = latest_search.country
+                if latest_search.regions:
+                    params["regions"] = latest_search.regions
+                    params["_regions"] = latest_search.regions
+                if latest_search.date_from:
+                    params["datefrom"] = latest_search.date_from
+                if latest_search.date_to:
+                    params["dateto"] = latest_search.date_to
+                if latest_search.nights_from is not None:
+                    params["nightsfrom"] = latest_search.nights_from
+                if latest_search.nights_to is not None:
+                    params["nightsto"] = latest_search.nights_to
+                if latest_search.adults is not None:
+                    params["adults"] = latest_search.adults
+                if latest_search.children is not None:
+                    params["child"] = latest_search.children
+                if latest_search.stars is not None:
+                    params["stars"] = latest_search.stars
+                if latest_search.meal is not None:
+                    params["meal"] = latest_search.meal
+                if latest_search.price_from is not None:
+                    params["pricefrom"] = latest_search.price_from
+                if latest_search.price_to is not None:
+                    params["priceto"] = latest_search.price_to
+
+                handler._last_search_params = params
+                handler._last_requestid = latest_search.requestid or None
+                handler._last_search_result = {
+                    "requestid": latest_search.requestid,
+                    "hotels_found": latest_search.hotels_found,
+                    "tours_found": latest_search.tours_found,
+                    "min_price": latest_search.min_price,
+                    "duration_ms": latest_search.duration_ms,
+                }
+
+            if latest_tour_cards:
+                handler._tourid_map = {}
+                for idx, card in enumerate(latest_tour_cards, 1):
+                    tour_id = str(card.get("tourid") or "").strip()
+                    if not tour_id:
+                        continue
+                    handler._tourid_map[idx] = {
+                        "tourid": tour_id,
+                        "hotelcode": card.get("hotelcode"),
+                        "hotelname": card.get("hotel_name") or card.get("hotelname") or "",
+                    }
+
+                if getattr(handler, "_tourid_map", None) and hasattr(handler, "_pinned_context"):
+                    lines = ["[КОНТЕКСТ: текущие показанные туры]"]
+                    for pos, entry in sorted(handler._tourid_map.items()):
+                        lines.append(
+                            f"{pos}. {entry.get('hotelname', '?')} "
+                            f"(tourid={entry['tourid']}, hotelcode={entry.get('hotelcode', '?')})"
+                        )
+                    handler._pinned_context = "\n".join(lines)
+
+            logger.info(
+                "♻️ Restored session %s from DB (%d messages, assistant=%s)",
+                session_id[:8],
+                len(restored_history),
+                assistant_id or "-",
+            )
+            return True
+    except Exception:
+        logger.warning(
+            "Session restore failed for session_id=%s assistant=%s",
+            session_id,
+            assistant_id or "-",
+            exc_info=True,
+        )
+        return False
+
+
+def _build_conversation_history_payload(db, assistant_id: str, conversation_id: str) -> dict:
+    from models import Conversation, Message
+
+    assistant_uuid = _assistant_uuid_or_none(assistant_id)
+    conv_query = db.query(Conversation).filter(
+        Conversation.session_id == conversation_id
+    )
+    if assistant_uuid is not None:
+        conv_query = conv_query.filter(Conversation.assistant_id == assistant_uuid)
+    conv = conv_query.first()
+    if conv is None and assistant_uuid is not None:
+        conv = db.query(Conversation).filter(
+            Conversation.session_id == conversation_id
+        ).first()
+    if conv is None:
+        return {"conversation_id": conversation_id, "messages": []}
+
+    rows = db.query(Message).filter(
+        Message.conversation_id == conv.id
+    ).order_by(Message.created_at.asc(), Message.id.asc()).all()
+
+    visible = []
+    for row in rows:
+        if row.role not in ("user", "assistant"):
+            continue
+        content = (row.content or "").strip()
+        tour_cards = list(row.tour_cards or [])
+        if row.role == "assistant" and not content and not tour_cards:
+            continue
+        if row.role == "user" and not content:
+            continue
+        visible.append({
+            "role": row.role,
+            "content": content,
+            "tour_cards": tour_cards,
+            "created_at": row.created_at.isoformat() if row.created_at else None,
+        })
+
+    return {
+        "conversation_id": conversation_id,
+        "messages": visible[-50:],
+    }
+
+
 def _build_handler(assistant_id: str = None):
     from runtime_config import resolve_runtime_config
 
@@ -286,6 +514,7 @@ def get_handler(session_id: str, assistant_id: str = None):
         handler, runtime_config, provider = _build_handler(assistant_id=assistant_id)
         # Подключаем диалоговый лог
         handler._dialogue_log_callback = lambda direction, content: _write_dialogue_log(session_id, direction, content)
+        restored = _restore_handler_from_db(handler, session_id, assistant_id=assistant_id)
         _handlers[cache_key] = {
             "handler": handler,
             "last_active": time.time(),
@@ -294,17 +523,18 @@ def get_handler(session_id: str, assistant_id: str = None):
             "provider": provider,
         }
         logger.info(
-            "🆕 New session %s  (provider: %s, assistant: %s, source: %s, total sessions: %d)",
+            "🆕 New session %s  (provider: %s, assistant: %s, source: %s, restored=%s, total sessions: %d)",
             session_id[:8],
             provider,
             assistant_id or "-",
             getattr(runtime_config, "source", "env-default"),
+            "yes" if restored else "no",
             len(_handlers),
         )
         _write_dialogue_log(
             session_id,
             "SYSTEM",
-            f"New session created (provider: {provider}, model: {handler.model}, assistant_id: {assistant_id or '-'}, config_source: {getattr(runtime_config, 'source', 'env-default')})",
+            f"New session created (provider: {provider}, model: {handler.model}, assistant_id: {assistant_id or '-'}, config_source: {getattr(runtime_config, 'source', 'env-default')}, restored={'yes' if restored else 'no'})",
         )
         return handler
 
@@ -387,7 +617,8 @@ def _log_chat_to_db(session_id: str, user_message: str, reply: str,
                      history_snapshot: list = None,
                      assistant_id: str = None,
                      search_result: dict = None,
-                     api_calls_log: list = None):
+                     api_calls_log: list = None,
+                     final_message_usage: dict = None):
     """
     Записать в PostgreSQL ПОЛНЫЙ ПУТЬ без исключений:
     - КАЖДАЯ запись из history_snapshot (user, assistant, tool, синтетические retry)
@@ -441,6 +672,21 @@ def _log_chat_to_db(session_id: str, user_message: str, reply: str,
 
             msg_count = 0
             final_reply_in_snapshot = False
+            tool_outputs_by_call_id = {}
+
+            if history_snapshot:
+                for entry in history_snapshot:
+                    if entry.get("role") != "tool":
+                        continue
+                    tool_call_id = entry.get("tool_call_id")
+                    if not tool_call_id:
+                        continue
+                    try:
+                        parsed_output = json.loads(entry.get("content") or "{}")
+                    except (json.JSONDecodeError, TypeError):
+                        parsed_output = None
+                    if isinstance(parsed_output, dict):
+                        tool_outputs_by_call_id[tool_call_id] = parsed_output
 
             if history_snapshot:
                 last_idx = len(history_snapshot) - 1
@@ -466,11 +712,24 @@ def _log_chat_to_db(session_id: str, user_message: str, reply: str,
                         msg.tool_calls = tc_data
                     if tc_id:
                         msg.tool_call_id = tc_id
+                    tokens_prompt = entry.get("tokens_prompt")
+                    tokens_completion = entry.get("tokens_completion")
+                    if tokens_prompt is not None:
+                        msg.tokens_prompt = int(tokens_prompt)
+                    if tokens_completion is not None:
+                        msg.tokens_completion = int(tokens_completion)
 
                     if is_final_reply:
                         if tour_cards:
                             msg.tour_cards = tour_cards
                         msg.latency_ms = latency_ms
+                        if final_message_usage:
+                            prompt_tokens = final_message_usage.get("tokens_prompt")
+                            completion_tokens = final_message_usage.get("tokens_completion")
+                            if prompt_tokens is not None:
+                                msg.tokens_prompt = int(prompt_tokens)
+                            if completion_tokens is not None:
+                                msg.tokens_completion = int(completion_tokens)
                         final_reply_in_snapshot = True
 
                     db.add(msg)
@@ -483,6 +742,7 @@ def _log_chat_to_db(session_id: str, user_message: str, reply: str,
                             tc_data,
                             tour_cards=tour_cards,
                             search_result=search_result,
+                            tool_outputs=tool_outputs_by_call_id,
                         )
 
             if not final_reply_in_snapshot:
@@ -501,6 +761,13 @@ def _log_chat_to_db(session_id: str, user_message: str, reply: str,
                 )
                 if tour_cards:
                     fallback_msg.tour_cards = tour_cards
+                if final_message_usage:
+                    prompt_tokens = final_message_usage.get("tokens_prompt")
+                    completion_tokens = final_message_usage.get("tokens_completion")
+                    if prompt_tokens is not None:
+                        fallback_msg.tokens_prompt = int(prompt_tokens)
+                    if completion_tokens is not None:
+                        fallback_msg.tokens_completion = int(completion_tokens)
                 db.add(fallback_msg)
                 msg_count += 1
 
@@ -545,11 +812,25 @@ def _log_chat_to_db(session_id: str, user_message: str, reply: str,
                 except Exception:
                     pass
 
+            db.flush()
+
+            if _aid is not None:
+                try:
+                    from dialog_sender import enqueue_conversation_snapshot
+                    enqueue_conversation_snapshot(db, conversation_id=conv.id, assistant_id=_aid)
+                except Exception:
+                    logger.warning(
+                        "Dialog sender enqueue failed for conversation=%s assistant=%s",
+                        conv.id,
+                        _aid,
+                        exc_info=True,
+                    )
+
     except Exception as e:
         logger.warning("DB logging failed (non-critical): %s", e)
 
 
-def _log_tour_searches(db, conv_id, tool_calls_data, tour_cards=None, search_result=None):
+def _log_tour_searches(db, conv_id, tool_calls_data, tour_cards=None, search_result=None, tool_outputs=None):
     """Извлечь параметры поисков туров из tool_calls и записать в tour_searches."""
     try:
         from models import TourSearch
@@ -570,6 +851,26 @@ def _log_tour_searches(db, conv_id, tool_calls_data, tour_cards=None, search_res
                     return int(val)
                 except (ValueError, TypeError):
                     return None
+
+            def _csv_first_int(val):
+                if val is None or val == "":
+                    return None
+                if isinstance(val, (list, tuple)):
+                    return _csv_first_int(val[0] if val else None)
+                if isinstance(val, int):
+                    return val
+                raw = str(val).strip()
+                if not raw:
+                    return None
+                return _int(raw.split(",")[0].strip())
+
+            def _csv_text(val):
+                if val is None or val == "":
+                    return None
+                if isinstance(val, (list, tuple)):
+                    items = [str(item).strip() for item in val if str(item).strip()]
+                    return ",".join(items) or None
+                return str(val).strip() or None
 
             tours_found = None
             hotels_found = None
@@ -594,8 +895,8 @@ def _log_tour_searches(db, conv_id, tool_calls_data, tour_cards=None, search_res
                 conversation_id=conv_id,
                 search_type=stype,
                 departure=_int(args.get("departure") or args.get("city")),
-                country=_int((args.get("country") or args.get("countries", "")).split(",")[0] or None),
-                regions=args.get("regions") or None,
+                country=_csv_first_int(args.get("country") or args.get("countries")),
+                regions=_csv_text(args.get("regions")),
                 date_from=args.get("datefrom"),
                 date_to=args.get("dateto"),
                 nights_from=_int(args.get("nightsfrom")),
@@ -614,6 +915,18 @@ def _log_tour_searches(db, conv_id, tool_calls_data, tour_cards=None, search_res
                 search.hotels_found = search_result.get("hotels_found")
                 search.tours_found = search_result.get("tours_found")
                 search.min_price = search_result.get("min_price")
+                search.requestid = search_result.get("requestid") or search.requestid
+                search.duration_ms = search_result.get("duration_ms")
+            tc_id = tc.get("id")
+            tool_output = (tool_outputs or {}).get(tc_id) if tc_id else None
+            if name == "search_tours" and isinstance(tool_output, dict):
+                search.requestid = (
+                    tool_output.get("requestid")
+                    or ((tool_output.get("result") or {}).get("requestid") if isinstance(tool_output.get("result"), dict) else None)
+                    or search.requestid
+                )
+            if not search.requestid:
+                search.requestid = args.get("requestid")
             db.add(search)
     except Exception as e:
         logger.warning("_log_tour_searches failed: %s", e)
@@ -665,10 +978,21 @@ def _compute_service_signature(secret: str, service_id: str, timestamp: str,
     return hmac.new(secret.encode("utf-8"), payload, hashlib.sha256).hexdigest()
 
 
-def _build_service_auth_headers() -> dict:
+def _build_service_auth_headers(assistant_id: str = None) -> dict:
     from config import settings
 
-    secret = (settings.runtime_service_auth_secret or "").strip()
+    secret = ""
+    if assistant_id:
+        try:
+            from runtime_config import resolve_runtime_config
+            runtime_config = resolve_runtime_config(assistant_id=assistant_id)
+            secret = (runtime_config.runtime_service_auth_secret or "").strip()
+        except Exception:
+            logger.warning("Failed to resolve runtime auth secret for assistant=%s", assistant_id, exc_info=True)
+            secret = ""
+
+    if not secret:
+        secret = (settings.runtime_service_auth_secret or "").strip()
     if not secret:
         return {}
 
@@ -679,6 +1003,10 @@ def _build_service_auth_headers() -> dict:
 
 def _resolve_request_assistant_id() -> str:
     assistant_id = (request.headers.get("X-Assistant-Id") or "").strip()
+    if assistant_id:
+        return assistant_id
+
+    assistant_id = (request.args.get("assistant_id") or "").strip()
     if assistant_id:
         return assistant_id
 
@@ -985,7 +1313,7 @@ def widget_chat_proxy(assistant_id):
 
     try:
         raw_payload = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-        auth_headers = _build_service_auth_headers()
+        auth_headers = _build_service_auth_headers(assistant_id=assistant_id)
         with httpx.Client(timeout=45.0) as client:
             resp = client.post(
                 f"{bot_url}/api/v1/chat",
@@ -1003,6 +1331,65 @@ def widget_chat_proxy(assistant_id):
         return jsonify({"error": "Бот-сервер недоступен. Попробуйте позже."}), 502
     except Exception as e:
         logger.exception("Widget chat proxy error")
+        return jsonify({"error": "Внутренняя ошибка сервера"}), 500
+
+
+@app.route('/api/widget/<assistant_id>/history')
+def public_widget_history(assistant_id):
+    """Proxy widget history requests to the bot server."""
+    disabled = _public_widget_route_disabled(api=True)
+    if disabled:
+        return disabled
+    _init_infrastructure()
+    from database import get_db
+    from models import Assistant
+    from cache import rate_limit_check
+    import httpx
+
+    conversation_id = (request.args.get('conversation_id') or request.args.get('cid') or '').strip()
+    if not conversation_id:
+        return jsonify({"conversation_id": "", "messages": []})
+
+    ip = request.remote_addr
+    rl_key = f"rl:whistory:{ip}:{assistant_id}:{int(time.time()) // 60}"
+    if not rate_limit_check(rl_key, 30, 60):
+        return jsonify({"error": "Rate limit exceeded"}), 429
+
+    with get_db() as db:
+        if db is None:
+            return jsonify({"error": "Service temporarily unavailable"}), 503
+
+        assistant = db.query(Assistant).filter(
+            Assistant.id == assistant_id,
+            Assistant.is_active.is_(True),
+        ).first()
+
+        if not assistant or not assistant.bot_server_url:
+            return jsonify({"error": "Assistant not configured"}), 503
+
+        bot_url = assistant.bot_server_url.rstrip('/')
+
+    try:
+        auth_headers = _build_service_auth_headers(assistant_id=assistant_id)
+        with httpx.Client(timeout=20.0) as client:
+            resp = client.get(
+                f"{bot_url}/api/runtime/history",
+                params={
+                    "assistant_id": assistant_id,
+                    "conversation_id": conversation_id,
+                },
+                headers={
+                    "X-Assistant-Id": assistant_id,
+                    **auth_headers,
+                },
+            )
+        return (resp.content, resp.status_code, {"Content-Type": "application/json"})
+    except httpx.TimeoutException:
+        return jsonify({"error": "Бот-сервер не отвечает. Попробуйте позже."}), 504
+    except httpx.ConnectError:
+        return jsonify({"error": "Бот-сервер недоступен. Попробуйте позже."}), 502
+    except Exception:
+        logger.exception("Widget history proxy error")
         return jsonify({"error": "Внутренняя ошибка сервера"}), 500
 
 
@@ -1087,7 +1474,7 @@ def _log_request_start():
     except Exception:
         pass
 
-    if request.path == '/api/v1/chat':
+    if request.path in ('/api/v1/chat', '/api/runtime/history'):
         try:
             g.runtime_auth = _evaluate_runtime_auth()
             outcome = g.runtime_auth
@@ -1123,7 +1510,7 @@ def _log_request_end(response):
     logger.info("<- %s %s %s %dms rid=%s", request.method, request.path, response.status_code, duration_ms, rid)
     # удобно дергать request-id из фронта при разборе багов
     response.headers["X-Request-Id"] = rid
-    if request.path == '/api/v1/chat':
+    if request.path in ('/api/v1/chat', '/api/runtime/history'):
         outcome = getattr(g, "runtime_auth", None)
         if outcome:
             response.headers["X-Runtime-Auth-Mode"] = outcome.get("mode", "off")
@@ -1171,6 +1558,9 @@ def chat():
 
         tour_cards = list(handler._pending_tour_cards)
         handler._pending_tour_cards = []
+        _api_calls_snapshot = list(getattr(handler, '_pending_api_calls', []))
+        if hasattr(handler, '_pending_api_calls'):
+            handler._pending_api_calls.clear()
 
         _latency_ms = int((time.perf_counter() - g._req_start) * 1000) if hasattr(g, '_req_start') else None
         _log_chat_to_db(session_id, message, response, tour_cards,
@@ -1179,7 +1569,8 @@ def chat():
                         history_snapshot=_new_entries,
                         assistant_id=assistant_id,
                         search_result=getattr(handler, '_last_search_result', None),
-                        api_calls_log=getattr(handler, '_pending_api_calls', None))
+                        api_calls_log=_api_calls_snapshot,
+                        final_message_usage=getattr(handler, '_last_message_usage', None))
         
         return jsonify({'response': response})
     except Exception as e:
@@ -1287,7 +1678,8 @@ def chat_v1():
                         history_snapshot=_new_entries,
                         assistant_id=assistant_id,
                         search_result=getattr(handler, '_last_search_result', None),
-                        api_calls_log=_api_calls_snapshot)
+                        api_calls_log=_api_calls_snapshot,
+                        final_message_usage=getattr(handler, '_last_message_usage', None))
 
         return jsonify({
             'reply': reply,
@@ -1394,7 +1786,8 @@ def chat_stream():
                                 history_snapshot=_new_entries,
                                 assistant_id=_stream_assistant_id,
                                 search_result=getattr(handler, '_last_search_result', None),
-                                api_calls_log=_stream_api_calls)
+                                api_calls_log=_stream_api_calls,
+                                final_message_usage=getattr(handler, '_last_message_usage', None))
                 token_queue.put(('done', response))
             except Exception as e:
                 result['error'] = str(e)
@@ -1489,6 +1882,8 @@ def runtime_metadata():
     assistant_id = request.args.get("assistant_id") or request.headers.get("X-Assistant-Id")
     runtime = resolve_runtime_config(assistant_id=assistant_id)
     service_ids = _split_csv(settings.runtime_trusted_service_ids)
+    reporting = dict((runtime.runtime_metadata or {}).get("reporting") or {})
+    reporting_auth = dict(reporting.get("auth") or {})
 
     return jsonify({
         "runtime_instance_id": settings.runtime_instance_id or os.getenv("HOSTNAME") or "mgp-runtime",
@@ -1521,14 +1916,46 @@ def runtime_metadata():
             "trusted_proxy_configured": bool(settings.runtime_trusted_proxy_cidrs),
             "allow_trusted_proxy_bypass": settings.runtime_allow_trusted_proxy_bypass,
         },
+        "reporting": {
+            "mode": reporting.get("mode") or ("batch_snapshot" if settings.runtime_report_url else "none"),
+            "contract_version": reporting.get("contract_version"),
+            "endpoint_url": reporting.get("endpoint_url") or settings.runtime_report_url or "",
+            "accepted_event_types": reporting.get("accepted_event_types") or ["conversation_snapshot"],
+            "auth": {
+                "type": reporting_auth.get("type") or "shared_secret",
+                "header_name": reporting_auth.get("header_name") or "X-MGP-Service-Token",
+                "secret_configured": bool(reporting_auth.get("secret") or settings.runtime_report_token),
+            },
+        },
         "capabilities": {
             "chat_v1": True,
             "chat_stream": True,
             "health": True,
             "runtime_metadata": True,
             "runtime_status": True,
+            "dialog_sender": True,
         },
     })
+
+
+@app.route('/api/runtime/history')
+def runtime_history():
+    """Internal runtime conversation history for widget restoration."""
+    _init_infrastructure()
+    from database import get_db
+
+    conversation_id = (request.args.get("conversation_id") or request.args.get("cid") or "").strip()
+    assistant_id = _resolve_request_assistant_id()
+    auth_error = _runtime_auth_error_response(conversation_id=conversation_id)
+    if auth_error:
+        return auth_error
+    if not conversation_id:
+        return jsonify({"conversation_id": "", "messages": []})
+
+    with get_db() as db:
+        if db is None:
+            return jsonify({"conversation_id": conversation_id, "messages": []}), 503
+        return jsonify(_build_conversation_history_payload(db, assistant_id, conversation_id))
 
 
 @app.route('/api/runtime/status')
@@ -1539,13 +1966,42 @@ def runtime_status():
         return denied
 
     from config import settings
+    from sqlalchemy import func
+    from database import get_db
+    from models import RuntimeEventOutbox
+    from runtime_config import resolve_runtime_config
+
+    assistant_id = request.args.get("assistant_id") or request.headers.get("X-Assistant-Id")
+    runtime = resolve_runtime_config(assistant_id=assistant_id)
+    reporting = dict((runtime.runtime_metadata or {}).get("reporting") or {})
 
     checks = _build_health_payload()
     checks["runtime_mode"] = _RUNTIME_MODE
     checks["runtime_instance_id"] = settings.runtime_instance_id or os.getenv("HOSTNAME") or "mgp-runtime"
     checks["service_auth_mode"] = settings.runtime_service_auth_mode
     checks["trusted_proxy_configured"] = bool(settings.runtime_trusted_proxy_cidrs)
-    checks["reporting_enabled"] = bool(settings.runtime_report_url)
+    checks["reporting_enabled"] = bool(reporting.get("endpoint_url") or settings.runtime_report_url)
+    checks["dialog_sender_enabled"] = bool(settings.runtime_dialog_sender_enabled)
+    checks["dialog_sender_backlog"] = {
+        "pending": 0,
+        "retrying": 0,
+        "failed": 0,
+    }
+    try:
+        with get_db() as db:
+            if db is not None:
+                counts = dict(
+                    db.query(RuntimeEventOutbox.status, func.count(RuntimeEventOutbox.id))
+                    .group_by(RuntimeEventOutbox.status)
+                    .all()
+                )
+                checks["dialog_sender_backlog"] = {
+                    "pending": int(counts.get("pending", 0)),
+                    "retrying": int(counts.get("retrying", 0)),
+                    "failed": int(counts.get("failed", 0)),
+                }
+    except Exception:
+        logger.warning("Failed to collect dialog sender backlog", exc_info=True)
     all_ok = checks.get("postgres") == "ok" and checks.get("redis") == "ok"
     return jsonify(checks), 200 if all_ok else 503
 
