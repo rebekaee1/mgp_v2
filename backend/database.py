@@ -4,6 +4,7 @@ Graceful degradation: если PostgreSQL недоступен, приложен
 """
 
 import logging
+import os
 import re as _re
 from contextlib import contextmanager
 from typing import Optional, Generator
@@ -46,12 +47,19 @@ def init_db(database_url: str) -> bool:
         database_url = _ensure_psycopg_url(database_url)
 
     try:
-        kwargs = {} if is_sqlite else dict(
-            pool_size=5,
-            max_overflow=10,
-            pool_pre_ping=True,
-            pool_recycle=300,
-        )
+        kwargs = {}
+        if not is_sqlite:
+            pool_size = max(1, int(os.getenv("DB_POOL_SIZE", "2")))
+            max_overflow = max(0, int(os.getenv("DB_MAX_OVERFLOW", "2")))
+            pool_timeout = max(1, int(os.getenv("DB_POOL_TIMEOUT_SECONDS", "5")))
+            kwargs = dict(
+                pool_size=pool_size,
+                max_overflow=max_overflow,
+                pool_timeout=pool_timeout,
+                pool_pre_ping=True,
+                pool_recycle=300,
+                pool_use_lifo=True,
+            )
         _engine = create_engine(database_url, echo=False, **kwargs)
 
         if is_sqlite:
@@ -73,7 +81,13 @@ def init_db(database_url: str) -> bool:
             Base.metadata.create_all(_engine)
             logger.info("SQLite database ready: %s", database_url)
         else:
-            logger.info("PostgreSQL connected: %s", database_url.split("@")[-1])
+            logger.info(
+                "PostgreSQL connected: %s (pool_size=%s max_overflow=%s timeout=%ss)",
+                database_url.split("@")[-1],
+                kwargs.get("pool_size"),
+                kwargs.get("max_overflow"),
+                kwargs.get("pool_timeout"),
+            )
 
         _SessionLocal = sessionmaker(bind=_engine, expire_on_commit=False)
         _db_available = True
