@@ -49,9 +49,9 @@ def init_db(database_url: str) -> bool:
     try:
         kwargs = {}
         if not is_sqlite:
-            pool_size = max(1, int(os.getenv("DB_POOL_SIZE", "2")))
-            max_overflow = max(0, int(os.getenv("DB_MAX_OVERFLOW", "2")))
-            pool_timeout = max(1, int(os.getenv("DB_POOL_TIMEOUT_SECONDS", "5")))
+            pool_size = max(1, int(os.getenv("DB_POOL_SIZE", "5")))
+            max_overflow = max(0, int(os.getenv("DB_MAX_OVERFLOW", "10")))
+            pool_timeout = max(1, int(os.getenv("DB_POOL_TIMEOUT_SECONDS", "10")))
             kwargs = dict(
                 pool_size=pool_size,
                 max_overflow=max_overflow,

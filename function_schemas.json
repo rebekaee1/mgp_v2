@@ -13,7 +13,7 @@
     {
       "type": "function",
       "name": "search_tours",
-      "description": "Запускает асинхронный поиск туров. Возвращает requestid. Пайплайн: search_tours → get_search_status → get_search_results. Цены ЗА НОМЕР. Даты: ДД.ММ.ГГГГ, макс. диапазон 14 дней.",
+      "description": "Запускает асинхронный поиск туров. Возвращает requestid. Пайплайн: search_tours → get_search_status → get_search_results. Цены ЗА НОМЕР. Даты: ДД.ММ.ГГГГ, макс. диапазон 14 дней. ⛔ НЕ поддерживает фильтрацию по: багажу, трансферу, страховке, визе, времени вылета, авиакомпании. НИКОГДА не обещай поиск по этим параметрам.",
       "parameters": {
         "type": "object",
         "properties": {
@@ -35,13 +35,13 @@
           },
           "nightsfrom": {
             "type": "integer",
-            "description": "Мин. ночей.",
+            "description": "Мин. ночей. Клиент дал диапазон дат (с X по Y / с X-Y / X-Y месяц) → nightsfrom = Y-X, НЕ спрашивай отдельно.",
             "default": 7,
             "minimum": 1
           },
           "nightsto": {
             "type": "integer",
-            "description": "Макс. ночей.",
+            "description": "Макс. ночей. Клиент дал диапазон дат → nightsto = nightsfrom.",
             "default": 10,
             "minimum": 1
           },
@@ -79,7 +79,7 @@
           },
           "stars": {
             "type": "integer",
-            "description": "Мин. звёздность.",
+            "description": "Мин. звёздность. Когда клиент говорит 'любой'/'без разницы'/'на ваше усмотрение' — используй умные дефолты по стране из system_prompt §3.6.1. НЕ оставляй пустым при skip QC.",
             "enum": [2, 3, 4, 5]
           },
           "starsbetter": {
@@ -90,7 +90,7 @@
           },
           "meal": {
             "type": "integer",
-            "description": "Код питания (get_dictionaries type=meal)."
+            "description": "Код питания (get_dictionaries type=meal). Когда клиент говорит 'любой'/'без разницы' — используй умные дефолты по стране из system_prompt §3.6.1. НЕ оставляй пустым при skip QC."
           },
           "mealbetter": {
             "type": "integer",
@@ -110,11 +110,11 @@
           },
           "hoteltypes": {
             "type": "string",
-            "description": "Типы: active,relax,family,health,city,beach,deluxe."
+            "description": "Типы: active,relax,family,health,city,beach,deluxe. ⛔ НЕ добавляй этот параметр, если клиент не упомянул тип отдыха явно (пляжный, городской и т.д.)."
           },
           "regions": {
             "type": "string",
-            "description": "Коды курортов через запятую. Турция: Аланья=19, Анталья=20, Белек=21, Кемер=22, Сиде=23."
+            "description": "Коды курортов через запятую. Турция: Аланья=19, Анталья=20, Белек=21, Кемер=22, Сиде=23. ⛔ НЕ добавляй regions, если клиент указал только страну без конкретного курорта."
           },
           "subregions": {
             "type": "string",

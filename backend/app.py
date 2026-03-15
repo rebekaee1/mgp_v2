@@ -249,6 +249,10 @@ _handlers_lock = threading.Lock()
 _handlers: dict[str, dict] = {}  # cache_key → {"handler": Handler, "last_active": float}
 SESSION_TTL_SECONDS = 30 * 60  # 30 минут неактивности → удаление
 
+# Per-session mutexes to prevent concurrent request processing (double messages)
+_session_chat_locks: dict[str, threading.Lock] = {}
+_session_chat_locks_guard = threading.Lock()
+
 
 def _session_cache_key(session_id: str, assistant_id: str = None) -> str:
     return f"{assistant_id or 'default'}::{session_id}"
@@ -347,9 +351,17 @@ def _restore_handler_from_db(handler, session_id: str, assistant_id: str = None)
                 handler._search_awaiting_results = False
 
             if hasattr(handler, "_update_collected_slots"):
+                if hasattr(handler, "_collected_slots"):
+                    handler._collected_slots.clear()
                 for entry in restored_history:
                     if entry.get("role") == "user" and entry.get("content"):
                         handler._update_collected_slots(entry["content"])
+                # After restoration, remove potentially stale child-related slots
+                # that were extracted from historical messages -- the authoritative
+                # source is _last_search_params from the DB, not regex over old text.
+                if hasattr(handler, "_collected_slots"):
+                    for _stale_key in ("Дети", "Возраст ребёнка"):
+                        handler._collected_slots.pop(_stale_key, None)
 
             latest_search = db.query(TourSearch).filter(
                 TourSearch.conversation_id == conv.id
@@ -399,6 +411,28 @@ def _restore_handler_from_db(handler, session_id: str, assistant_id: str = None)
                     "min_price": latest_search.min_price,
                     "duration_ms": latest_search.duration_ms,
                 }
+
+                _param_labels = {
+                    "departure": "Город вылета", "country": "Страна",
+                    "datefrom": "Дата от", "dateto": "Дата до",
+                    "nightsfrom": "Ночей от", "nightsto": "Ночей до",
+                    "adults": "Взрослых", "child": "Детей",
+                    "stars": "Звёзды", "meal": "Питание",
+                }
+                _summary_lines = []
+                for k, label in _param_labels.items():
+                    v = params.get(k)
+                    if v is not None:
+                        _summary_lines.append(f"- {label}: {v}")
+                if _summary_lines and hasattr(handler, "full_history"):
+                    handler.full_history.append({
+                        "role": "system",
+                        "content": (
+                            "[ВОССТАНОВЛЕННАЯ СЕССИЯ] Параметры предыдущего поиска:\n"
+                            + "\n".join(_summary_lines)
+                            + "\nНЕ переспрашивай эти параметры. Используй их для контекста."
+                        )
+                    })
 
             if latest_tour_cards:
                 handler._tourid_map = {}
@@ -1383,6 +1417,21 @@ def chat_v1():
     log(f"📨 [v1] Новое сообщение от {session_id[:8]}...", "MSG")
     log(f"   └─ \"{message[:100]}{'...' if len(message) > 100 else ''}\"", "MSG")
 
+    # Acquire per-session lock to prevent concurrent processing (double messages)
+    with _session_chat_locks_guard:
+        if session_id not in _session_chat_locks:
+            _session_chat_locks[session_id] = threading.Lock()
+        _chat_lock = _session_chat_locks[session_id]
+
+    if not _chat_lock.acquire(blocking=False):
+        logger.warning("🚫 DOUBLE-REQUEST: session %s already processing, rejecting", session_id[:8])
+        return jsonify({
+            'error': 'Request already in progress',
+            'reply': 'Подождите, обрабатываю предыдущий запрос...',
+            'tour_cards': [],
+            'conversation_id': conversation_id
+        }), 429
+
     _write_dialogue_log(session_id, "USER", message)
 
     handler = get_handler(session_id, assistant_id=assistant_id)
@@ -1447,6 +1496,9 @@ def chat_v1():
             'tour_cards': [],
             'conversation_id': conversation_id
         }), 500
+
+    finally:
+        _chat_lock.release()
 
 
 @app.route('/api/chat/stream', methods=['POST'])

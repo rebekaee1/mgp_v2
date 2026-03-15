@@ -12,7 +12,7 @@ services:
       -c work_mem=4MB
       -c maintenance_work_mem=32MB
       -c effective_cache_size=${PG_EFFECTIVE_CACHE:-256MB}
-      -c max_connections=${PG_MAX_CONN:-20}
+      -c max_connections=${PG_MAX_CONN:-50}
       -c wal_buffers=2MB
       -c checkpoint_completion_target=0.9
       -c random_page_cost=1.1

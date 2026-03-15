@@ -30,6 +30,7 @@ try:
         _is_promised_search,
         _dedup_response,
         _strip_reasoning_leak,
+        _strip_technical_ids,
         _dedup_sentences,
         _strip_trailing_fragment,
         StreamCallback,
@@ -40,6 +41,7 @@ except ImportError:
         _is_promised_search,
         _dedup_response,
         _strip_reasoning_leak,
+        _strip_technical_ids,
         _dedup_sentences,
         _strip_trailing_fragment,
         StreamCallback,
@@ -104,6 +106,7 @@ class OpenAIHandler(YandexGPTHandler):
         self._pinned_search_intent: Optional[str] = None
         # Collected cascade slots — injected as system message to prevent "forgetting"
         self._collected_slots: Dict[str, str] = {}
+        self._nights_from_date_range = False
 
         # 0 = не показывали, 1 = мягкое (60 msgs), 2 = финальное (72 msgs)
         self._context_warning_stage = 0
@@ -206,12 +209,18 @@ class OpenAIHandler(YandexGPTHandler):
         # Collected cascade slots reminder (prevents model from re-asking known params)
         if self._collected_slots:
             slot_lines = [f"- {k}: {v}" for k, v in self._collected_slots.items()]
+            _slots_suffix = "\nЕсли клиент НЕ меняет параметр — используй сохранённое значение."
+            if self._nights_from_date_range and "Длительность" in self._collected_slots:
+                _slots_suffix += (
+                    "\n⛔ Ночи ВЫЧИСЛЕНЫ из диапазона дат клиента. "
+                    "НЕ спрашивай «на сколько ночей?». Длительность уже известна."
+                )
             messages.append({
                 "role": "system",
                 "content": (
                     "[СОБРАННЫЕ ПАРАМЕТРЫ КЛИЕНТА — НЕ переспрашивай]\n"
                     + "\n".join(slot_lines)
-                    + "\nЕсли клиент НЕ меняет параметр — используй сохранённое значение."
+                    + _slots_suffix
                 )
             })
 
@@ -256,8 +265,13 @@ class OpenAIHandler(YandexGPTHandler):
         ],
         "Даты": [
             (r'(\d{1,2}[./]\d{1,2}(?:[./]\d{2,4})?)', None),
+            (r'(\d{1,2})\s*[-–]\s*(\d{1,2})\s+(?:января|февраля|марта|апреля|мая|июня|июля|августа|'
+             r'сентября|октября|ноября|декабря)', None),
             (r'(\d{1,2})\s+(?:января|февраля|марта|апреля|мая|июня|июля|августа|'
              r'сентября|октября|ноября|декабря)', None),
+            (r'после\s+(\d{1,2})\s*[./]?\s*(\d{1,2})', None),
+            (r'после\s+(\d{1,2})\s+(?:январ|феврал|март|апрел|ма[яй]|июн|июл|август|'
+             r'сентябр|октябр|ноябр|декабр)', None),
             (r'ближайш\w*\s*(?:вылет|дат|рейс)?', "ближайший вылет"),
             (r'(?:всё?\s*равно|не\s*важно|неважно)\s*когда', "ближайший вылет"),
             (r'какой\s+есть\s+(?:вылет|рейс)', "ближайший вылет"),
@@ -330,9 +344,9 @@ class OpenAIHandler(YandexGPTHandler):
                     self._collected_slots[slot_name] = value
                     break
 
-        # Date-range → nights: "с 16 по 28 апреля" = 12 ночей
+        # Date-range → nights: "с 16 по 28 апреля", "с 1-15 июня", "1-15 июня" = N ночей
         _range_m = re.search(
-            r'с\s+(\d{1,2})\s*(?:по|до)\s*(\d{1,2})\s*'
+            r'(?:с\s+)?(\d{1,2})\s*(?:по|до|-|–)\s*(\d{1,2})\s*'
             r'(?:январ|феврал|март|апрел|ма[яй]|июн|июл|август|'
             r'сентябр|октябр|ноябр|декабр)',
             text, re.IGNORECASE
@@ -344,6 +358,7 @@ class OpenAIHandler(YandexGPTHandler):
             if 1 <= _nights <= 30:
                 self._collected_slots["Даты"] = _range_m.group(0)
                 self._collected_slots["Длительность"] = f"{_nights} ночей"
+                self._nights_from_date_range = True
                 logger.debug("📌 NIGHTS-FROM-RANGE: %d ночей из '%s'", _nights, _range_m.group(0))
 
         # Context-aware: bare "любой/любая/без разницы" → check what model asked
@@ -794,10 +809,42 @@ class OpenAIHandler(YandexGPTHandler):
                 })
                 continue
 
-            # Safety-net: bot asks about dates but user said "ближайший"
+            # Safety-net: deadlock cycle "уже показаны" / "горящие туры уже показаны"
+            _already_shown_match = re.search(
+                r'(?:горящие\s+)?туры?\s+уже\s+(?:показан|отображ|выведен)',
+                final_text, re.IGNORECASE
+            )
+            if _already_shown_match:
+                _recent_assistant = [
+                    m.get("content", "") for m in self.full_history[-10:]
+                    if m.get("role") == "assistant" and m.get("content")
+                ]
+                _already_shown_count = sum(
+                    1 for txt in _recent_assistant
+                    if re.search(r'туры?\s+уже\s+(?:показан|отображ)', txt, re.IGNORECASE)
+                )
+                if _already_shown_count >= 1:
+                    empty_retries += 1
+                    logger.warning(
+                        "⚠️ ALREADY-SHOWN-DEADLOCK detected (#%d): count=%d",
+                        empty_retries, _already_shown_count
+                    )
+                    if empty_retries < 2:
+                        self.full_history.append({"role": "assistant", "content": final_text})
+                        self.full_history.append({"role": "user", "content":
+                            "СИСТЕМНАЯ ОШИБКА: Ты уже говорил 'туры показаны', но клиент "
+                            "их не видит — это проблема интерфейса. ЗАПРЕЩЕНО повторять "
+                            "'уже показаны'! Вместо этого: 1) Предложи обновить страницу; "
+                            "2) ВЫЗОВИ get_hot_tours заново чтобы отправить данные повторно; "
+                            "3) Предложи сделать обычный поиск search_tours. "
+                            "ДЕЙСТВУЙ, не объясняй!"
+                        })
+                        continue
+
+            # Safety-net: bot asks about dates but user said "ближайший" or "после X"
             _asks_date = re.search(
                 r'(?:как\w+\s*месяц|какие\s*дат|когда\s*план|на\s*как\w+\s*месяц|'
-                r'промежут\w*\s*дат|уточн\w+\s*дат)',
+                r'промежут\w*\s*дат|уточн\w+\s*дат|конкретн\w+\s*дат)',
                 final_text, re.IGNORECASE
             )
             if _asks_date:
@@ -806,6 +853,65 @@ class OpenAIHandler(YandexGPTHandler):
                               m.get("content", ""), re.IGNORECASE)
                     for m in self.full_history[-8:] if m.get("role") == "user"
                 )
+                # Check for "после X" pattern (date, not duration like "после 3 дней")
+                _after_date_re = (
+                    r'после\s+(\d{1,2})\s*[./ ]\s*(\d{1,2})(?!\s*(?:ноч|дн|дней|день|недел))'
+                    r'|после\s+(\d{1,2})\s+(?:январ|феврал|март|апрел|ма[яй]|июн|июл|август|'
+                    r'сентябр|октябр|ноябр|декабр)'
+                )
+                _user_said_after = any(
+                    re.search(_after_date_re, m.get("content", ""), re.IGNORECASE)
+                    for m in self.full_history[-8:] if m.get("role") == "user"
+                )
+                if _user_said_after:
+                    empty_retries += 1
+                    logger.warning(
+                        "⚠️ DATE-ASK-AFTER-OVERRIDE: bot asks date but user said 'после X' (#%d)",
+                        empty_retries
+                    )
+                    if empty_retries < 2:
+                        # Extract the "после X" value from user messages
+                        _month_map = {
+                            'январ': '01', 'феврал': '02', 'март': '03', 'апрел': '04',
+                            'мая': '05', 'май': '05', 'июн': '06', 'июл': '07',
+                            'август': '08', 'сентябр': '09', 'октябр': '10',
+                            'ноябр': '11', 'декабр': '12',
+                        }
+                        _after_day = "?"
+                        _after_month = "?"
+                        for m in self.full_history[-8:]:
+                            if m.get("role") != "user":
+                                continue
+                            _txt = m.get("content", "")
+                            # Try "после DD.MM" or "после DD MM"
+                            _dm = re.search(r'после\s+(\d{1,2})\s*[./ ]\s*(\d{1,2})', _txt, re.IGNORECASE)
+                            if _dm:
+                                _after_day = _dm.group(1)
+                                _after_month = _dm.group(2).zfill(2)
+                                break
+                            # Try "после DD месяц_название"
+                            _dn = re.search(
+                                r'после\s+(\d{1,2})\s+(январ\w*|феврал\w*|март\w*|апрел\w*|'
+                                r'ма[яй]\w*|июн\w*|июл\w*|август\w*|сентябр\w*|октябр\w*|'
+                                r'ноябр\w*|декабр\w*)', _txt, re.IGNORECASE
+                            )
+                            if _dn:
+                                _after_day = _dn.group(1)
+                                _mname = _dn.group(2).lower()
+                                for prefix, num in _month_map.items():
+                                    if _mname.startswith(prefix):
+                                        _after_month = num
+                                        break
+                                break
+                        self.full_history.append({"role": "assistant", "content": final_text})
+                        self.full_history.append({"role": "user", "content":
+                            f"СИСТЕМНАЯ ОШИБКА: Клиент сказал 'после {_after_day}.{_after_month}'. "
+                            f"Это означает datefrom={_after_day}.{_after_month}! "
+                            f"НЕ спрашивай конкретную дату! Слот Даты ЗАПОЛНЕН. "
+                            f"dateto = datefrom + 14 дней. "
+                            f"Если ночи неизвестны — спроси ТОЛЬКО про ночи, НЕ про даты."
+                        })
+                        continue
                 if _user_said_nearest:
                     empty_retries += 1
                     logger.warning(
@@ -855,6 +961,36 @@ class OpenAIHandler(YandexGPTHandler):
                                 f"НЕМЕДЛЕННО вызови search_tours."
                             })
                             continue
+
+            # Safety-net: bot asks about QC (stars/meal) before Состав slot
+            # Only match actual QUESTIONS (какой/какую/сколько), not statements like "подберу 4★ всё включено"
+            _asks_qc = re.search(
+                r'(?:как\w+\s*(?:категори|звёзд|питани)|какую?\s*(?:категори|звёзд|питани)|'
+                r'сколько\s*звёзд|какую?\s*звёздност\w*|тип\s*питани\w*\s*(?:предпочит|хотите|интерес|рассматр))',
+                final_text, re.IGNORECASE
+            )
+            _has_composition = (
+                "Состав" in self._collected_slots or
+                "Дети" in self._collected_slots or
+                any(re.search(r'(?:взросл|детей|ребён|вдвоём|семь|компани)', m.get("content", ""), re.IGNORECASE)
+                    for m in self.full_history[-10:] if m.get("role") == "user")
+            )
+            if _asks_qc and not _has_composition:
+                empty_retries += 1
+                logger.warning(
+                    "⚠️ QC-BEFORE-COMPOSITION: bot asks QC but Состав unknown (#%d)",
+                    empty_retries
+                )
+                if empty_retries < 2:
+                    self.full_history.append({"role": "assistant", "content": final_text})
+                    self.full_history.append({"role": "user", "content":
+                        "СИСТЕМНАЯ ОШИБКА: Ты спросил о звёздности/питании (слот 5), "
+                        "но ещё не знаешь СОСТАВ группы (слот 4)! "
+                        "СТРОГИЙ ПОРЯДОК: Направление → Город → Даты → **Состав** → QC. "
+                        "СНАЧАЛА спроси: 'Сколько взрослых и будут ли дети?' "
+                        "Только ПОСЛЕ этого переходи к QC."
+                    })
+                    continue
 
             # Safety-net: bot asks about stars but user named a specific hotel/brand
             _asks_stars = re.search(
@@ -962,6 +1098,9 @@ class OpenAIHandler(YandexGPTHandler):
 
             # Strip leaked LLM reasoning / JSON fragments from end of response
             final_text = _strip_reasoning_leak(final_text)
+
+            # Strip leaked internal IDs (tourid, hotelcode, requestid)
+            final_text = _strip_technical_ids(final_text)
 
             # Sentence-level dedup (catches intra-paragraph question repeats)
             final_text = _dedup_sentences(final_text)
@@ -1123,10 +1262,12 @@ class OpenAIHandler(YandexGPTHandler):
         self._pinned_context = None
         self._pinned_search_intent = None
         self._collected_slots = {}
+        self._nights_from_date_range = False
         self._last_departure_city = "Москва"
         self._last_requestid = None
         self._tourid_map = {}
         self._tour_details_cache = {}
+        self._shown_flight_signatures = {}
         self._last_search_params = {}
         self._user_stated_budget = None
         self._empty_iterations = 0
