@@ -355,6 +355,42 @@ class ProvisioningRequest(Base):
     )
 
 
+class ReconciliationRequest(Base):
+    """LK-triggered reconciliation request state for runtime recovery."""
+    __tablename__ = "reconciliation_requests"
+
+    reconciliation_request_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    idempotency_key: Mapped[str] = mapped_column(String(128), nullable=False)
+    control_plane_request_id: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="queued")
+    assistant_id: Mapped[Optional[uuid.UUID]] = mapped_column(UUID(), nullable=True)
+    conversation_id: Mapped[Optional[uuid.UUID]] = mapped_column(UUID(), nullable=True)
+    occurred_from: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    occurred_to: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    limit: Mapped[int] = mapped_column(Integer, default=500)
+    deliver_now: Mapped[bool] = mapped_column(Boolean, default=True)
+    request_payload: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
+    latest_result: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
+    queued_events: Mapped[int] = mapped_column(Integer, default=0)
+    matched_conversations: Mapped[int] = mapped_column(Integer, default=0)
+    delivered_events: Mapped[int] = mapped_column(Integer, default=0)
+    error_code: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    error_message: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    started_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    completed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, onupdate=_utcnow
+    )
+
+    __table_args__ = (
+        Index("ix_reconciliation_requests_status", "status", "created_at"),
+        Index("ix_reconciliation_requests_idempotency", "idempotency_key"),
+    )
+
+
 class RuntimeEventOutbox(Base):
     """Durable outbox for MGP -> LK runtime dialog delivery."""
     __tablename__ = "runtime_event_outbox"

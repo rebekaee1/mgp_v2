@@ -254,6 +254,53 @@ python backend/cli.py replay-outbox --assistant-id <assistant_uuid> --deliver-no
 
 Подробный операционный сценарий описан в `RUNBOOK_DIALOG_DELIVERY_RECOVERY.md`.
 
+### Phase-2 Reconciliation API
+
+Для `LK-triggered recovery` runtime предоставляет reconciliation API:
+
+```bash
+POST /api/runtime/reconciliation
+GET /api/runtime/reconciliation/<reconciliation_request_id>
+```
+
+Auth:
+
+- `Authorization: Bearer <RUNTIME_PROVISIONING_API_TOKEN>`
+- `X-Idempotency-Key`
+- `X-Control-Plane-Request-Id`
+
+Поддерживаемые фильтры request body:
+
+- `assistant_id`
+- `conversation_id`
+- `from`
+- `to`
+- `limit`
+- `deliver_now`
+
+Статусы reconciliation request:
+
+- `queued`
+- `running`
+- `completed`
+- `failed`
+
+Response payload включает:
+
+- `reconciliation_request_id`
+- `status`
+- `control_plane_request_id`
+- `filters`
+- `deliver_now`
+- `result.matched_conversations`
+- `result.queued_events`
+- `result.delivered_events`
+- `error`
+- `created_at`
+- `started_at`
+- `completed_at`
+- `updated_at`
+
 ## Template / Provisioning
 
 Runtime рассчитан на шаблонный запуск новой компании без правки кода:

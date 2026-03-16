@@ -127,4 +127,24 @@ Runtime использует следующие базовые пороги:
 ## Комментарий
 
 Этот runbook покрывает `Phase 1` recovery path на стороне `MGP`.
-`Phase 2` с `LK-triggered reconciliation API` должен быть зафиксирован отдельным контрактом.
+`Phase 2` добавляет `LK-triggered reconciliation API`:
+
+```bash
+POST /api/runtime/reconciliation
+GET /api/runtime/reconciliation/<reconciliation_request_id>
+```
+
+Для вызова используются:
+
+- `Authorization: Bearer <RUNTIME_PROVISIONING_API_TOKEN>`
+- `X-Idempotency-Key`
+- `X-Control-Plane-Request-Id`
+
+Body поддерживает:
+
+- `assistant_id`
+- `conversation_id`
+- `from`
+- `to`
+- `limit`
+- `deliver_now`

@@ -51,9 +51,11 @@ CORS(app, resources={
 
 from dashboard_api import auth_bp, dash_bp
 from provisioning_api import provisioning_bp
+from reconciliation_api import reconciliation_bp
 app.register_blueprint(auth_bp)
 app.register_blueprint(dash_bp)
 app.register_blueprint(provisioning_bp)
+app.register_blueprint(reconciliation_bp)
 
 from werkzeug.middleware.proxy_fix import ProxyFix
 app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_prefix=1)
