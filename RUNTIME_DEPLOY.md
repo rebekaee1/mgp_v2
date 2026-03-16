@@ -115,6 +115,11 @@
 - `service_auth_mode`
 - флаг включенного reporting/webhook слоя
 - backlog sender-а: `dialog_sender_backlog.pending|retrying|failed`
+- `oldest_undelivered_event_age_sec`
+- `last_successful_delivery_at`
+- `estimated_delivery_lag_sec`
+- `delivery_pipeline_status`
+- `dialog_sender_alert_thresholds`
 
 ### Provisioning Contract
 
@@ -230,6 +235,24 @@ Status model:
 - idempotency: `event_id` уникален на snapshot; receiver может дедуплицировать по `assistant_id + event_id`
 
 Секрет `runtime.reporting.auth.secret` сохраняется в `assistant.runtime_metadata`, но не возвращается в callback/status API.
+
+### Phase-1 Recovery
+
+Для production-safe recovery на стороне runtime должен быть доступен admin/job replay:
+
+```bash
+python backend/cli.py replay-outbox --assistant-id <assistant_uuid>
+python backend/cli.py replay-outbox --conversation-id <conversation_uuid>
+python backend/cli.py replay-outbox --from 2026-03-16T00:00:00+00:00 --to 2026-03-16T23:59:59+00:00
+```
+
+С немедленной попыткой доставки:
+
+```bash
+python backend/cli.py replay-outbox --assistant-id <assistant_uuid> --deliver-now
+```
+
+Подробный операционный сценарий описан в `RUNBOOK_DIALOG_DELIVERY_RECOVERY.md`.
 
 ## Template / Provisioning
 

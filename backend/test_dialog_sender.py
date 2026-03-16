@@ -1,11 +1,18 @@
 import tempfile
 import unittest
 import uuid
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import patch
 
 from database import init_db, get_db
-from dialog_sender import _payload_size_bytes, enqueue_conversation_snapshot, run_dialog_sender_once
+from dialog_sender import (
+    _payload_size_bytes,
+    collect_delivery_metrics,
+    enqueue_conversation_snapshot,
+    replay_conversation_snapshots,
+    run_dialog_sender_once,
+)
 from models import ApiCall, Assistant, Company, Conversation, Message, RuntimeEventOutbox, TourSearch
 
 
@@ -205,6 +212,62 @@ class DialogSenderTestCase(unittest.TestCase):
                 "truncated" in (tool_messages[-1]["content"] or "")
                 or "omitted" in (tool_messages[-1]["content"] or "")
             )
+
+    def test_collect_delivery_metrics_reports_lag_and_status(self):
+        now = datetime.now(timezone.utc)
+        with get_db() as db:
+            db.add(RuntimeEventOutbox(
+                assistant_id=self.assistant_id,
+                conversation_id=self.conversation_id,
+                event_id=f"{self.conversation_id}:sent",
+                event_type="conversation_snapshot",
+                status="sent",
+                payload={"event_type": "conversation_snapshot"},
+                attempts=1,
+                sent_at=now - timedelta(seconds=15),
+            ))
+            db.add(RuntimeEventOutbox(
+                assistant_id=self.assistant_id,
+                conversation_id=self.conversation_id,
+                event_id=f"{self.conversation_id}:pending",
+                event_type="conversation_snapshot",
+                status="pending",
+                payload={"event_type": "conversation_snapshot"},
+                attempts=0,
+                next_retry_at=now - timedelta(seconds=5),
+                created_at=now - timedelta(seconds=120),
+            ))
+
+        with get_db() as db:
+            metrics = collect_delivery_metrics(
+                db,
+                reporting_enabled=True,
+                dialog_sender_enabled=True,
+            )
+
+        self.assertEqual(metrics["dialog_sender_backlog"]["pending"], 1)
+        self.assertEqual(metrics["dialog_sender_backlog"]["failed"], 0)
+        self.assertGreaterEqual(metrics["oldest_undelivered_event_age_sec"], 100)
+        self.assertEqual(metrics["estimated_delivery_lag_sec"], metrics["oldest_undelivered_event_age_sec"])
+        self.assertIsNotNone(metrics["last_successful_delivery_at"])
+        self.assertEqual(metrics["delivery_pipeline_status"], "degraded")
+
+    def test_replay_backfill_queues_snapshot_by_filters(self):
+        with get_db() as db:
+            result = replay_conversation_snapshots(
+                db,
+                assistant_id=self.assistant_id,
+                conversation_id=self.conversation_id,
+                limit=10,
+            )
+            self.assertEqual(result["matched"], 1)
+            self.assertEqual(result["queued"], 1)
+
+        with get_db() as db:
+            outbox = db.query(RuntimeEventOutbox).all()
+            self.assertEqual(len(outbox), 1)
+            self.assertEqual(outbox[0].status, "pending")
+            self.assertEqual(outbox[0].event_type, "conversation_snapshot")
 
 
 if __name__ == "__main__":

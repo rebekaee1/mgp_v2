@@ -70,6 +70,9 @@ class Settings(BaseSettings):
     runtime_dialog_sender_max_attempts: int = 5
     runtime_dialog_sender_retry_backoff_seconds: int = 10
     runtime_dialog_sender_retry_backoff_max_seconds: int = 300
+    runtime_dialog_sender_normal_lag_threshold_seconds: int = 60
+    runtime_dialog_sender_oldest_pending_alert_seconds: int = 300
+    runtime_dialog_sender_failed_backlog_alert_threshold: int = 1
     runtime_provisioning_api_token: str = ""
     runtime_provisioning_callback_timeout_seconds: int = 15
     runtime_provisioning_callback_max_attempts: int = 3

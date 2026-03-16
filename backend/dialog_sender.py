@@ -8,7 +8,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
 import httpx
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from config import settings
 from database import get_db, is_db_available
@@ -175,6 +175,10 @@ def _runtime_reporting_config(runtime_metadata: dict | None) -> dict[str, Any]:
         "auth_header_name": "X-MGP-Service-Token",
         "auth_secret": fallback_secret,
     }
+
+
+def _to_iso_or_none(value: Optional[datetime]) -> Optional[str]:
+    return _iso(value) if value is not None else None
 
 
 def _api_call_external_id(api_call_id: int) -> str:
@@ -346,11 +350,11 @@ def _build_snapshot_payload(
     return _fit_snapshot_payload(payload)
 
 
-def enqueue_conversation_snapshot(db, conversation_id: uuid.UUID, assistant_id: uuid.UUID) -> None:
+def enqueue_conversation_snapshot(db, conversation_id: uuid.UUID, assistant_id: uuid.UUID) -> Optional[str]:
     assistant = db.get(Assistant, assistant_id)
     conversation = db.get(Conversation, conversation_id)
     if assistant is None or conversation is None:
-        return
+        return None
 
     reporting = _runtime_reporting_config(assistant.runtime_metadata)
     if reporting.get("mode") != "batch_snapshot":
@@ -358,7 +362,7 @@ def enqueue_conversation_snapshot(db, conversation_id: uuid.UUID, assistant_id: 
             "Dialog sender skipped conversation=%s assistant=%s reason=reporting_disabled",
             conversation_id, assistant_id,
         )
-        return
+        return None
 
     messages = db.execute(
         select(Message).where(Message.conversation_id == conversation_id).order_by(Message.created_at.asc(), Message.id.asc())
@@ -391,6 +395,7 @@ def enqueue_conversation_snapshot(db, conversation_id: uuid.UUID, assistant_id: 
         len(tour_searches),
         len(api_calls),
     )
+    return event_id
 
 
 def _payload_hash(payload: dict[str, Any]) -> str:
@@ -410,6 +415,111 @@ def _load_due_events(db, limit: int) -> list[RuntimeEventOutbox]:
         .limit(limit)
     )
     return db.execute(stmt).scalars().all()
+
+
+def collect_delivery_metrics(
+    db,
+    *,
+    reporting_enabled: bool,
+    dialog_sender_enabled: bool,
+) -> dict[str, Any]:
+    counts = dict(
+        db.query(RuntimeEventOutbox.status, func.count(RuntimeEventOutbox.id))
+        .group_by(RuntimeEventOutbox.status)
+        .all()
+    )
+    oldest_undelivered_at = (
+        db.query(func.min(RuntimeEventOutbox.created_at))
+        .filter(RuntimeEventOutbox.status.in_(_STATUSES_PENDING))
+        .scalar()
+    )
+    last_successful_delivery_at = (
+        db.query(func.max(RuntimeEventOutbox.sent_at))
+        .filter(RuntimeEventOutbox.status == "sent")
+        .scalar()
+    )
+
+    oldest_age_sec: Optional[int] = None
+    if oldest_undelivered_at is not None:
+        oldest_age_sec = max(0, int((_utcnow() - oldest_undelivered_at).total_seconds()))
+
+    estimated_lag_sec = oldest_age_sec or 0
+    failed_count = int(counts.get("failed", 0))
+    retrying_count = int(counts.get("retrying", 0))
+
+    pipeline_status = "ok"
+    if not reporting_enabled or not dialog_sender_enabled:
+        pipeline_status = "disabled"
+    elif failed_count >= max(1, int(settings.runtime_dialog_sender_failed_backlog_alert_threshold)):
+        pipeline_status = "failed"
+    elif oldest_age_sec is not None and oldest_age_sec >= int(settings.runtime_dialog_sender_oldest_pending_alert_seconds):
+        pipeline_status = "failed"
+    elif retrying_count > 0:
+        pipeline_status = "degraded"
+    elif oldest_age_sec is not None and oldest_age_sec > int(settings.runtime_dialog_sender_normal_lag_threshold_seconds):
+        pipeline_status = "degraded"
+
+    return {
+        "dialog_sender_backlog": {
+            "pending": int(counts.get("pending", 0)),
+            "retrying": retrying_count,
+            "failed": failed_count,
+        },
+        "oldest_undelivered_event_age_sec": oldest_age_sec,
+        "last_successful_delivery_at": _to_iso_or_none(last_successful_delivery_at),
+        "estimated_delivery_lag_sec": estimated_lag_sec,
+        "delivery_pipeline_status": pipeline_status,
+        "dialog_sender_alert_thresholds": {
+            "normal_lag_sec": int(settings.runtime_dialog_sender_normal_lag_threshold_seconds),
+            "oldest_undelivered_alert_sec": int(settings.runtime_dialog_sender_oldest_pending_alert_seconds),
+            "failed_backlog_alert_count": int(settings.runtime_dialog_sender_failed_backlog_alert_threshold),
+        },
+    }
+
+
+def replay_conversation_snapshots(
+    db,
+    *,
+    assistant_id: Optional[uuid.UUID] = None,
+    conversation_id: Optional[uuid.UUID] = None,
+    occurred_from: Optional[datetime] = None,
+    occurred_to: Optional[datetime] = None,
+    limit: int = 500,
+) -> dict[str, Any]:
+    event_ts = func.coalesce(Conversation.last_active_at, Conversation.started_at)
+    stmt = select(Conversation).order_by(event_ts.asc(), Conversation.id.asc())
+
+    if assistant_id is not None:
+        stmt = stmt.where(Conversation.assistant_id == assistant_id)
+    if conversation_id is not None:
+        stmt = stmt.where(Conversation.id == conversation_id)
+    if occurred_from is not None:
+        stmt = stmt.where(event_ts >= occurred_from)
+    if occurred_to is not None:
+        stmt = stmt.where(event_ts <= occurred_to)
+    if limit > 0:
+        stmt = stmt.limit(limit)
+
+    conversations = db.execute(stmt).scalars().all()
+    queued = 0
+    skipped = 0
+    for conversation in conversations:
+        event_id = enqueue_conversation_snapshot(db, conversation.id, conversation.assistant_id)
+        if event_id:
+            queued += 1
+        else:
+            skipped += 1
+
+    return {
+        "matched": len(conversations),
+        "queued": queued,
+        "skipped": skipped,
+        "assistant_id": str(assistant_id) if assistant_id else None,
+        "conversation_id": str(conversation_id) if conversation_id else None,
+        "occurred_from": _to_iso_or_none(occurred_from),
+        "occurred_to": _to_iso_or_none(occurred_to),
+        "limit": limit,
+    }
 
 
 def _compute_retry_delay(attempt: int) -> int:

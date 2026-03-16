@@ -1769,40 +1769,52 @@ def runtime_status():
         return denied
 
     from config import settings
-    from sqlalchemy import func
     from database import get_db
-    from models import RuntimeEventOutbox
+    from dialog_sender import collect_delivery_metrics
+    from models import Assistant
     from runtime_config import resolve_runtime_config
 
     assistant_id = request.args.get("assistant_id") or request.headers.get("X-Assistant-Id")
     runtime = resolve_runtime_config(assistant_id=assistant_id)
     reporting = dict((runtime.runtime_metadata or {}).get("reporting") or {})
+    reporting_enabled = bool(reporting.get("endpoint_url") or settings.runtime_report_url)
 
     checks = _build_health_payload()
     checks["runtime_mode"] = _RUNTIME_MODE
     checks["runtime_instance_id"] = settings.runtime_instance_id or os.getenv("HOSTNAME") or "mgp-runtime"
     checks["service_auth_mode"] = settings.runtime_service_auth_mode
     checks["trusted_proxy_configured"] = bool(settings.runtime_trusted_proxy_cidrs)
-    checks["reporting_enabled"] = bool(reporting.get("endpoint_url") or settings.runtime_report_url)
+    checks["reporting_enabled"] = reporting_enabled
     checks["dialog_sender_enabled"] = bool(settings.runtime_dialog_sender_enabled)
-    checks["dialog_sender_backlog"] = {
-        "pending": 0,
-        "retrying": 0,
-        "failed": 0,
+    checks["dialog_sender_backlog"] = {"pending": 0, "retrying": 0, "failed": 0}
+    checks["oldest_undelivered_event_age_sec"] = None
+    checks["last_successful_delivery_at"] = None
+    checks["estimated_delivery_lag_sec"] = 0
+    checks["delivery_pipeline_status"] = "disabled" if not checks["dialog_sender_enabled"] else "ok"
+    checks["dialog_sender_alert_thresholds"] = {
+        "normal_lag_sec": int(settings.runtime_dialog_sender_normal_lag_threshold_seconds),
+        "oldest_undelivered_alert_sec": int(settings.runtime_dialog_sender_oldest_pending_alert_seconds),
+        "failed_backlog_alert_count": int(settings.runtime_dialog_sender_failed_backlog_alert_threshold),
     }
     try:
         with get_db() as db:
             if db is not None:
-                counts = dict(
-                    db.query(RuntimeEventOutbox.status, func.count(RuntimeEventOutbox.id))
-                    .group_by(RuntimeEventOutbox.status)
-                    .all()
+                if not reporting_enabled:
+                    assistant_rows = db.query(Assistant.runtime_metadata).filter(Assistant.runtime_metadata.isnot(None)).all()
+                    reporting_enabled = any(
+                        isinstance(row[0], dict)
+                        and isinstance(row[0].get("reporting"), dict)
+                        and bool((row[0].get("reporting") or {}).get("endpoint_url"))
+                        for row in assistant_rows
+                    )
+                    checks["reporting_enabled"] = reporting_enabled
+                checks.update(
+                    collect_delivery_metrics(
+                        db,
+                        reporting_enabled=reporting_enabled,
+                        dialog_sender_enabled=bool(checks["dialog_sender_enabled"]),
+                    )
                 )
-                checks["dialog_sender_backlog"] = {
-                    "pending": int(counts.get("pending", 0)),
-                    "retrying": int(counts.get("retrying", 0)),
-                    "failed": int(counts.get("failed", 0)),
-                }
     except Exception:
         logger.warning("Failed to collect dialog sender backlog", exc_info=True)
     all_ok = checks.get("postgres") == "ok" and checks.get("redis") == "ok"

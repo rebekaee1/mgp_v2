@@ -15,6 +15,8 @@ import argparse
 import json
 import re
 import sys
+import uuid
+from datetime import datetime
 from pathlib import Path
 from typing import Optional, Dict, Any
 
@@ -50,6 +52,29 @@ def _build_widget_config(args: argparse.Namespace) -> Optional[Dict[str, str]]:
     }
     widget = {k: v for k, v in widget.items() if v}
     return widget or None
+
+
+def _parse_uuid(value: Optional[str], *, field_name: str) -> Optional[uuid.UUID]:
+    if not value:
+        return None
+    try:
+        return uuid.UUID(str(value).strip())
+    except ValueError:
+        print(f"ERROR: invalid {field_name}: {value}")
+        sys.exit(1)
+
+
+def _parse_datetime(value: Optional[str], *, field_name: str) -> Optional[datetime]:
+    if not value:
+        return None
+    raw = str(value).strip()
+    if raw.endswith("Z"):
+        raw = raw[:-1] + "+00:00"
+    try:
+        return datetime.fromisoformat(raw)
+    except ValueError:
+        print(f"ERROR: invalid {field_name}: {value}. Use ISO-8601, e.g. 2026-03-16T10:00:00+00:00")
+        sys.exit(1)
 
 
 def _resolve_provisioning_payload(args: argparse.Namespace) -> Dict[str, Any]:
@@ -208,6 +233,54 @@ def create_user(args: argparse.Namespace) -> None:
     print("Done.")
 
 
+def replay_outbox(args: argparse.Namespace) -> None:
+    from dialog_sender import replay_conversation_snapshots, run_dialog_sender_once
+
+    if not init_db(settings.database_url):
+        print("ERROR: Cannot connect to PostgreSQL")
+        sys.exit(1)
+
+    assistant_id = _parse_uuid(args.assistant_id, field_name="assistant_id")
+    conversation_id = _parse_uuid(args.conversation_id, field_name="conversation_id")
+    occurred_from = _parse_datetime(args.from_ts, field_name="from")
+    occurred_to = _parse_datetime(args.to_ts, field_name="to")
+
+    if not any([assistant_id, conversation_id, occurred_from, occurred_to]):
+        print("ERROR: specify at least one filter: --assistant-id, --conversation-id, --from, --to")
+        sys.exit(1)
+
+    if occurred_from and occurred_to and occurred_from > occurred_to:
+        print("ERROR: --from must be <= --to")
+        sys.exit(1)
+
+    with get_db() as db:
+        if db is None:
+            print("ERROR: DB session unavailable")
+            sys.exit(1)
+
+        result = replay_conversation_snapshots(
+            db,
+            assistant_id=assistant_id,
+            conversation_id=conversation_id,
+            occurred_from=occurred_from,
+            occurred_to=occurred_to,
+            limit=max(1, int(args.limit)),
+        )
+
+    delivered_now = 0
+    if getattr(args, "deliver_now", False):
+        delivered_now = run_dialog_sender_once(limit=max(1, int(args.limit)))
+
+    summary = {
+        "mode": "replay-outbox",
+        **result,
+        "deliver_now": bool(getattr(args, "deliver_now", False)),
+        "delivered_now": delivered_now,
+    }
+    print(json.dumps(summary, ensure_ascii=False, indent=2))
+    print("Replay completed.")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="AIMPACT Dashboard CLI")
     sub = parser.add_subparsers(dest="command")
@@ -242,9 +315,19 @@ def main() -> None:
         if not any(existing.dest == action.dest for existing in pt._actions):
             pt._add_action(action)
 
+    ro = sub.add_parser("replay-outbox", help="Queue replay/backfill snapshots into runtime_event_outbox")
+    ro.add_argument("--assistant-id", dest="assistant_id", default=None)
+    ro.add_argument("--conversation-id", dest="conversation_id", default=None)
+    ro.add_argument("--from", dest="from_ts", default=None, help="ISO-8601 lower bound for conversation activity time")
+    ro.add_argument("--to", dest="to_ts", default=None, help="ISO-8601 upper bound for conversation activity time")
+    ro.add_argument("--limit", type=int, default=500)
+    ro.add_argument("--deliver-now", action="store_true", help="Immediately run sender after queueing replay events")
+
     args = parser.parse_args()
     if args.command in {"create-user", "provision-tenant"}:
         create_user(args)
+    elif args.command == "replay-outbox":
+        replay_outbox(args)
     else:
         parser.print_help()
 
