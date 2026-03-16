@@ -246,7 +246,7 @@
     {
       "type": "function",
       "name": "get_dictionaries",
-      "description": "Справочники: departure, country, region, subregion, meal, stars, hotel, operator, flydate, currency, services. Один type за вызов.",
+      "description": "Справочники TourVisor. Передай ТОЛЬКО type + один фильтр (cndep/regcountry/hotcountry). НЕ передавай массивы, списки или собственные данные в аргументах. Пример: {\"type\": \"region\", \"regcountry\": 47}. Один type за вызов.",
       "parameters": {
         "type": "object",
         "properties": {

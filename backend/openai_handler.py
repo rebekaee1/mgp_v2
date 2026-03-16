@@ -136,11 +136,6 @@ class OpenAIHandler(YandexGPTHandler):
         brace_start = cleaned.find('{')
         if brace_start > 0:
             cleaned = cleaned[brace_start:]
-        if len(cleaned) > 2000:
-            cleaned = cleaned[:2000]
-            brace_end = cleaned.rfind('}')
-            if brace_end > 0:
-                cleaned = cleaned[:brace_end + 1]
         return cleaned
 
     # ─── Tools ────────────────────────────────────────────────────────────
@@ -498,6 +493,18 @@ class OpenAIHandler(YandexGPTHandler):
 
         while iteration < max_iterations:
             iteration += 1
+
+            elapsed = time.perf_counter() - chat_start
+            if elapsed > 90:
+                logger.error(
+                    "⏱ WALL-CLOCK TIMEOUT after %.1fs at iteration %d",
+                    elapsed, iteration
+                )
+                return (
+                    "Извините, обработка заняла слишком много времени. "
+                    "Попробуйте переформулировать запрос."
+                )
+
             messages = self._build_openai_messages()
 
             logger.info(
@@ -673,6 +680,37 @@ class OpenAIHandler(YandexGPTHandler):
                     "🔧 TOOL CALLS: %s", ", ".join(func_names)
                 )
 
+                # Guard: truncated tool-call arguments (model hit max_tokens)
+                _completion_tokens = usage.completion_tokens if usage else 0
+                if finish_reason == "length" or _completion_tokens >= 4086:
+                    logger.warning(
+                        "⚠️ TOOL CALLS TRUNCATED (finish=%s, completion=%s) — "
+                        "skipping execution, injecting hint",
+                        finish_reason, _completion_tokens or "?"
+                    )
+                    for tc in message.tool_calls:
+                        self.full_history.append({
+                            "role": "tool",
+                            "tool_call_id": tc.id,
+                            "content": json.dumps({
+                                "error": (
+                                    "Аргументы обрезаны из-за лимита токенов. "
+                                    "Вызови функцию с МИНИМАЛЬНЫМИ аргументами. "
+                                    "Для get_dictionaries передай ТОЛЬКО "
+                                    '{"type": "region", "regcountry": 47}. '
+                                    "НЕ передавай массивы, списки или данные — "
+                                    "только type и один фильтр-код."
+                                )
+                            }, ensure_ascii=False)
+                        })
+                    empty_retries += 1
+                    if empty_retries >= 3:
+                        return (
+                            "Извините, не удалось обработать запрос. "
+                            "Попробуйте переформулировать вопрос."
+                        )
+                    continue
+
                 # Оптимизация: параллельное выполнение tool calls
                 _LARGE_FUNCS = {
                     'get_search_results', 'get_hotel_info', 'get_hot_tours'
@@ -692,12 +730,33 @@ class OpenAIHandler(YandexGPTHandler):
                         return output[:limit] + "…"
                     return output
 
+                _had_json_error = False
+
                 if len(message.tool_calls) == 1:
                     tc = message.tool_calls[0]
                     arguments = self._sanitize_arguments(tc.function.arguments or "{}")
                     result = await self._execute_function(
                         tc.function.name, arguments, tc.id
                     )
+                    output_str = result.get("output", "")
+                    if "невалидный JSON" in output_str:
+                        _had_json_error = True
+                        self._json_error_streak = getattr(self, '_json_error_streak', 0) + 1
+                        if self._json_error_streak >= 3:
+                            self.full_history.pop()
+                            return (
+                                "Извините, возникла техническая ошибка. "
+                                "Попробуйте переформулировать вопрос."
+                            )
+                        if self._json_error_streak >= 2:
+                            result["output"] = json.dumps({
+                                "error": (
+                                    f"СТОП. Уже {self._json_error_streak} ошибок JSON подряд для {tc.function.name}. "
+                                    f"Передай ТОЛЬКО простые параметры из схемы. "
+                                    f'Пример: {{"type": "region", "regcountry": 47}}. '
+                                    f"Никаких массивов, списков или дополнительных полей."
+                                )
+                            }, ensure_ascii=False)
                     self.full_history.append({
                         "role": "tool",
                         "tool_call_id": tc.id,
@@ -721,6 +780,19 @@ class OpenAIHandler(YandexGPTHandler):
                     ])
 
                     for tc_id, tc_name, result in results:
+                        output_str = result.get("output", "")
+                        if "невалидный JSON" in output_str:
+                            _had_json_error = True
+                            self._json_error_streak = getattr(self, '_json_error_streak', 0) + 1
+                            if self._json_error_streak >= 2:
+                                result["output"] = json.dumps({
+                                    "error": (
+                                        f"СТОП. Уже {self._json_error_streak} ошибок JSON подряд для {tc_name}. "
+                                        f"Передай ТОЛЬКО простые параметры из схемы. "
+                                        f'Пример: {{"type": "region", "regcountry": 47}}. '
+                                        f"Никаких массивов, списков или дополнительных полей."
+                                    )
+                                }, ensure_ascii=False)
                         self.full_history.append({
                             "role": "tool",
                             "tool_call_id": tc_id,
@@ -728,6 +800,15 @@ class OpenAIHandler(YandexGPTHandler):
                                 tc_name, result["output"]
                             )
                         })
+
+                    if _had_json_error and getattr(self, '_json_error_streak', 0) >= 3:
+                        return (
+                            "Извините, возникла техническая ошибка. "
+                            "Попробуйте переформулировать вопрос."
+                        )
+
+                if not _had_json_error:
+                    self._json_error_streak = 0
 
                 logger.info(
                     "🔄 TOOL CALLS DONE  count=%d  continuing…",
@@ -1274,6 +1355,7 @@ class OpenAIHandler(YandexGPTHandler):
         self.previous_response_id = None
         self._pending_api_calls = []
         self._last_message_usage = None
+        self._json_error_streak = 0
         self._context_warning_stage = 0
         self._metrics = {
             "promised_search_detections": 0,
