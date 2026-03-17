@@ -1,11 +1,11 @@
 # Deploy Notes
 
-Актуально на `2026-03-16`.
+Актуально на `2026-03-17`.
 
 ## Текущее состояние
 
 - Локальный репозиторий, `origin/main` и код на сервере `/opt/mgp` синхронизированы.
-- Текущий commit: `aed5031` (`fix: production audit — 15 assistant behavior fixes + flight UX improvements`).
+- Текущий commit: `c7cd776` (`fix: departure-context-aware region handling, truncation prevention, date/meal fixes`).
 - Production runtime работает в режиме `backend-only`.
 - Основной production flow: `LK -> MGP runtime -> MGP Postgres`.
 - Legacy SSH-sync на production явно отключен через `SYNC_MGP_ENABLED=false`.
