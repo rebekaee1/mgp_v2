@@ -49,6 +49,12 @@ def _transliterate(text: str, mapping: dict = None) -> str:
     return ''.join(m.get(c, c) for c in text.lower())
 
 
+def _is_departure_context(text: str, match_start: int) -> bool:
+    """Check if a regex match at *match_start* is preceded by a departure preposition (из/с/от)."""
+    prefix_words = text[:match_start].split()
+    return bool(prefix_words and prefix_words[-1] in ("из", "с", "от"))
+
+
 def _fuzzy_hotel_match(queries, hotels: list, threshold: float = 0.65) -> list:
     """Word-level fuzzy matching of one or more *queries* against hotel names.
 
@@ -1417,6 +1423,8 @@ class YandexGPTHandler:
         # и используется как fallback для пропущенных параметров.
         self._last_search_params: Dict = {}
         self._user_stated_budget: Optional[int] = None
+        self._russia_no_region_hint: bool = False
+        self._original_requested_meal: Optional[int] = None
         
         # ── Прогрессивный "ближайший вылет": счётчик попыток и последняя страна ──
         self._nearest_search_attempt: int = 0
@@ -2024,6 +2032,7 @@ class YandexGPTHandler:
             # Если клиент указал конкретный курорт, но модель НЕ передала regions —
             # пытаемся авто-разрешить (Tier 1: hardcoded ID, Tier 2: API lookup),
             # и только если не получилось — возвращаем ошибку
+            _resort_auto_resolved = False
             if not args.get("regions") and not args.get("subregions") and not args.get("hotels"):
                 user_messages_for_region = [
                     msg.get("content", "") for msg in self.full_history[-20:] 
@@ -2038,23 +2047,53 @@ class YandexGPTHandler:
                 #   region_id — если ID региона ИЗВЕСТЕН (популярные регионы)
                 #   parent_region — если город является подрайоном известного региона (нужен API lookup)
                 resort_patterns = [
-                    # ═══ Россия (country=47) — hardcoded IDs из системного промпта ═══
-                    # КМВ — города, входящие в регион "Кав. Мин. Воды" (Tier 1: hardcoded ID 424)
+                    # ═══ Россия (country=47) — ALL TourVisor regions ═══
+                    # КМВ (424) — города региона
                     (r'\b(?:кисловодск\w*|пятигорск\w*|ессентуки\w*|железноводск\w*|минеральн\w*\s*вод\w*|кмв)\b', "России", "424", 47, None),
-                    # Сочи (region=426) + Адлер входит в Сочи
+                    # Сочи (426) + Адлер
                     (r'\b(?:сочи)\b', "России", "426", 47, None),
                     (r'\b(?:адлер\w*)\b', "России", "426", 47, None),
-                    # Красная Поляна — отдельный регион (495)
+                    # Красная Поляна (495)
                     (r'\b(?:красн\w*\s*полян\w*)\b', "России", "495", 47, None),
                     # Черноморское побережье
                     (r'\b(?:анап[аыуе]\w*)\b', "России", "427", 47, None),
                     (r'\b(?:геленджик\w*|новоросс\w*)\b', "России", "428", 47, None),
-                    # Крым (region=423)
+                    (r'\b(?:туапсе\w*)\b', "России", "429", 47, None),
+                    (r'\b(?:азовск\w*)\b', "России", "564", 47, None),
+                    # Крым (423)
                     (r'\b(?:крым\w*)\b', "России", "423", 47, None),
                     (r'\b(?:ялт[аыуе]\w*|алушт[аыуе]\w*|севастопол\w*|феодоси\w*|судак\w*|евпатори\w*)\b', "России", "423", 47, None),
-                    # Калининград (Tier 1: hardcoded ID 425)
+                    # Калининград (425)
                     (r'\b(?:калининград\w*)\b', "России", "425", 47, None),
                     (r'\b(?:светлогорск\w*|зеленоградск\w*)\b', "России", "425", 47, None),
+                    # Горнолыжные курорты
+                    (r'\b(?:домбай\w*)\b', "России", "523", 47, None),
+                    (r'\b(?:приэльбрусь\w*|эльбрус\w*)\b', "России", "524", 47, None),
+                    (r'\b(?:архыз\w*)\b', "России", "525", 47, None),
+                    (r'\b(?:шерегеш\w*)\b', "России", "498", 47, None),
+                    (r'\b(?:абзаков\w*|банно\w*)\b', "России", "518", 47, None),
+                    # Города-направления (одновременно departure и destination)
+                    (r'\b(?:казан[ьи]\w*)\b', "России", "517", 47, None),
+                    (r'\b(?:подмосковь\w*)\b', "России", "469", 47, None),
+                    (r'\b(?:золот\w*\s*кольц\w*)\b', "России", "527", 47, None),
+                    (r'\b(?:велик\w*\s*устюг\w*)\b', "России", "471", 47, None),
+                    # Кавказ
+                    (r'\b(?:дагестан\w*|махачкал\w*|дербент\w*)\b', "России", "662", 47, None),
+                    (r'\b(?:адыге[яи]\w*)\b', "России", "697", 47, None),
+                    (r'\b(?:ингушети\w*)\b', "России", "689", 47, None),
+                    (r'\b(?:кабардин\w*|нальчик\w*)\b', "России", "692", 47, None),
+                    (r'\b(?:осети\w*|владикавказ\w*)\b', "России", "680", 47, None),
+                    (r'\b(?:чечн\w*|грозн\w*)\b', "России", "679", 47, None),
+                    # Природные регионы
+                    (r'\b(?:карели\w*|петрозаводск\w*)\b', "России", "526", 47, None),
+                    (r'\b(?:байкал\w*)\b', "России", "565", 47, None),
+                    (r'\b(?:алтай\w*)\b', "России", "496", 47, None),
+                    (r'\b(?:урал\w*)\b', "России", "563", 47, None),
+                    (r'\b(?:мурманск\w*)\b', "России", "668", 47, None),
+                    # Экскурсионные
+                    (r'\b(?:псков\w*)\b', "России", "617", 47, None),
+                    (r'\b(?:воронеж\w*)\b', "России", "661", 47, None),
+                    (r'\b(?:татарстан\w*)\b', "России", "618", 47, None),
                     # ═══ Турция (country=4) — hardcoded IDs ═══
                     (r'\b(?:алан[ьи]я|аланья)\b', "Турции", "19", 4, None),
                     (r'\b(?:анталь?я|анталия)\b', "Турции", "20", 4, None),
@@ -2100,9 +2139,12 @@ class YandexGPTHandler:
                 
                 mentioned_resort = None
                 for pattern, country_name, region_id, country_code, parent_region in resort_patterns:
-                    if re.search(pattern, user_text_for_region):
-                        resort_match = re.search(pattern, user_text_for_region).group()
-                        mentioned_resort = (resort_match, country_name, region_id, country_code, parent_region)
+                    for _m in re.finditer(pattern, user_text_for_region):
+                        if _is_departure_context(user_text_for_region, _m.start()):
+                            continue
+                        mentioned_resort = (_m.group(), country_name, region_id, country_code, parent_region)
+                        break
+                    if mentioned_resort:
                         break
                 
                 if mentioned_resort:
@@ -2176,6 +2218,9 @@ class YandexGPTHandler:
                         except Exception as e:
                             logger.error("❌ AUTO-RESOLVE (Tier 3) API error: %s", e)
                     
+                    if resolved:
+                        _resort_auto_resolved = True
+
                     # Если не удалось авто-разрешить — fallback: ошибка для модели
                     if not resolved:
                         logger.warning(
@@ -2195,6 +2240,18 @@ class YandexGPTHandler:
                             "_hint": f"Определи код региона '{resort_name}' через get_dictionaries и передай в regions."
                         }
             
+            # ── Soft hint: Россия без региона ──
+            _country_raw = _safe_int(args.get("country"))
+            if (_country_raw == 47
+                    and not args.get("regions")
+                    and not args.get("subregions")
+                    and not args.get("hotels")):
+                self._russia_no_region_hint = True
+                logger.warning(
+                    "⚠️ RUSSIA-NO-REGION: search_tours(country=47) без regions — "
+                    "результаты будут разбросаны, hint будет добавлен"
+                )
+
             # ── Fix C2: Fallback из кэша предыдущего поиска ──
             # Если модель потеряла параметры при смене страны ("а если Египет?"),
             # восстанавливаем пропущенные из кэша. НИКОГДА не перезаписываем явно переданные.
@@ -2414,21 +2471,36 @@ class YandexGPTHandler:
                         args.get("hoteltypes")
                     )
 
-            if args.get("regions"):
+            if args.get("regions") and not _resort_auto_resolved:
                 _all_user_text_r = " ".join([
                     msg.get("content", "") for msg in self.full_history
                     if msg.get("role") == "user" and msg.get("content")
                 ]).lower()
                 _region_keywords = [
-                    r'(?:аланью?|аланья|анталью?|анталья|анталия|анталию|белек\w*|кемер\w*|сиде|мармарис\w*|бодрум\w*|фетхие|даламан\w*)',
+                    r'(?:аланью?|аланья|анталью?|анталья|анталия|анталию|белек\w*|кемер\w*|сиде|мармарис\w*|бодрум\w*|фетхие|даламан\w*|кушадас\w*|стамбул\w*|дидим\w*)',
                     r'(?:хургад\w*|шарм|марса\s*алам|дахаб\w*|табб\w*|макади|сафаг\w*|сома\s*бей)',
                     r'(?:паттай\w*|пхукет\w*|самуи|краби|хуа\s*хин\w*|чианг\w*)',
                     r'(?:нячанг\w*|фукуок\w*|муйне|дананг\w*|хошимин\w*)',
                     r'(?:дубай|абу.?даби|шардж\w*|рас.?эль|аджман\w*|фуджейр\w*)',
                     r'(?:сочи|адлер\w*|анап\w*|геленджик\w*|крым\w*|ялт\w*|алушт\w*|калининград\w*)',
+                    r'(?:казан[ьи]\w*|алтай\w*|шерегеш\w*|дагестан\w*|махачкал\w*|дербент\w*)',
+                    r'(?:карели\w*|байкал\w*|домбай\w*|архыз\w*|приэльбрусь\w*|эльбрус\w*)',
+                    r'(?:кмв|кисловодск\w*|пятигорск\w*|ессентуки\w*|абзаков\w*|банно\w*)',
+                    r'(?:красн\w*\s*полян\w*|урал\w*|мурманск\w*|подмосковь\w*|золот\w+\s*кольц\w*)',
+                    r'(?:псков\w*|воронеж\w*|татарстан\w*|питер\w*|санкт.?петербург\w*)',
+                    r'(?:кабардин\w*|ингушети\w*|осети\w*|чечн\w*|адыге\w*)',
+                    r'(?:азовск\w*|туапсе\w*|новоросс\w*|светлогорск\w*|зеленоградск\w*)',
+                    r'(?:велик\w*\s*устюг\w*|петрозаводск\w*|владикавказ\w*|нальчик\w*|грозн\w*)',
                     r'(?:курорт\w*|район\w*|побережь\w*)',
                 ]
-                _user_wants_region = any(re.search(p, _all_user_text_r) for p in _region_keywords)
+                _user_wants_region = False
+                for _p in _region_keywords:
+                    for _m in re.finditer(_p, _all_user_text_r):
+                        if not _is_departure_context(_all_user_text_r, _m.start()):
+                            _user_wants_region = True
+                            break
+                    if _user_wants_region:
+                        break
                 if not _user_wants_region:
                     logger.info(
                         "🛡️ SAFETY-NET: regions=%s удалён — пользователь не упоминал конкретный курорт",
@@ -2686,6 +2758,9 @@ class YandexGPTHandler:
                 self._last_search_params["_hideregular"] = args["hideregular"]
             if args.get("hotels"):
                 self._last_search_params["_hotels"] = args.get("hotels")
+            _meal_val = _safe_int(args.get("meal"))
+            if _meal_val and _meal_val > 0:
+                self._original_requested_meal = _meal_val
             logger.info("📋 PARAM-CACHE: saved %d params from search", len(self._last_search_params))
             
             # ── Сохраняем "идеальные" параметры для пересортировки результатов ──
@@ -2810,6 +2885,14 @@ class YandexGPTHandler:
                         f"Поиск завершён! Найдено {hotels_found} отелей, {tours_found} туров. "
                         f"Вызови get_search_results с requestid для получения списка отелей."
                     )
+                    if getattr(self, '_russia_no_region_hint', False):
+                        last_status["_hint"] += (
+                            " ⚠️ Поиск по всей России без конкретного региона — результаты разбросаны. "
+                            "В ответе ОБЯЗАТЕЛЬНО предложи клиенту уточнить регион: пляжный отдых (Сочи, Крым, Анапа), "
+                            "горнолыжный (Красная Поляна, Домбай, Шерегеш), экскурсионный (Казань, СПб, Золотое Кольцо), "
+                            "природа (Карелия, Байкал, Алтай)."
+                        )
+                        self._russia_no_region_hint = False
                     if self._user_stated_budget:
                         _mp = int(last_status.get("minprice", 0))
                         if _mp > self._user_stated_budget:
@@ -3069,7 +3152,7 @@ class YandexGPTHandler:
 
             _result_hint = "Карточки с фото, ценами, датами, питанием, звёздами УЖЕ отображены фронтендом. НЕ перечисляй отели, цены, описания, даты, питание, звёзды в тексте! Напиши ТОЛЬКО краткий комментарий (1-2 предложения) и спроси клиента."
 
-            _req_meal_code = _safe_int(self._last_search_params.get("meal"), None)
+            _req_meal_code = _safe_int(self._original_requested_meal, None) or _safe_int(self._last_search_params.get("meal"), None)
             if _req_meal_code and simplified:
                 _req_meal_kw = _MEAL_ID_TO_KEYWORDS.get(_req_meal_code, [])
                 if _req_meal_kw:
@@ -3948,10 +4031,10 @@ class YandexGPTHandler:
                             {"role": "user", "content": "Пожалуйста, продолжи помогать с подбором тура."}
                         ]
                         continue
-                    return "Извините, произошла техническая ошибка. Попробуйте переформулировать запрос или начните новый чат."
+                    return "Что-то пошло не так — попробуйте повторить запрос ещё раз."
                 
                 if "429" in error_str or "Too Many" in error_str:
-                    return "Сервис временно перегружен. Подождите несколько секунд и повторите."
+                    return "Секундочку, сейчас много обращений — повторите через пару секунд!"
                 
                 # Если previous response failed → fallback к full_history
                 if "status failed" in error_str:
@@ -3981,10 +4064,10 @@ class YandexGPTHandler:
                     if empty_retries < 2:
                         empty_retries += 1
                         continue
-                    return "Извините, диалог стал слишком длинным. Пожалуйста, начните новый чат или кратко повторите ваш запрос."
+                    return "Наш диалог получился очень длинным — начните новый чат, и я с радостью продолжу!"
                 
                 self.previous_response_id = None
-                return "Произошла временная ошибка. Попробуйте ещё раз или начните новый чат."
+                return "Что-то пошло не так — попробуйте повторить запрос ещё раз."
             
             # Проверяем function calls
             has_function_calls = False
@@ -4041,10 +4124,10 @@ class YandexGPTHandler:
                                    empty_retries, len(self.full_history))
                     if empty_retries >= 3:
                         logger.error("⚠️ GIVING UP after %d empty responses", empty_retries)
-                        # ── P3: Если карточки уже есть — позитивный fallback вместо "Извините" ──
+                        # ── P3: Если карточки уже есть — позитивный fallback ──
                         if self._pending_tour_cards:
                             return "Вот что нашёл по вашему запросу! Посмотрите варианты и скажите, какой заинтересовал — расскажу подробнее."
-                        return "Извините, не удалось обработать запрос. Попробуйте переформулировать."
+                        return "Что-то пошло не так — попробуйте повторить запрос ещё раз."
                     # Fallback: пересылаем всю историю + nudge сообщение
                     self.previous_response_id = None
                     nudge = {"role": "user", "content": "Продолжи обработку моего запроса на основе полученных данных."}
@@ -4064,7 +4147,7 @@ class YandexGPTHandler:
                     logger.warning("⚠️ %s detected (#%d): \"%s\"", reason, empty_retries, (final_text or '')[:100])
                     
                     if empty_retries >= 3:
-                        return "Извините, произошла ошибка. Попробуйте переформулировать запрос или начните новый чат."
+                        return "Что-то пошло не так — попробуйте переформулировать запрос."
                     
                     # Стратегия: вставляем контекстное приветствие ассистента ПЕРЕД первым
                     # сообщением пользователя. _call_api_sync строит messages из full_history.
@@ -4363,11 +4446,11 @@ class YandexGPTHandler:
                             {"role": "user", "content": "Пожалуйста, продолжи помогать с подбором тура."}
                         ]
                         continue
-                    return "Извините, произошла техническая ошибка. Попробуйте переформулировать запрос или начните новый чат."
+                    return "Что-то пошло не так — попробуйте повторить запрос ещё раз."
                 
                 # 429 Too Many Requests — rate limiting
                 if "429" in error_str or "Too Many" in error_str:
-                    return "Сервис временно перегружен. Подождите несколько секунд и повторите."
+                    return "Секундочку, сейчас много обращений — повторите через пару секунд!"
                 
                 # Если response ещё in_progress — подождать и попробовать снова
                 if "in_progress" in error_str:
@@ -4397,10 +4480,10 @@ class YandexGPTHandler:
                     self._empty_iterations += 1
                     if self._empty_iterations < 3:
                         continue
-                    return "Извините, диалог стал слишком длинным. Пожалуйста, начните новый чат или кратко повторите ваш запрос."
+                    return "Наш диалог получился очень длинным — начните новый чат, и я с радостью продолжу!"
                 
                 self.previous_response_id = None
-                return "Произошла временная ошибка связи. Попробуйте ещё раз или начните новый чат."
+                return "Что-то пошло не так — попробуйте повторить запрос ещё раз."
             
             # Обрабатываем streaming ответ
             full_text = ""
@@ -4509,7 +4592,7 @@ class YandexGPTHandler:
                                    self._empty_iterations, full_text[:100])
                     if self._empty_iterations >= 3:
                         self._empty_iterations = 0
-                        return "Извините, произошла ошибка. Попробуйте переформулировать запрос или начните новый чат."
+                        return "Что-то пошло не так — попробуйте переформулировать запрос."
                     # Стратегия: вставляем контекстное приветствие ассистента
                     _CF_GREETING = "Здравствуйте! Я помогу вам подобрать тур. Куда хотите поехать?"
                     has_greeting = any(item.get("_cf_greeting") for item in self.full_history)
@@ -4767,6 +4850,7 @@ class YandexGPTHandler:
         self._last_departure_city = "Москва"
         self._tour_details_cache = {}
         self._shown_flight_signatures = {}
+        self._original_requested_meal = None
         logger.info("🔄 HANDLER RESET  cleared %d messages from full_history", old_len)
 
 

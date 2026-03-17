@@ -250,12 +250,16 @@ class OpenAIHandler(YandexGPTHandler):
              r'вьетнам|шри.?ланк|куб[аеу]|доминикан|индонези|бали|тунис|'
              r'черногори|болгари|хорвати|абхази|росси|сочи|крым|анап|'
              r'геленджик|калининград|кмв|марокк|израил|иордани|'
-             r'индия|китай|япони|южная корея|мексик|бразили)\w*', None),
+             r'индия|китай|япони|южная корея|мексик|бразили|'
+             r'казан[ьи]|карели|байкал|алтай|дагестан|домбай|шерегеш|'
+             r'архыз|приэльбрусь|урал|подмосковь|золот\w+ кольц|'
+             r'мурманск|псков|воронеж|татарстан)\w*', None),
         ],
         "Город вылета": [
-            (r'\b(?:москв|питер|спб|санкт.?петербург|екатеринбург|екб|казан[ьи]|'
+            (r'\b(?:екатеринбург|екб|'
              r'новосибирск|нск|краснодар|красноярск|ростов|уф[аеы]|пермь?|'
              r'челябинск|самар[аеу]|нижн\w+ новгород)\w*', None),
+            (r'(?:из|с)\s+(?:москв|казан|питер|спб|санкт.?петербург|сочи)\w*', None),
             (r'без\s*перел[её]т', "без перелёта"),
         ],
         "Даты": [
@@ -328,6 +332,17 @@ class OpenAIHandler(YandexGPTHandler):
         ],
     }
 
+    _DESTINATION_REGION_CODES = {
+        'сочи': '426', 'крым': '423', 'анап': '597', 'геленджик': '598',
+        'калининград': '425', 'казан': '517', 'дагестан': '662',
+        'алтай': '496', 'шерегеш': '498', 'карели': '526', 'байкал': '565',
+        'домбай': '523', 'архыз': '525', 'кмв': '424', 'кисловодск': '424',
+        'подмосковь': '469', 'урал': '563', 'мурманск': '668',
+        'питер': '470', 'санкт': '470', 'красн': '495',
+        'псков': '617', 'воронеж': '661', 'татарстан': '618',
+        'приэльбрусь': '524', 'золот': '527',
+    }
+
     def _update_collected_slots(self, user_message: str):
         """Extract and pin cascade parameters from user messages."""
         text = user_message.lower().strip()
@@ -336,6 +351,11 @@ class OpenAIHandler(YandexGPTHandler):
                 m = re.search(pattern, text, re.IGNORECASE)
                 if m:
                     value = fixed_value or m.group(0)
+                    if slot_name == "Направление":
+                        for prefix, region_id in self._DESTINATION_REGION_CODES.items():
+                            if prefix in value:
+                                value = f"{value} (regions={region_id})"
+                                break
                     self._collected_slots[slot_name] = value
                     break
 
@@ -346,15 +366,22 @@ class OpenAIHandler(YandexGPTHandler):
             r'сентябр|октябр|ноябр|декабр)',
             text, re.IGNORECASE
         )
+        _has_explicit_duration = bool(re.search(
+            r'(\d+)\s*(?:ноч|ночей|дн|дней|день)|(?:на\s+)?(?:неделю|недельку)|(?:две\s+недели|2\s+недели)',
+            text, re.IGNORECASE
+        ))
         if _range_m:
             _day_from = int(_range_m.group(1))
             _day_to = int(_range_m.group(2))
             _nights = _day_to - _day_from
             if 1 <= _nights <= 30:
                 self._collected_slots["Даты"] = _range_m.group(0)
-                self._collected_slots["Длительность"] = f"{_nights} ночей"
-                self._nights_from_date_range = True
-                logger.debug("📌 NIGHTS-FROM-RANGE: %d ночей из '%s'", _nights, _range_m.group(0))
+                if not _has_explicit_duration:
+                    self._collected_slots["Длительность"] = f"{_nights} ночей"
+                    self._nights_from_date_range = True
+                    logger.debug("📌 NIGHTS-FROM-RANGE: %d ночей из '%s'", _nights, _range_m.group(0))
+                else:
+                    logger.debug("📌 DATE-RANGE + EXPLICIT-DURATION: range '%s', не перезаписываем длительность", _range_m.group(0))
 
         # Context-aware: bare "любой/любая/без разницы" → check what model asked
         if re.match(r'^(?:любой|любая|любые|без разницы|все равно|всё равно|неважно|не важно)$', text):
@@ -501,8 +528,8 @@ class OpenAIHandler(YandexGPTHandler):
                     elapsed, iteration
                 )
                 return (
-                    "Извините, обработка заняла слишком много времени. "
-                    "Попробуйте переформулировать запрос."
+                    "Что-то пошло не так — попробуйте повторить "
+                    "запрос ещё раз."
                 )
 
             messages = self._build_openai_messages()
@@ -566,8 +593,8 @@ class OpenAIHandler(YandexGPTHandler):
                 # Rate limit
                 if "429" in error_str or "rate_limit" in error_str.lower():
                     return (
-                        "Сервис временно перегружен. "
-                        "Подождите несколько секунд и повторите."
+                        "Секундочку, сейчас много обращений — "
+                        "повторите через пару секунд!"
                     )
 
                 # Token limit exceeded
@@ -594,8 +621,8 @@ class OpenAIHandler(YandexGPTHandler):
                     if empty_retries < 3:
                         continue
                     return (
-                        "Извините, диалог стал слишком длинным. "
-                        "Пожалуйста, начните новый чат."
+                        "Наш диалог получился очень длинным — "
+                        "начните новый чат, и я с радостью продолжу!"
                     )
 
                 # Invalid request (orphaned tool message, malformed history)
@@ -648,8 +675,8 @@ class OpenAIHandler(YandexGPTHandler):
                         continue
 
                 return (
-                    "Произошла временная ошибка. "
-                    "Попробуйте ещё раз или начните новый чат."
+                    "Что-то пошло не так — попробуйте повторить "
+                    "запрос ещё раз."
                 )
 
             # ── Handle tool calls (native) ──
@@ -694,20 +721,20 @@ class OpenAIHandler(YandexGPTHandler):
                             "tool_call_id": tc.id,
                             "content": json.dumps({
                                 "error": (
-                                    "Аргументы обрезаны из-за лимита токенов. "
-                                    "Вызови функцию с МИНИМАЛЬНЫМИ аргументами. "
-                                    "Для get_dictionaries передай ТОЛЬКО "
-                                    '{"type": "region", "regcountry": 47}. '
-                                    "НЕ передавай массивы, списки или данные — "
-                                    "только type и один фильтр-код."
+                                    "Аргументы обрезаны — НЕ вызывай get_dictionaries! "
+                                    "Коды регионов: Сочи=426, Крым=423, Казань=517, "
+                                    "Дагестан=662, Алтай=496, Шерегеш=498, Карелия=526, "
+                                    "Байкал=565, КМВ=424, СПб=470, Москва=469, "
+                                    "Красная Поляна=495, Анапа=597. "
+                                    "Вызови search_tours НАПРЯМУЮ с regions=ID."
                                 )
                             }, ensure_ascii=False)
                         })
                     empty_retries += 1
                     if empty_retries >= 3:
                         return (
-                            "Извините, не удалось обработать запрос. "
-                            "Попробуйте переформулировать вопрос."
+                            "Что-то пошло не так — попробуйте повторить "
+                            "или упростить запрос."
                         )
                     continue
 
@@ -745,8 +772,8 @@ class OpenAIHandler(YandexGPTHandler):
                         if self._json_error_streak >= 3:
                             self.full_history.pop()
                             return (
-                                "Извините, возникла техническая ошибка. "
-                                "Попробуйте переформулировать вопрос."
+                                "Что-то пошло не так — попробуйте повторить "
+                                "запрос ещё раз."
                             )
                         if self._json_error_streak >= 2:
                             result["output"] = json.dumps({
@@ -803,8 +830,8 @@ class OpenAIHandler(YandexGPTHandler):
 
                     if _had_json_error and getattr(self, '_json_error_streak', 0) >= 3:
                         return (
-                            "Извините, возникла техническая ошибка. "
-                            "Попробуйте переформулировать вопрос."
+                            "Что-то пошло не так — попробуйте повторить "
+                            "запрос ещё раз."
                         )
 
                 if not _had_json_error:
@@ -840,8 +867,8 @@ class OpenAIHandler(YandexGPTHandler):
                 )
                 if empty_retries >= 3:
                     return (
-                        "Извините, произошла ошибка. "
-                        "Попробуйте переформулировать запрос."
+                        "Что-то пошло не так — попробуйте "
+                        "переформулировать запрос."
                     )
                 self.full_history.append({
                     "role": "user",
@@ -878,8 +905,8 @@ class OpenAIHandler(YandexGPTHandler):
                             "какой заинтересовал — расскажу подробнее."
                         )
                     return (
-                        "Извините, не удалось обработать запрос. "
-                        "Попробуйте переформулировать."
+                        "Что-то пошло не так — попробуйте повторить "
+                        "запрос ещё раз."
                     )
                 self.full_history.append({
                     "role": "user",
@@ -1208,7 +1235,7 @@ class OpenAIHandler(YandexGPTHandler):
 
             # ── Context limit warning ──
             _hist_len = len(self.full_history)
-            _is_error_response = final_text.startswith(("Извините", "Произошла", "К сожалению"))
+            _is_error_response = final_text.startswith(("Что-то пошло не так", "Секундочку", "Наш диалог получился", "Извините", "Произошла", "К сожалению"))
 
             if not _is_error_response and self._context_warning_stage < 2:
                 _WARNING_SOFT = 60
@@ -1258,8 +1285,8 @@ class OpenAIHandler(YandexGPTHandler):
 
         logger.error("🤖 MAX ITERATIONS REACHED (%d)", max_iterations)
         return (
-            "Извините, запрос оказался слишком сложным. "
-            "Попробуйте ещё раз или уточните параметры."
+            "Что-то пошло не так — попробуйте уточнить "
+            "параметры и повторить."
         )
 
     # ─── History Cleanup ──────────────────────────────────────────────────

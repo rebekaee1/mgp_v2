@@ -1257,7 +1257,7 @@ def _log_request_start():
             ip_key = f"rl:ip:{ip}:{int(time.time()) // 60}"
             if not rate_limit_check(ip_key, settings.rate_limit_per_ip, 60):
                 logger.warning("🚫 RATE LIMIT ip=%s path=%s", ip, request.path)
-                return jsonify({"error": "Rate limit exceeded", "reply": "Слишком много запросов. Подождите минуту."}), 429
+                return jsonify({"error": "Rate limit exceeded", "reply": "Слишком много запросов — подождите минутку и повторите!"}), 429
     except Exception:
         pass
 
@@ -1410,7 +1410,7 @@ def chat_v1():
             logger.warning("🚫 SESSION LIMIT reached (%d), rejecting new session", _MAX_SESSIONS)
             return jsonify({
                 'error': 'Server busy',
-                'reply': 'Сервер перегружен. Попробуйте позже.',
+                'reply': 'Сейчас много обращений — попробуйте через минутку!',
                 'tour_cards': [],
                 'conversation_id': conversation_id
             }), 503
@@ -1494,7 +1494,7 @@ def chat_v1():
         _write_dialogue_log(session_id, "ERROR", str(e))
         return jsonify({
             'error': str(e),
-            'reply': 'Извините, произошла техническая ошибка. Попробуйте ещё раз.',
+            'reply': 'Что-то пошло не так — попробуйте ещё раз!',
             'tour_cards': [],
             'conversation_id': conversation_id
         }), 500
