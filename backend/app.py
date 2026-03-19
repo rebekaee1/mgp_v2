@@ -1349,6 +1349,43 @@ def chat():
         if hasattr(handler, '_pending_api_calls'):
             handler._pending_api_calls.clear()
 
+        # ── Enrich cards with addpayments from prefetch cache (no extra API calls) ──
+        if tour_cards and hasattr(handler, '_tour_details_cache'):
+            _sp = getattr(handler, '_last_search_params', {}) or {}
+            _adults = _sp.get('adults', 2)
+            _children = _sp.get('child', 0)
+            _total_people = _adults + _children
+
+            _first_tid = tour_cards[0].get("id", "")
+            _prefetch_tids = getattr(handler, '_prefetch_tids', set())
+            _failed = getattr(handler, '_prefetch_failed', set())
+            if _first_tid and _first_tid in _prefetch_tids and _first_tid not in handler._tour_details_cache:
+                import time as _t
+                _t0 = _t.time()
+                while _t.time() - _t0 < 2.0:
+                    if _first_tid in handler._tour_details_cache or _first_tid in _failed:
+                        break
+                    _t.sleep(0.2)
+
+            _enriched_count = 0
+            for card in tour_cards:
+                tid = card.get("id", "")
+                cached = handler._tour_details_cache.get(tid)
+                if cached and isinstance(cached, dict):
+                    tourinfo = cached.get("tourinfo", {})
+                    addpayments = tourinfo.get("addpayments", [])
+                    if addpayments:
+                        total_pp = sum(ap.get("amount", 0) for ap in addpayments)
+                        card["addpayments_per_person"] = total_pp
+                        card["addpayments_total"] = total_pp * _total_people
+                        card["addpayments_details"] = [
+                            {"name": ap.get("name", ""), "amount": ap.get("amount", 0)}
+                            for ap in addpayments
+                        ]
+                        _enriched_count += 1
+            if _enriched_count:
+                logger.info("💊 ADDPAYMENTS enriched %d/%d cards from prefetch cache", _enriched_count, len(tour_cards))
+
         _latency_ms = int((time.perf_counter() - g._req_start) * 1000) if hasattr(g, '_req_start') else None
         _log_chat_to_db(session_id, message, response, tour_cards,
                         _latency_ms, model_name=getattr(handler, 'model', 'unknown'),
@@ -1451,6 +1488,43 @@ def chat_v1():
         _api_calls_snapshot = list(getattr(handler, '_pending_api_calls', []))
         if hasattr(handler, '_pending_api_calls'):
             handler._pending_api_calls.clear()
+
+        # ── Enrich cards with addpayments from prefetch cache (no extra API calls) ──
+        if tour_cards and hasattr(handler, '_tour_details_cache'):
+            _sp = getattr(handler, '_last_search_params', {}) or {}
+            _adults = _sp.get('adults', 2)
+            _children = _sp.get('child', 0)
+            _total_people = _adults + _children
+
+            _first_tid = tour_cards[0].get("id", "")
+            _prefetch_tids = getattr(handler, '_prefetch_tids', set())
+            _failed = getattr(handler, '_prefetch_failed', set())
+            if _first_tid and _first_tid in _prefetch_tids and _first_tid not in handler._tour_details_cache:
+                import time as _t
+                _t0 = _t.time()
+                while _t.time() - _t0 < 2.0:
+                    if _first_tid in handler._tour_details_cache or _first_tid in _failed:
+                        break
+                    _t.sleep(0.2)
+
+            _enriched_count = 0
+            for card in tour_cards:
+                tid = card.get("id", "")
+                cached = handler._tour_details_cache.get(tid)
+                if cached and isinstance(cached, dict):
+                    tourinfo = cached.get("tourinfo", {})
+                    addpayments = tourinfo.get("addpayments", [])
+                    if addpayments:
+                        total_pp = sum(ap.get("amount", 0) for ap in addpayments)
+                        card["addpayments_per_person"] = total_pp
+                        card["addpayments_total"] = total_pp * _total_people
+                        card["addpayments_details"] = [
+                            {"name": ap.get("name", ""), "amount": ap.get("amount", 0)}
+                            for ap in addpayments
+                        ]
+                        _enriched_count += 1
+            if _enriched_count:
+                logger.info("💊 ADDPAYMENTS enriched %d/%d cards from prefetch cache", _enriched_count, len(tour_cards))
 
         _write_dialogue_log(session_id, "ASSISTANT", reply)
 
