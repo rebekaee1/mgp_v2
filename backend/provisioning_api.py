@@ -86,8 +86,9 @@ def _validate_openai_runtime_access(api_key: str, model: str) -> Optional[Dict[s
             return None
         retryable = resp.status_code in (408, 409, 425, 429) or resp.status_code >= 500
         error_body = (resp.text or "").strip()[:300]
+        error_code = "llm_validation_unavailable" if retryable else "llm_credentials_invalid"
         return _llm_validation_error(
-            "llm_credentials_invalid",
+            error_code,
             f"OpenAI/OpenRouter chat validation failed: HTTP {resp.status_code} {error_body}".strip(),
             retryable=retryable,
         )
@@ -159,6 +160,12 @@ def _validate_runtime_llm_access(llm_provider: str, api_key: str, model: str) ->
         f"Unsupported llm_provider for runtime validation: {provider or '-'}",
         retryable=False,
     )
+
+
+def _should_block_provisioning_on_llm_validation(error: Optional[Dict[str, Any]]) -> bool:
+    if not error:
+        return False
+    return not bool(error.get("retryable"))
 
 
 def _callback_url(payload: Dict[str, Any]) -> Optional[str]:
@@ -589,11 +596,17 @@ def _apply_provisioning(req_id: str) -> None:
                 api_key=effective_llm_api_key,
                 model=effective_llm_model,
             )
-            if llm_validation_error:
+            if _should_block_provisioning_on_llm_validation(llm_validation_error):
                 _update_request_status(req, "failed", error=llm_validation_error)
                 db.flush()
                 _start_callback(req_id, "failed")
                 return
+            if llm_validation_error:
+                logger.warning(
+                    "Provisioning request %s continuing despite retryable LLM validation error: %s",
+                    req_id,
+                    llm_validation_error.get("message") or llm_validation_error.get("code") or "unknown",
+                )
 
             existing_company = db.query(Company).filter(Company.slug == company_slug).first()
             existing_user = db.query(User).filter(User.email == admin_email).first()
