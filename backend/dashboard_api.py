@@ -1902,7 +1902,14 @@ def assistant_update(assistant_id):
         if not a or a.company_id != g.company_id:
             return jsonify({"error": "Not found"}), 404
 
-        for field in ("name", "is_active", "system_prompt", "faq_content"):
+        for field in (
+            "name",
+            "is_active",
+            "system_prompt",
+            "faq_content",
+            "tourvisor_login",
+            "tourvisor_pass",
+        ):
             if field in data:
                 setattr(a, field, data[field])
 
