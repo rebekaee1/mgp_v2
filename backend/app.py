@@ -1365,7 +1365,7 @@ def _handle_unexpected_error(e: Exception):
     rid = getattr(g, "request_id", "-")
     logger.exception("Unhandled exception rid=%s path=%s", rid, request.path)
     if request.path.startswith("/api/"):
-        return jsonify({"error": str(e), "request_id": rid}), 500
+        return jsonify({"error": "internal_error", "request_id": rid}), 500
     return "Internal Server Error", 500
 
 
@@ -1451,7 +1451,7 @@ def chat():
         return jsonify({'response': response})
     except Exception as e:
         logger.exception("chat error session_id=%s", session_id)
-        return jsonify({'error': str(e)}), 500
+        return jsonify({'error': 'internal_error', 'reply': 'Что-то пошло не так — попробуйте ещё раз!'}), 500
 
 
 @app.route('/api/v1/chat', methods=['POST'])
@@ -1630,7 +1630,7 @@ def chat_v1():
         logger.exception("[v1] chat error session_id=%s", session_id)
         _write_dialogue_log(session_id, "ERROR", str(e))
         return jsonify({
-            'error': str(e),
+            'error': 'internal_error',
             'reply': 'Что-то пошло не так — попробуйте ещё раз!',
             'tour_cards': [],
             'conversation_id': conversation_id
@@ -1746,11 +1746,11 @@ def chat_stream():
                     _mark_assistant_responded(session_id)
                     token_queue.put(('done', response))
                 except Exception as e:
-                    result['error'] = str(e)
+                    result['error'] = 'internal_error'
                     logger.exception("stream chat error session_id=%s", session_id)
                     log(f"❌ ОШИБКА: {e}", "ERROR")
                     _write_dialogue_log(session_id, "ERROR", str(e))
-                    token_queue.put(('error', str(e)))
+                    token_queue.put(('error', 'Что-то пошло не так — попробуйте ещё раз!'))
 
             thread = threading.Thread(target=run_chat)
             thread.start()

@@ -20,7 +20,7 @@ logger = logging.getLogger("mgp_bot.dialog_sender")
 _CONTRACT_VERSION = "2026-03-09"
 _EVENT_TYPE = "conversation_snapshot"
 _STATUSES_PENDING = {"pending", "retrying"}
-_PAYLOAD_TARGET_BYTES = 64 * 1024
+_PAYLOAD_TARGET_BYTES = 48 * 1024
 _MAX_API_CALLS = 20
 _MAX_API_CALLS_AGGRESSIVE = 8
 _MAX_TOUR_CARDS = 10
@@ -576,12 +576,11 @@ def _deliver_outbox_event(db, event: RuntimeEventOutbox) -> None:
         if resp.status_code == 413:
             compacted_payload = _fit_snapshot_payload(_compact_snapshot_payload(event.payload or {}, level=3))
             compacted_body = _event_body(compacted_payload)
-            if _payload_hash(compacted_body) != _payload_hash(body):
-                event.payload = compacted_payload
-                with httpx.Client(timeout=float(settings.runtime_dialog_sender_timeout_seconds)) as client:
-                    resp = client.post(endpoint_url, json=compacted_body, headers=headers)
-                event.last_status_code = resp.status_code
-                body = compacted_body
+            event.payload = compacted_payload
+            with httpx.Client(timeout=float(settings.runtime_dialog_sender_timeout_seconds)) as client:
+                resp = client.post(endpoint_url, json=compacted_body, headers=headers)
+            event.last_status_code = resp.status_code
+            body = compacted_body
         if 200 <= resp.status_code < 300 or resp.status_code == 409:
             event.status = "sent"
             event.sent_at = _utcnow()

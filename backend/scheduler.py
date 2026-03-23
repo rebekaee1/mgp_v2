@@ -49,32 +49,33 @@ def _job_daily_stats():
                 logger.info("DailyStat for %s already exists, skipping", yesterday)
                 return
 
-            day_start = f"{yesterday}T00:00:00+00:00"
-            day_end = f"{yesterday}T23:59:59.999999+00:00"
+            yesterday_date = datetime.strptime(yesterday, "%Y-%m-%d").date()
+            day_start = datetime(yesterday_date.year, yesterday_date.month, yesterday_date.day, tzinfo=timezone.utc)
+            day_end = day_start + timedelta(days=1)
 
             conversations_total = db.query(func.count(Conversation.id)).filter(
                 Conversation.started_at >= day_start,
-                Conversation.started_at <= day_end,
+                Conversation.started_at < day_end,
             ).scalar() or 0
 
             messages_total = db.query(func.count(Message.id)).filter(
                 Message.created_at >= day_start,
-                Message.created_at <= day_end,
+                Message.created_at < day_end,
             ).scalar() or 0
 
             searches_total = db.query(func.count(TourSearch.id)).filter(
                 TourSearch.created_at >= day_start,
-                TourSearch.created_at <= day_end,
+                TourSearch.created_at < day_end,
             ).scalar() or 0
 
             tours_shown = db.query(func.coalesce(func.sum(Conversation.tour_cards_shown), 0)).filter(
                 Conversation.started_at >= day_start,
-                Conversation.started_at <= day_end,
+                Conversation.started_at < day_end,
             ).scalar() or 0
 
             avg_response = db.query(func.coalesce(func.avg(Message.latency_ms), 0)).filter(
                 Message.created_at >= day_start,
-                Message.created_at <= day_end,
+                Message.created_at < day_end,
                 Message.role == "assistant",
                 Message.latency_ms.isnot(None),
             ).scalar() or 0
@@ -84,12 +85,12 @@ def _job_daily_stats():
                 func.coalesce(func.sum(Message.tokens_completion), 0)
             ).filter(
                 Message.created_at >= day_start,
-                Message.created_at <= day_end,
+                Message.created_at < day_end,
             ).scalar() or 0
 
             unique_ips = db.query(func.count(distinct(Conversation.ip_address))).filter(
                 Conversation.started_at >= day_start,
-                Conversation.started_at <= day_end,
+                Conversation.started_at < day_end,
             ).scalar() or 0
 
             stat = DailyStat(
