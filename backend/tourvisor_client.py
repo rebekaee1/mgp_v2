@@ -347,7 +347,8 @@ class TourVisorClient:
             "flydeparture": departure_id,
             "flycountry": country_id
         })
-        flydates = data.get("lists", {}).get("flydates", {}).get("flydate", [])
+        _flydates_obj = data.get("lists", {}).get("flydates") or {}
+        flydates = _flydates_obj.get("flydate", [])
         return flydates if isinstance(flydates, list) else [flydates]
     
     async def get_currencies(self) -> List[Dict]:

@@ -1247,7 +1247,7 @@ def _fix_merged_questions(text: str) -> str:
         for i, part in enumerate(parts):
             if part == '?' and i >= 1 and i + 2 < len(parts):
                 prev_q = parts[i - 1]
-                next_q = parts[i + 2] if i + 2 < len(parts) else ""
+                next_q = parts[i + 1]
                 prev_words = prev_q.strip().split()[-5:]
                 next_words = next_q.strip().split()[:5]
                 overlap = len(set(w.lower() for w in prev_words) & set(w.lower() for w in next_words))
@@ -1755,6 +1755,19 @@ class YandexGPTHandler:
             else:
                 dep_code = _safe_int(dep_raw)
             
+            # ── Guard: reject departure codes not in supported list ──
+            if dep_code and dep_code not in _DEPARTURE_CITIES:
+                all_cities = [f"{name}" for cid, name in sorted(_DEPARTURE_CITIES.items()) if cid != 99]
+                logger.warning("⛔ DEPARTURE-UNSUPPORTED: dep_code=%d not in _DEPARTURE_CITIES", dep_code)
+                return json.dumps({
+                    "error": (
+                        f"⛔ Город вылета с кодом {dep_code} НЕДОСТУПЕН в системе. "
+                        f"Доступные города вылета: {', '.join(all_cities)}. "
+                        f"Сообщи клиенту, что вылет из этого города недоступен, "
+                        f"и предложи ближайшие альтернативы из списка."
+                    )
+                }, ensure_ascii=False)
+
             if dep_code is not None and not isinstance(args.get("departure"), list):
                 # ── Детекция смены города вылета ──
                 # Если модель явно сменила departure по сравнению с кэшем И
@@ -2255,6 +2268,7 @@ class YandexGPTHandler:
             # ── Fix C2: Fallback из кэша предыдущего поиска ──
             # Если модель потеряла параметры при смене страны ("а если Египет?"),
             # восстанавливаем пропущенные из кэша. НИКОГДА не перезаписываем явно переданные.
+            _starsbetter_from_cache = False
             if self._last_search_params:
                 _cache_keys = ("departure", "datefrom", "dateto", "nightsfrom", "nightsto",
                                "adults", "child", "childage1", "childage2", "childage3",
@@ -2264,6 +2278,8 @@ class YandexGPTHandler:
                     if (_ck not in args or args[_ck] is None) and _ck in self._last_search_params:
                         args[_ck] = self._last_search_params[_ck]
                         _restored.append(f"{_ck}={self._last_search_params[_ck]}")
+                        if _ck == "starsbetter":
+                            _starsbetter_from_cache = True
                 if _restored:
                     logger.info("📋 PARAM-CACHE: restored from previous search: %s", ", ".join(_restored))
                 # Если страна изменилась — сбрасываем region из кэша (другая страна = другие регионы)
@@ -2339,15 +2355,17 @@ class YandexGPTHandler:
             
             # ── Fix P5: Авто-коррекция nightsfrom (минимум 3 ночи) ──
             # По бизнес-логике nightsfrom < 3 бессмысленно (нет туров на 1-2 ночи)
-            # Также если nightsfrom > nightsto — исправляем (nightsfrom = nightsto)
             nf = args.get("nightsfrom")
             nt = args.get("nightsto")
             if nf is not None and nf < 3:
                 logger.warning("⚠️ nightsfrom=%d < 3, исправлено на 3 (минимум для туров)", nf)
                 args["nightsfrom"] = 3
+            # Re-read CORRECTED values before checking nightsfrom > nightsto
+            nf = args.get("nightsfrom")
+            nt = args.get("nightsto")
             if nf is not None and nt is not None and nf > nt:
-                logger.warning("⚠️ nightsfrom=%d > nightsto=%d, исправлено nightsfrom=%d", nf, nt, nt)
-                args["nightsfrom"] = nt
+                logger.warning("⚠️ nightsfrom=%d > nightsto=%d, расширяем nightsto до %d", nf, nt, nf)
+                args["nightsto"] = nf
             
             # ── Safety-net: hotels + stars conflict ──
             # Если модель указала конкретные отели (hotels), stars не нужен —
@@ -2428,20 +2446,40 @@ class YandexGPTHandler:
                         args.get("stars")
                     )
                 elif args.get("starsbetter") == 1:
-                    _user_stars_text = " ".join([
-                        msg.get("content", "") for msg in self.full_history[-20:]
-                        if msg.get("role") == "user" and msg.get("content")
-                    ]).lower()
-                    _wants_better = bool(re.search(
-                        r'(?:от\s+\d|\d\s*\+|\d\s*[-–]\s*\d\s*(?:зв|★|\*)|не\s+ниже|минимум\s+\d|и\s+выше|выше)',
-                        _user_stars_text
-                    ))
-                    if not _wants_better:
-                        args["starsbetter"] = 0
-                        logger.info(
-                            "🛡️ SAFETY-NET C1: starsbetter=1 → 0 при stars=%s (нет 'от/диапазон/не ниже/минимум')",
-                            args.get("stars")
+                    if _starsbetter_from_cache:
+                        _recent_user = " ".join([
+                            msg.get("content", "") for msg in self.full_history[-6:]
+                            if msg.get("role") == "user" and msg.get("content")
+                        ]).lower()
+                        _exact_only = re.search(
+                            r'(?:только\s+\d|именно\s+\d|строго\s+\d|не\s+выше|не\s+больше)',
+                            _recent_user
                         )
+                        if _exact_only:
+                            args["starsbetter"] = 0
+                            logger.info(
+                                "🛡️ SAFETY-NET C1: cache-restored starsbetter=1 → 0 (user narrowed: '%s')",
+                                _exact_only.group()
+                            )
+                        else:
+                            logger.info(
+                                "🛡️ SAFETY-NET C1: trusting cache starsbetter=1 (no narrowing detected)"
+                            )
+                    else:
+                        _user_stars_text = " ".join([
+                            msg.get("content", "") for msg in self.full_history[-20:]
+                            if msg.get("role") == "user" and msg.get("content")
+                        ]).lower()
+                        _wants_better = bool(re.search(
+                            r'(?:от\s+\d|\d\s*\+|\d\s*[-–]\s*\d\s*(?:зв|★|\*)|не\s+ниже|минимум\s+\d|и\s+выше|выше)',
+                            _user_stars_text
+                        ))
+                        if not _wants_better:
+                            args["starsbetter"] = 0
+                            logger.info(
+                                "🛡️ SAFETY-NET C1: starsbetter=1 → 0 при stars=%s (нет 'от/диапазон/не ниже/минимум')",
+                                args.get("stars")
+                            )
             
             # ── Safety-net: strip hoteltypes/regions if user never mentioned them ──
             if args.get("hoteltypes"):
@@ -2580,7 +2618,7 @@ class YandexGPTHandler:
             if (args.get("dateto") and args.get("datefrom")
                     and args["dateto"] == args["datefrom"]):
                 _user_date_text = " ".join([
-                    msg.get("content", "") for msg in self.full_history[-10:]
+                    msg.get("content", "") for msg in self.full_history[-30:]
                     if msg.get("role") == "user" and msg.get("content")
                 ]).lower()
                 _has_range = re.search(
@@ -2638,6 +2676,7 @@ class YandexGPTHandler:
                     except ValueError:
                         pass
                     self._nearest_search_attempt += 1
+                    self._current_search_is_nearest = True
 
             # ── Safety-net: вычисление ночей из «с X по Y [месяц]» или «X-Y месяц» ──
             if args.get("datefrom") and not args.get("nightsfrom"):
@@ -2693,6 +2732,61 @@ class YandexGPTHandler:
             else:
                 logger.info("✈️ FLIGHT-FILTER: all flights (country=%s)", _country_code)
             
+            # ── Dead route pre-check (safety net for multi-slot / skipped LLM check) ──
+            _dep_code_check = _safe_int(args.get("departure"))
+            _country_code_check = _safe_int(args.get("country"))
+            if (_dep_code_check and _country_code_check
+                    and _dep_code_check != 99):
+                try:
+                    _fly_check = await self.tourvisor.get_flydates(
+                        _dep_code_check, _country_code_check
+                    )
+                    if not _fly_check or (isinstance(_fly_check, list) and len(_fly_check) == 0):
+                        _dep_city_check = _DEPARTURE_CITIES.get(
+                            _dep_code_check, f"город {_dep_code_check}"
+                        )
+                        _alt = []
+                        try:
+                            _hot_check = await self.tourvisor.get_hot_tours(
+                                city=_dep_code_check, count=30
+                            )
+                            _seen_c = set()
+                            for _tc in (_hot_check or []):
+                                _cnc = _tc.get("countryname", "").strip()
+                                if _cnc and _cnc not in _seen_c:
+                                    _seen_c.add(_cnc)
+                                    _alt.append(_cnc)
+                                if len(_alt) >= 6:
+                                    break
+                        except Exception:
+                            pass
+
+                        logger.info(
+                            "🚫 DEAD ROUTE (safety-net): dep=%s (%s) -> country=%s | alt=%s",
+                            _dep_code_check, _dep_city_check, _country_code_check, _alt
+                        )
+                        return {
+                            "status": "route_unavailable",
+                            "route_dead": True,
+                            "departure_city": _dep_city_check,
+                            "country_id": _country_code_check,
+                            "available_destinations": _alt,
+                            "_hint": (
+                                f"⛔ МАРШРУТ НЕДОСТУПЕН: из {_dep_city_check} нет рейсов "
+                                f"в направление country={_country_code_check}. "
+                                f"Расширение дат/фильтров НЕ поможет — рейсов нет вообще. "
+                                + (f"Доступные направления из {_dep_city_check}: {', '.join(_alt)}. " if _alt else
+                                   f"Предложи другой город вылета (Москва / Санкт-Петербург). ")
+                                + "Предложи клиенту рассмотреть одно из этих направлений (§5.4.2). "
+                                + "НЕ показывай карточки — только текстом. "
+                                + "Когда клиент выберет — проверь маршрут и запусти search_tours."
+                            )
+                        }
+                except NoResultsError:
+                    raise
+                except Exception as _dr_err:
+                    logger.warning("Dead route pre-check failed (non-blocking): %s", _dr_err)
+
             self._metrics["total_searches"] += 1
             request_id = await self.tourvisor.search_tours(
                 departure=args.get("departure"),
@@ -2758,6 +2852,9 @@ class YandexGPTHandler:
                 self._last_search_params["_hideregular"] = args["hideregular"]
             if args.get("hotels"):
                 self._last_search_params["_hotels"] = args.get("hotels")
+            if getattr(self, '_current_search_is_nearest', False):
+                self._last_search_params["_is_nearest"] = True
+                self._current_search_is_nearest = False
             _meal_val = _safe_int(args.get("meal"))
             if _meal_val and _meal_val > 0:
                 self._original_requested_meal = _meal_val
@@ -2839,14 +2936,8 @@ class YandexGPTHandler:
                     if hotels_found == 0 or tours_found == 0:
                         _dep_code = self._last_search_params.get("departure")
                         _dep_city = _DEPARTURE_CITIES.get(_dep_code, "") if _dep_code else ""
-                        _dep_hint = ""
-                        if _dep_code:
-                            _dep_hint = (
-                                f" ⚠️ Из города '{_dep_city}' (departure={_dep_code}) — ноль туров. "
-                                f"Проверь через get_dictionaries(type=country, cndep={_dep_code}) "
-                                f"какие направления доступны из этого города и предложи клиенту "
-                                f"доступные альтернативы."
-                            )
+
+                        # ── Specific hints (take priority over cascade) ──
                         _hotel_hint = ""
                         _hotel_code_str = self._last_search_params.get("_hotels", "")
                         _meal_code = self._last_search_params.get("meal")
@@ -2868,8 +2959,69 @@ class YandexGPTHandler:
                                 "Для этого направления могут быть только регулярные рейсы. "
                                 "Повтори search_tours БЕЗ параметра hideregular или с hideregular=0."
                             )
+
+                        # ── Interactive options hint (§5.4) — only when no specific hints ──
+                        _cascade_hint = ""
+                        if not _hotel_hint and not _hideregular_hint:
+                            _is_nearest = self._last_search_params.get("_is_nearest")
+                            _nearest_attempt = self._nearest_search_attempt
+
+                            if _is_nearest and _nearest_attempt < 3:
+                                _cascade_hint = (
+                                    f" ⚠️ Прогрессивный поиск 'ближайший вылет' (попытка {_nearest_attempt}/3). "
+                                    "Повтори search_tours с ТЕМИ ЖЕ параметрами — backend автоматически расширит dateto. "
+                                    "НЕ спрашивай клиента, НЕ показывай варианты. Просто сообщи: «Расширяю даты поиска...» и повтори."
+                                )
+                            else:
+                                _options = []
+
+                                _df_str = self._last_search_params.get("datefrom", "")
+                                _dt_str = self._last_search_params.get("dateto", "")
+                                if _df_str and _dt_str:
+                                    try:
+                                        from datetime import datetime as _dtp
+                                        _d1 = _dtp.strptime(_df_str, "%d.%m.%Y")
+                                        _d2 = _dtp.strptime(_dt_str, "%d.%m.%Y")
+                                        if (_d2 - _d1).days < 14:
+                                            _options.append("Расширить диапазон дат поиска")
+                                    except (ValueError, TypeError):
+                                        _options.append("Расширить диапазон дат поиска")
+
+                                _meal_val = self._last_search_params.get("meal")
+                                if _meal_val:
+                                    if _meal_val == 2:
+                                        _options.append(
+                                            "Попробовать с завтраками (без питания в пакетных турах бывает редко)"
+                                        )
+                                    else:
+                                        _options.append("Убрать ограничение по питанию")
+
+                                if self._last_search_params.get("stars"):
+                                    _options.append("Рассмотреть другие категории отелей")
+
+                                if self._last_search_params.get("_regions"):
+                                    _options.append("Убрать ограничение по курорту")
+
+                                _options.append(f"Попробовать другой город вылета (сейчас: {_dep_city})")
+
+                                _opts_text = "\n".join(f"  {i+1}. {opt}" for i, opt in enumerate(_options))
+                                _cascade_hint = (
+                                    f" ВАРИАНТЫ ДЛЯ КЛИЕНТА (представь нумерованным списком, "
+                                    f"сообщи что по текущим параметрам ничего не нашлось):\n{_opts_text}\n"
+                                    "Спроси клиента какой вариант ему больше подходит. "
+                                    "Если клиент говорит 'любой'/'всё равно'/'попробуйте всё' — "
+                                    "примени первый доступный вариант из списка."
+                                )
+
+                            logger.info(
+                                "📊 ZERO-RESULTS: nearest=%s, attempt=%d, options=%d",
+                                bool(_is_nearest), _nearest_attempt,
+                                len(_options) if '_options' in dir() else 0
+                            )
+
                         raise NoResultsError(
-                            f"Поиск завершён: найдено {hotels_found} отелей, {tours_found} туров.{_dep_hint}{_hotel_hint}{_hideregular_hint}",
+                            f"Поиск завершён: найдено {hotels_found} отелей, {tours_found} туров."
+                            f"{_cascade_hint}{_hotel_hint}{_hideregular_hint}",
                             filters_hint="Попробуйте расширить даты, увеличить бюджет или убрать фильтры"
                         )
 
@@ -3191,7 +3343,20 @@ class YandexGPTHandler:
             if "departure" in dict_type:
                 return await self.tourvisor.get_departures()
             elif "country" in dict_type:
-                return await self.tourvisor.get_countries(args.get("cndep"))
+                countries_result = await self.tourvisor.get_countries(args.get("cndep"))
+                _cndep = args.get("cndep")
+                if (self._last_search_params
+                        and _cndep is not None
+                        and _cndep != self._last_search_params.get("departure")):
+                    return {
+                        "countries": countries_result,
+                        "_hint": (
+                            "HINT: Клиент ранее искал тур. Если направление доступно из нового города — "
+                            "запусти search_tours с новым departure и ИСХОДНЫМИ параметрами клиента из диалога "
+                            "(направление, даты, состав, QC). НЕ спрашивай Продолжить."
+                        )
+                    }
+                return countries_result
             elif "subregion" in dict_type:
                 return await self.tourvisor.get_subregions(args.get("regcountry"))
             elif "region" in dict_type:
@@ -3220,10 +3385,74 @@ class YandexGPTHandler:
             elif "services" in dict_type:
                 return await self.tourvisor.get_services()
             elif "flydate" in dict_type:
-                return await self.tourvisor.get_flydates(
-                    args.get("flydeparture"),
-                    args.get("flycountry")
+                _dep_id = args.get("flydeparture")
+                _country_id = args.get("flycountry")
+
+                if _dep_id is None or _country_id is None:
+                    return await self.tourvisor.get_flydates(_dep_id, _country_id)
+
+                try:
+                    flydates = await self.tourvisor.get_flydates(_dep_id, _country_id)
+                except Exception as _fd_err:
+                    logger.warning("get_flydates error (non-blocking): %s", _fd_err)
+                    return {
+                        "error": str(_fd_err),
+                        "_hint": "Не удалось проверить маршрут. Продолжай сбор оставшихся слотов каскада."
+                    }
+
+                if not flydates or (isinstance(flydates, list) and len(flydates) == 0):
+                    _dep_city = _DEPARTURE_CITIES.get(_dep_id, f"город {_dep_id}")
+                    _alt_countries = []
+                    try:
+                        _hot = await self.tourvisor.get_hot_tours(city=_dep_id, count=30)
+                        _seen = set()
+                        for _t in (_hot or []):
+                            _cn = _t.get("countryname", "").strip()
+                            if _cn and _cn not in _seen:
+                                _seen.add(_cn)
+                                _alt_countries.append(_cn)
+                            if len(_alt_countries) >= 6:
+                                break
+                    except Exception as _hot_err:
+                        logger.warning("get_hot_tours for alternatives error: %s", _hot_err)
+
+                    logger.info(
+                        "🚫 DEAD ROUTE: departure=%s (%s) -> country=%s | alternatives=%s",
+                        _dep_id, _dep_city, _country_id, _alt_countries
+                    )
+                    return {
+                        "route_dead": True,
+                        "flydates": [],
+                        "departure_city": _dep_city,
+                        "departure_id": _dep_id,
+                        "country_id": _country_id,
+                        "available_destinations": _alt_countries,
+                        "_hint": (
+                            f"⛔ МАРШРУТ НЕДОСТУПЕН: из {_dep_city} нет рейсов в направление country={_country_id}. "
+                            f"НЕ продолжай сбор слотов (даты, состав, звёзды/питание). "
+                            f"Сообщи клиенту что данное направление недоступно из {_dep_city}. "
+                            + (f"Предложи альтернативные направления: {', '.join(_alt_countries)}. " if _alt_countries else
+                               "Альтернативы не найдены — предложи другой город вылета (Москва / Санкт-Петербург). ")
+                            + "Спроси клиента какое направление его заинтересует. "
+                            + "НЕ показывай карточки туров — только предложи направления текстом. "
+                            + "Когда клиент выберет — проверь новый маршрут через get_dictionaries(type=flydate) "
+                            + "и продолжи сбор оставшихся слотов (даты, состав, QC)."
+                        )
+                    }
+
+                _earliest = min(flydates) if flydates else None
+                _latest = max(flydates) if flydates else None
+                logger.info(
+                    "✅ ROUTE OK: departure=%s -> country=%s | %d dates (%s — %s)",
+                    _dep_id, _country_id, len(flydates), _earliest, _latest
                 )
+                return {
+                    "route_available": True,
+                    "total_dates": len(flydates),
+                    "earliest_date": _earliest,
+                    "latest_date": _latest,
+                    "_hint": "Маршрут доступен, рейсы есть. Продолжай сбор оставшихся слотов каскада."
+                }
             elif "hotel" in dict_type:
                 # Собираем типы отелей
                 hotel_types = []
@@ -4175,7 +4404,8 @@ class YandexGPTHandler:
                 
                 # ⚡ Детект «обещанного, но не выполненного поиска»
                 # Модель написала «сейчас поищу», но НЕ вызвала search_tours
-                if final_text and _is_promised_search(final_text):
+                # Skip if tour cards already found this turn
+                if final_text and not self._pending_tour_cards and _is_promised_search(final_text):
                     empty_retries += 1
                     self._metrics["promised_search_detections"] += 1
                     logger.warning("⚠️ PROMISED-SEARCH detected (#%d): \"%s\" — nudging model to call function",
@@ -4611,7 +4841,7 @@ class YandexGPTHandler:
                     continue
                 
                 # ⚡ Детект «обещанного, но не выполненного поиска» (stream)
-                if _is_promised_search(full_text):
+                if not self._pending_tour_cards and _is_promised_search(full_text):
                     self._empty_iterations += 1
                     self._metrics["promised_search_detections"] += 1
                     logger.warning("⚠️ STREAM PROMISED-SEARCH detected (#%d): \"%s\" — nudging model",

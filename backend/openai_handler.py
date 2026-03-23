@@ -32,6 +32,7 @@ try:
         _strip_reasoning_leak,
         _strip_technical_ids,
         _dedup_sentences,
+        _fix_merged_questions,
         _strip_trailing_fragment,
         StreamCallback,
     )
@@ -43,6 +44,7 @@ except ImportError:
         _strip_reasoning_leak,
         _strip_technical_ids,
         _dedup_sentences,
+        _fix_merged_questions,
         _strip_trailing_fragment,
         StreamCallback,
     )
@@ -1123,8 +1125,8 @@ class OpenAIHandler(YandexGPTHandler):
                     })
                     continue
 
-            # Promised search detection (safety-net)
-            if _is_promised_search(final_text):
+            # Promised search detection (safety-net) — skip if tour cards already found this turn
+            if not self._pending_tour_cards and _is_promised_search(final_text):
                 empty_retries += 1
                 self._metrics["promised_search_detections"] = \
                     self._metrics.get("promised_search_detections", 0) + 1
@@ -1212,6 +1214,9 @@ class OpenAIHandler(YandexGPTHandler):
 
             # Sentence-level dedup (catches intra-paragraph question repeats)
             final_text = _dedup_sentences(final_text)
+
+            # Truncate duplicate merged questions ("Какой тип питания? Какой тип питания вам подходит?")
+            final_text = _fix_merged_questions(final_text)
 
             # Strip orphaned dialogue-continuation fragments after last '?'
             final_text = _strip_trailing_fragment(final_text)

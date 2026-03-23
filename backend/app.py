@@ -256,6 +256,33 @@ SESSION_TTL_SECONDS = 30 * 60  # 30 минут неактивности → уд
 _session_chat_locks: dict[str, threading.Lock] = {}
 _session_chat_locks_guard = threading.Lock()
 
+# Per-session message debounce (blocks identical messages within a short window)
+_debounce_lock = threading.Lock()
+_session_last_user_msg: dict = {}       # session_id -> (text, timestamp)
+_session_last_assistant_at: dict = {}   # session_id -> timestamp
+_DEBOUNCE_WINDOW_SEC = 3
+
+
+def _is_duplicate_user_message(session_id: str, text: str) -> bool:
+    now = time.time()
+    with _debounce_lock:
+        last = _session_last_user_msg.get(session_id)
+        last_asst = _session_last_assistant_at.get(session_id, 0)
+        _session_last_user_msg[session_id] = (text, now)
+        if last is None:
+            return False
+        prev_text, prev_ts = last
+        if prev_text != text or now - prev_ts > _DEBOUNCE_WINDOW_SEC:
+            return False
+        if last_asst > prev_ts:
+            return False
+        return True
+
+
+def _mark_assistant_responded(session_id: str):
+    with _debounce_lock:
+        _session_last_assistant_at[session_id] = time.time()
+
 
 def _session_cache_key(session_id: str, assistant_id: str = None) -> str:
     return f"{assistant_id or 'default'}::{session_id}"
@@ -578,11 +605,15 @@ def get_handler(session_id: str, assistant_id: str = None):
 def _cleanup_stale_sessions():
     """Удалить сессии, неактивные дольше SESSION_TTL_SECONDS"""
     now = time.time()
+    _stale_session_ids: list[str] = []
     with _handlers_lock:
         stale = [cache_key for cache_key, info in _handlers.items()
                  if now - info["last_active"] > SESSION_TTL_SECONDS]
         for cache_key in stale:
             handler = _handlers[cache_key]["handler"]
+            parts = cache_key.split("::", 1)
+            if len(parts) == 2:
+                _stale_session_ids.append(parts[1])
             try:
                 handler.close_sync()
             except Exception:
@@ -590,6 +621,14 @@ def _cleanup_stale_sessions():
             del _handlers[cache_key]
         if stale:
             logger.info("🧹 Cleaned up %d stale sessions (remaining: %d)", len(stale), len(_handlers))
+    if _stale_session_ids:
+        with _session_chat_locks_guard:
+            for sid in _stale_session_ids:
+                _session_chat_locks.pop(sid, None)
+        with _debounce_lock:
+            for sid in _stale_session_ids:
+                _session_last_user_msg.pop(sid, None)
+                _session_last_assistant_at.pop(sid, None)
 
 
 # === BOOKING INTENT DETECTION ===
@@ -1233,6 +1272,15 @@ def _dashboard_index_response():
     return send_from_directory(_DASHBOARD_DIR, "index.html")
 
 
+@app.route('/test_widget.html')
+def test_widget():
+    """Serve the standalone test widget page for local testing."""
+    _widget_path = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "test_widget.html"))
+    if os.path.isfile(_widget_path):
+        return send_from_directory(os.path.dirname(_widget_path), "test_widget.html")
+    return "test_widget.html not found", 404
+
+
 @app.route('/favicon.ico')
 def favicon():
     """Чтобы не засорять логи 404-ками от браузера."""
@@ -1445,6 +1493,15 @@ def chat_v1():
     # conversation_id → session_id
     session_id = conversation_id
 
+    if _is_duplicate_user_message(session_id, message):
+        logger.warning("🚫 DEBOUNCE: duplicate message from session %s, rejecting", session_id[:8])
+        return jsonify({
+            'error': 'Duplicate message',
+            'reply': 'Подождите, обрабатываю ваш запрос...',
+            'tour_cards': [],
+            'conversation_id': conversation_id
+        }), 429
+
     # Session count limit
     with _handlers_lock:
         if _session_cache_key(session_id, assistant_id) not in _handlers and len(_handlers) >= _MAX_SESSIONS:
@@ -1561,6 +1618,8 @@ def chat_v1():
                         api_calls_log=_api_calls_snapshot,
                         final_message_usage=getattr(handler, '_last_message_usage', None))
 
+        _mark_assistant_responded(session_id)
+
         return jsonify({
             'reply': reply,
             'tour_cards': tour_cards,
@@ -1596,7 +1655,11 @@ def chat_stream():
         return jsonify({'error': 'Empty message'}), 400
     if len(message) > _MAX_MESSAGE_LENGTH:
         return jsonify({'error': 'Message too long'}), 400
-    
+
+    if _is_duplicate_user_message(session_id, message):
+        logger.warning("🚫 DEBOUNCE: duplicate stream message from session %s, rejecting", session_id[:8])
+        return jsonify({'error': 'Duplicate message'}), 429
+
     log(f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━", "INFO")
     log(f"📨 Новое сообщение от {session_id[:8]}...", "MSG")
     log(f"   └─ \"{message[:100]}{'...' if len(message) > 100 else ''}\"", "MSG")
@@ -1612,95 +1675,105 @@ def chat_stream():
     log(f"📊 История: {len(handler.input_list)} сообщений", "INFO")
     
     def generate():
-        token_queue = queue.Queue()
-        result = {'response': '', 'error': None}
-        token_count = [0]  # Счётчик токенов
-        accumulated_text = ['']  # Накопленный текст для dedup
-        first_line = [None]  # Первая строка ответа
-        dedup_active = [False]  # Флаг: обнаружен дубликат, прекращаем отправку
-        
-        def on_token(token):
-            accumulated_text[0] += token
-            
-            # Определяем первую строку (после первого \n)
-            if first_line[0] is None:
-                nl_idx = accumulated_text[0].find('\n')
-                if nl_idx > 10:
-                    first_line[0] = accumulated_text[0][:nl_idx].strip()
-            
-            # Проверяем дубликат: если первая строка повторилась
-            if first_line[0] and len(accumulated_text[0]) > len(first_line[0]) + 50:
-                second = accumulated_text[0].find(first_line[0], len(first_line[0]) + 1)
-                if second > 0 and not dedup_active[0]:
-                    dedup_active[0] = True
-                    logger.debug("🧹 STREAM DEDUP: duplicate detected at char %d, stopping token emission", second)
-            
-            if not dedup_active[0]:
-                token_queue.put(('token', token))
-                token_count[0] += 1
-        
-        def run_chat():
-            try:
-                _hist_before = len(handler.full_history)
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
-                log("🚀 Отправляю запрос в LLM...", "INFO")
-                response = loop.run_until_complete(
-                    handler.chat_stream(message, on_token=on_token)
-                )
-                loop.close()
-                _new_entries = handler.full_history[_hist_before:]
-                _tour_cards = getattr(handler, '_pending_tour_cards', []) or []
-                handler._pending_tour_cards = []
-                _stream_api_calls = list(getattr(handler, '_pending_api_calls', []))
-                if hasattr(handler, '_pending_api_calls'):
-                    handler._pending_api_calls.clear()
-                result['response'] = response
-                result['tour_cards'] = _tour_cards
-                log(f"✅ Ответ получен: {len(response)} символов, {token_count[0]} токенов", "OK")
-                log(f"   └─ \"{response[:150]}{'...' if len(response) > 150 else ''}\"", "OK")
-                _write_dialogue_log(session_id, "ASSISTANT", response)
-                _stream_latency = int((time.perf_counter() - _stream_start) * 1000)
-                _log_chat_to_db(session_id, message, response, _tour_cards,
-                                latency_ms=_stream_latency,
-                                model_name=getattr(handler, 'model', 'unknown'),
-                                llm_provider=getattr(getattr(handler, 'runtime_config', None), 'llm_provider', _llm_provider),
-                                ip_address=_stream_ip, user_agent=_stream_ua,
-                                history_snapshot=_new_entries,
-                                assistant_id=_stream_assistant_id,
-                                search_result=getattr(handler, '_last_search_result', None),
-                                api_calls_log=_stream_api_calls,
-                                final_message_usage=getattr(handler, '_last_message_usage', None))
-                token_queue.put(('done', response))
-            except Exception as e:
-                result['error'] = str(e)
-                logger.exception("stream chat error session_id=%s", session_id)
-                log(f"❌ ОШИБКА: {e}", "ERROR")
-                _write_dialogue_log(session_id, "ERROR", str(e))
-                token_queue.put(('error', str(e)))
-        
-        # Запускаем в отдельном потоке
-        thread = threading.Thread(target=run_chat)
-        thread.start()
-        
-        # Стримим токены
-        while True:
-            try:
-                event_type, data = token_queue.get(timeout=60)
-                
-                if event_type == 'token':
-                    yield f"data: {json.dumps({'type': 'token', 'content': data})}\n\n"
-                elif event_type == 'done':
-                    yield f"data: {json.dumps({'type': 'done', 'content': data})}\n\n"
-                    break
-                elif event_type == 'error':
-                    yield f"data: {json.dumps({'type': 'error', 'content': data})}\n\n"
-                    break
-            except queue.Empty:
-                log("⏳ Таймаут ожидания...", "WARN")
-                yield f"data: {json.dumps({'type': 'ping'})}\n\n"
-        
-        thread.join()
+        with _session_chat_locks_guard:
+            if session_id not in _session_chat_locks:
+                _session_chat_locks[session_id] = threading.Lock()
+            _chat_lock = _session_chat_locks[session_id]
+
+        if not _chat_lock.acquire(blocking=False):
+            logger.warning("🚫 DOUBLE-REQUEST: stream session %s already processing, rejecting", session_id[:8])
+            yield f"data: {json.dumps({'type': 'error', 'content': 'Подождите, обрабатываю предыдущий запрос...'})}\n\n"
+            return
+
+        try:
+            token_queue = queue.Queue()
+            result = {'response': '', 'error': None}
+            token_count = [0]
+            accumulated_text = ['']
+            first_line = [None]
+            dedup_active = [False]
+
+            def on_token(token):
+                accumulated_text[0] += token
+
+                if first_line[0] is None:
+                    nl_idx = accumulated_text[0].find('\n')
+                    if nl_idx > 10:
+                        first_line[0] = accumulated_text[0][:nl_idx].strip()
+
+                if first_line[0] and len(accumulated_text[0]) > len(first_line[0]) + 50:
+                    second = accumulated_text[0].find(first_line[0], len(first_line[0]) + 1)
+                    if second > 0 and not dedup_active[0]:
+                        dedup_active[0] = True
+                        logger.debug("🧹 STREAM DEDUP: duplicate detected at char %d, stopping token emission", second)
+
+                if not dedup_active[0]:
+                    token_queue.put(('token', token))
+                    token_count[0] += 1
+
+            def run_chat():
+                try:
+                    _hist_before = len(handler.full_history)
+                    loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(loop)
+                    log("🚀 Отправляю запрос в LLM...", "INFO")
+                    response = loop.run_until_complete(
+                        handler.chat_stream(message, on_token=on_token)
+                    )
+                    loop.close()
+                    _new_entries = handler.full_history[_hist_before:]
+                    _tour_cards = getattr(handler, '_pending_tour_cards', []) or []
+                    handler._pending_tour_cards = []
+                    _stream_api_calls = list(getattr(handler, '_pending_api_calls', []))
+                    if hasattr(handler, '_pending_api_calls'):
+                        handler._pending_api_calls.clear()
+                    result['response'] = response
+                    result['tour_cards'] = _tour_cards
+                    log(f"✅ Ответ получен: {len(response)} символов, {token_count[0]} токенов", "OK")
+                    log(f"   └─ \"{response[:150]}{'...' if len(response) > 150 else ''}\"", "OK")
+                    _write_dialogue_log(session_id, "ASSISTANT", response)
+                    _stream_latency = int((time.perf_counter() - _stream_start) * 1000)
+                    _log_chat_to_db(session_id, message, response, _tour_cards,
+                                    latency_ms=_stream_latency,
+                                    model_name=getattr(handler, 'model', 'unknown'),
+                                    llm_provider=getattr(getattr(handler, 'runtime_config', None), 'llm_provider', _llm_provider),
+                                    ip_address=_stream_ip, user_agent=_stream_ua,
+                                    history_snapshot=_new_entries,
+                                    assistant_id=_stream_assistant_id,
+                                    search_result=getattr(handler, '_last_search_result', None),
+                                    api_calls_log=_stream_api_calls,
+                                    final_message_usage=getattr(handler, '_last_message_usage', None))
+                    _mark_assistant_responded(session_id)
+                    token_queue.put(('done', response))
+                except Exception as e:
+                    result['error'] = str(e)
+                    logger.exception("stream chat error session_id=%s", session_id)
+                    log(f"❌ ОШИБКА: {e}", "ERROR")
+                    _write_dialogue_log(session_id, "ERROR", str(e))
+                    token_queue.put(('error', str(e)))
+
+            thread = threading.Thread(target=run_chat)
+            thread.start()
+
+            while True:
+                try:
+                    event_type, data = token_queue.get(timeout=60)
+
+                    if event_type == 'token':
+                        yield f"data: {json.dumps({'type': 'token', 'content': data})}\n\n"
+                    elif event_type == 'done':
+                        yield f"data: {json.dumps({'type': 'done', 'content': data})}\n\n"
+                        break
+                    elif event_type == 'error':
+                        yield f"data: {json.dumps({'type': 'error', 'content': data})}\n\n"
+                        break
+                except queue.Empty:
+                    log("⏳ Таймаут ожидания...", "WARN")
+                    yield f"data: {json.dumps({'type': 'ping'})}\n\n"
+
+            thread.join()
+        finally:
+            _chat_lock.release()
     
     return Response(
         stream_with_context(generate()),
