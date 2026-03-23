@@ -13,6 +13,7 @@ from sqlalchemy import func, select
 from config import settings
 from database import get_db, is_db_available
 from models import ApiCall, Assistant, Conversation, Message, RuntimeEventOutbox, TourSearch
+from runtime_message_filters import filter_runtime_message_rows
 
 logger = logging.getLogger("mgp_bot.dialog_sender")
 
@@ -367,6 +368,7 @@ def enqueue_conversation_snapshot(db, conversation_id: uuid.UUID, assistant_id: 
     messages = db.execute(
         select(Message).where(Message.conversation_id == conversation_id).order_by(Message.created_at.asc(), Message.id.asc())
     ).scalars().all()
+    messages = filter_runtime_message_rows(messages)
     tour_searches = db.execute(
         select(TourSearch).where(TourSearch.conversation_id == conversation_id).order_by(TourSearch.created_at.asc(), TourSearch.id.asc())
     ).scalars().all()

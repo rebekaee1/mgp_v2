@@ -52,6 +52,7 @@ CORS(app, resources={
 from dashboard_api import auth_bp, dash_bp
 from provisioning_api import provisioning_bp
 from reconciliation_api import reconciliation_bp
+from runtime_message_filters import filter_runtime_message_rows, filter_runtime_snapshot_entries
 app.register_blueprint(auth_bp)
 app.register_blueprint(dash_bp)
 app.register_blueprint(provisioning_bp)
@@ -494,6 +495,7 @@ def _build_conversation_history_payload(db, assistant_id: str, conversation_id: 
     rows = db.query(Message).filter(
         Message.conversation_id == conv.id
     ).order_by(Message.created_at.asc(), Message.id.asc()).all()
+    rows = filter_runtime_message_rows(rows)
 
     visible = []
     for row in rows:
@@ -654,8 +656,9 @@ def _log_chat_to_db(session_id: str, user_message: str, reply: str,
                      api_calls_log: list = None,
                      final_message_usage: dict = None):
     """
-    Записать в PostgreSQL ПОЛНЫЙ ПУТЬ без исключений:
-    - КАЖДАЯ запись из history_snapshot (user, assistant, tool, синтетические retry)
+    Записать в PostgreSQL клиентски-видимую историю:
+    - все обычные записи из history_snapshot (user, assistant, tool)
+    - исключая внутренние runtime nudges/self-repair подсказки
     - Последний assistant enriched с tour_cards + latency_ms
     - Safety net: если handler.chat() вернул reply без append в history,
       финальный ответ добавляется отдельно
@@ -726,6 +729,7 @@ def _log_chat_to_db(session_id: str, user_message: str, reply: str,
                         "role": "user",
                         "content": user_message,
                     })
+                snapshot_entries = filter_runtime_snapshot_entries(snapshot_entries)
 
             if snapshot_entries:
                 for entry in snapshot_entries:
