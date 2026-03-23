@@ -24,7 +24,6 @@ COPY --from=dashboard-build /app/dashboard/dist/ /app/backend/dashboard_dist/
 COPY system_prompt.md /app/system_prompt.md
 COPY function_schemas.json /app/function_schemas.json
 COPY faq.md /app/faq.md
-COPY test_widget.html /app/test_widget.html
 
 COPY backend/entrypoint.sh /app/entrypoint.sh
 RUN chmod +x /app/entrypoint.sh
