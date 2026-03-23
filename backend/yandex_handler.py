@@ -18,6 +18,7 @@ import requests
 from dotenv import load_dotenv
 from tourvisor_client import (
     TourVisorClient,
+    TourVisorAPIError,
     TourIdExpiredError,
     SearchNotFoundError,
     NoResultsError
@@ -1694,7 +1695,7 @@ class YandexGPTHandler:
                 "call_id": call_id,
                 "output": result_str
             }
-        except (TourIdExpiredError, SearchNotFoundError, NoResultsError) as e:
+        except (TourVisorAPIError, TourIdExpiredError, SearchNotFoundError, NoResultsError) as e:
             elapsed_ms = int((time.perf_counter() - t0) * 1000)
             error_msg = f"Ошибка: {str(e)}"
             logger.warning("🔧 FUNC CALL << %s  BUSINESS_ERROR  %dms  %s", name, elapsed_ms, error_msg)
@@ -2819,11 +2820,10 @@ class YandexGPTHandler:
                 hideregular=args.get("hideregular")
             )
             
-            # Проверка на ошибку (прошлые даты и т.п.)
             if request_id is None:
                 return {
-                    "error": "Не удалось создать поиск. Проверьте даты — они должны быть в будущем (2026 год или позже).",
-                    "hint": "Используйте формат ДД.ММ.ГГГГ, например 01.03.2026"
+                    "error": "Не удалось создать поиск. Возможные причины: некорректные даты, ошибка авторизации TourVisor или временная проблема сервиса.",
+                    "hint": "Проверьте даты (формат ДД.ММ.ГГГГ, должны быть в будущем). Если проблема повторяется — обратитесь к менеджеру."
                 }
             
             # ── P13: Кэшируем requestid для валидации в get_search_status ──

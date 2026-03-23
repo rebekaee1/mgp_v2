@@ -226,12 +226,20 @@ class TourVisorClient:
         Известные ошибки:
         - "Wrong (obsolete) TourID." — tourid истёк
         - "no search results" в status.state — requestid не найден
+        - {"error": {"errormessage": "..."}} — auth/validation (search.php, list.php)
         """
         # Fix D1: Логируем top-level iserror (actdetail.php возвращает ошибки на верхнем уровне)
         # НЕ бросаем исключение — dispatch обрабатывает fallback через F2
         if data.get("iserror"):
             logger.warning("🌐 TOURVISOR API ERROR [%s] (top-level iserror): %s",
                            endpoint, data.get("errormessage", "unknown"))
+        
+        # Top-level {"error": {"errormessage": "..."}} — auth/validation errors
+        if "error" in data and isinstance(data["error"], dict):
+            err_msg = data["error"].get("errormessage", "").strip()
+            if err_msg:
+                logger.error("🌐 TOURVISOR API ERROR [%s]: %s", endpoint, err_msg)
+                raise TourVisorAPIError(err_msg, data)
         
         # Проверка на errormessage (например, для actualize.php)
         if "data" in data:
