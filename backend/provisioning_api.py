@@ -66,6 +66,18 @@ def _llm_validation_error(code: str, message: str, *, retryable: bool = False) -
     }
 
 
+def _llm_http_validation_error(prefix: str, status_code: int, response_text: str) -> Dict[str, Any]:
+    """Map chat-completion validation HTTP status to error code and retry policy."""
+    retryable = status_code in (408, 409, 425, 429) or status_code >= 500
+    code = "llm_validation_unavailable" if retryable else "llm_credentials_invalid"
+    error_body = (response_text or "").strip()[:300]
+    return _llm_validation_error(
+        code,
+        f"{prefix}: HTTP {status_code} {error_body}".strip(),
+        retryable=retryable,
+    )
+
+
 def _validate_openai_runtime_access(api_key: str, model: str) -> Optional[Dict[str, Any]]:
     base_url = _normalize_base_url(settings.openai_base_url or "https://openrouter.ai/api/v1")
     try:
@@ -84,13 +96,10 @@ def _validate_openai_runtime_access(api_key: str, model: str) -> Optional[Dict[s
             )
         if 200 <= resp.status_code < 300:
             return None
-        retryable = resp.status_code in (408, 409, 425, 429) or resp.status_code >= 500
-        error_body = (resp.text or "").strip()[:300]
-        error_code = "llm_validation_unavailable" if retryable else "llm_credentials_invalid"
-        return _llm_validation_error(
-            error_code,
-            f"OpenAI/OpenRouter chat validation failed: HTTP {resp.status_code} {error_body}".strip(),
-            retryable=retryable,
+        return _llm_http_validation_error(
+            "OpenAI/OpenRouter chat validation failed",
+            resp.status_code,
+            resp.text or "",
         )
     except Exception as exc:
         return _llm_validation_error(
@@ -128,12 +137,10 @@ def _validate_yandex_runtime_access(api_key: str, model: str) -> Optional[Dict[s
             )
         if 200 <= resp.status_code < 300:
             return None
-        retryable = resp.status_code in (408, 409, 425, 429) or resp.status_code >= 500
-        error_body = (resp.text or "").strip()[:300]
-        return _llm_validation_error(
-            "llm_credentials_invalid",
-            f"Yandex chat validation failed: HTTP {resp.status_code} {error_body}".strip(),
-            retryable=retryable,
+        return _llm_http_validation_error(
+            "Yandex chat validation failed",
+            resp.status_code,
+            resp.text or "",
         )
     except Exception as exc:
         return _llm_validation_error(
