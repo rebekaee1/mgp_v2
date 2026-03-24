@@ -151,7 +151,7 @@
           },
           "services": {
             "type": "string",
-            "description": "Коды услуг через запятую (get_dictionaries type=services)."
+            "description": "Коды услуг через запятую. Основные: 48=только для взрослых (adults only / без детей). Для других кодов: get_dictionaries type=services."
           },
           "onrequest": {
             "type": "integer",

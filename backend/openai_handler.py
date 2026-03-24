@@ -330,7 +330,8 @@ class OpenAIHandler(YandexGPTHandler):
              r'горки\s*город|radisson\s*rosa|green\s*park|грин\s*парк|'
              r'гранд\s*каньон)\b', None),
             # Контекстный паттерн: "отель X" / "hotel X" / "в отеле X"
-            (r'(?:(?:в\s+)?отел[ьеи]|hotel)\s+([а-яёa-z]{3,})', None),
+            # Negative lookahead excludes common non-hotel words
+            (r'(?:(?:в\s+)?отел[ьеи]|hotel)\s+(?!без\b|для\b|с\b|на\b|в\b|у\b|по\b|от\b|до\b|не\b|или\b|и\b|всё\b|все\b|только\b|где\b|как\b|что\b|там\b|тут\b|это\b|рядом\b|около\b|возле\b|недалеко\b)([а-яёa-z]{3,})', None),
         ],
     }
 
@@ -477,6 +478,7 @@ class OpenAIHandler(YandexGPTHandler):
             temperature=0.2,
             max_tokens=4096,
             extra_body={"reasoning_effort": "low"},
+            timeout=60.0,
         )
 
     # ─── Main Chat Loop ──────────────────────────────────────────────────
@@ -524,7 +526,7 @@ class OpenAIHandler(YandexGPTHandler):
             iteration += 1
 
             elapsed = time.perf_counter() - chat_start
-            if elapsed > 90:
+            if elapsed > 120:
                 logger.error(
                     "⏱ WALL-CLOCK TIMEOUT after %.1fs at iteration %d",
                     elapsed, iteration
@@ -1243,8 +1245,8 @@ class OpenAIHandler(YandexGPTHandler):
             _is_error_response = final_text.startswith(("Что-то пошло не так", "Секундочку", "Наш диалог получился", "Извините", "Произошла", "К сожалению"))
 
             if not _is_error_response and self._context_warning_stage < 2:
-                _WARNING_SOFT = 60
-                _WARNING_HARD = 72
+                _WARNING_SOFT = 80
+                _WARNING_HARD = 96
 
                 if _hist_len >= _WARNING_HARD and self._context_warning_stage < 2:
                     summary = self._build_context_summary()

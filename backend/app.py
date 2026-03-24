@@ -433,9 +433,10 @@ def _restore_handler_from_db(handler, session_id: str, assistant_id: str = None)
                     params["priceto"] = latest_search.price_to
 
                 handler._last_search_params = params
-                handler._last_requestid = latest_search.requestid or None
+                handler._last_requestid = None
+                handler._search_awaiting_results = False
                 handler._last_search_result = {
-                    "requestid": latest_search.requestid,
+                    "requestid": None,
                     "hotels_found": latest_search.hotels_found,
                     "tours_found": latest_search.tours_found,
                     "min_price": latest_search.min_price,
@@ -461,6 +462,9 @@ def _restore_handler_from_db(handler, session_id: str, assistant_id: str = None)
                             "[ВОССТАНОВЛЕННАЯ СЕССИЯ] Параметры предыдущего поиска:\n"
                             + "\n".join(_summary_lines)
                             + "\nНЕ переспрашивай эти параметры. Используй их для контекста."
+                            "\n⚠️ requestid предыдущего поиска НЕДЕЙСТВИТЕЛЕН. "
+                            "Для показа туров ОБЯЗАТЕЛЬНО выполни новый search_tours, "
+                            "не используй get_search_results / continue_search без нового requestid."
                         )
                     })
 

@@ -1,0 +1,397 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>MGP AI Assistant — Тест</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    background: #f0f2f5;
+    height: 100vh;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+  }
+  .chat-container {
+    width: 420px;
+    height: 680px;
+    background: #fff;
+    border-radius: 16px;
+    box-shadow: 0 8px 32px rgba(0,0,0,0.12);
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+  .chat-header {
+    background: linear-gradient(135deg, #1a73e8, #0d47a1);
+    color: #fff;
+    padding: 16px 20px;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+  }
+  .chat-header .avatar {
+    width: 40px; height: 40px;
+    background: rgba(255,255,255,0.2);
+    border-radius: 50%;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 20px;
+  }
+  .chat-header .info h3 { font-size: 15px; font-weight: 600; }
+  .chat-header .info span { font-size: 12px; opacity: 0.8; }
+  .chat-header .new-btn {
+    margin-left: auto;
+    background: rgba(255,255,255,0.2);
+    border: none; color: #fff;
+    padding: 6px 12px; border-radius: 8px;
+    cursor: pointer; font-size: 12px;
+  }
+  .chat-header .new-btn:hover { background: rgba(255,255,255,0.35); }
+
+  .messages {
+    flex: 1;
+    overflow-y: auto;
+    padding: 16px;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    scroll-behavior: smooth;
+  }
+  .msg {
+    max-width: 85%;
+    padding: 10px 14px;
+    border-radius: 16px;
+    font-size: 14px;
+    line-height: 1.5;
+    word-wrap: break-word;
+  }
+  .msg.user {
+    align-self: flex-end;
+    background: #1a73e8;
+    color: #fff;
+    border-bottom-right-radius: 4px;
+  }
+  .msg.bot {
+    align-self: flex-start;
+    background: #f1f3f4;
+    color: #1a1a1a;
+    border-bottom-left-radius: 4px;
+  }
+  .msg.system {
+    align-self: center;
+    background: #fff3cd;
+    color: #856404;
+    font-size: 12px;
+    border-radius: 8px;
+    max-width: 95%;
+  }
+  .tour-cards {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    margin-top: 8px;
+  }
+  .tour-card {
+    background: #fff;
+    border: 1px solid #e0e0e0;
+    border-radius: 12px;
+    padding: 10px;
+    font-size: 13px;
+  }
+  .tour-card .hotel { font-weight: 600; color: #1a73e8; }
+  .tour-card .details { color: #666; margin-top: 4px; }
+  .tour-card .price { font-weight: 700; color: #1a1a1a; margin-top: 4px; font-size: 15px; }
+  .tour-card .rating-badge {
+    display: inline-block;
+    padding: 1px 6px;
+    border-radius: 4px;
+    font-size: 12px;
+    font-weight: 700;
+    margin-left: 4px;
+    vertical-align: middle;
+  }
+  .tour-card .rating-badge.high { background: #e6f4ea; color: #137333; }
+  .tour-card .rating-badge.mid { background: #fef7e0; color: #b06000; }
+  .tour-card .rating-badge.low { background: #fce8e6; color: #c5221f; }
+  .tour-card .rating-badge.none { background: #f1f3f4; color: #999; }
+
+  .typing {
+    align-self: flex-start;
+    background: #f1f3f4;
+    padding: 12px 18px;
+    border-radius: 16px;
+    border-bottom-left-radius: 4px;
+  }
+  .typing span {
+    display: inline-block;
+    width: 8px; height: 8px;
+    background: #999;
+    border-radius: 50%;
+    margin: 0 2px;
+    animation: bounce 1.2s infinite;
+  }
+  .typing span:nth-child(2) { animation-delay: 0.2s; }
+  .typing span:nth-child(3) { animation-delay: 0.4s; }
+  @keyframes bounce {
+    0%, 60%, 100% { transform: translateY(0); }
+    30% { transform: translateY(-6px); }
+  }
+
+  .input-area {
+    padding: 12px 16px;
+    border-top: 1px solid #e8e8e8;
+    display: flex;
+    gap: 8px;
+    background: #fafafa;
+  }
+  .input-area input {
+    flex: 1;
+    border: 1px solid #ddd;
+    border-radius: 24px;
+    padding: 10px 16px;
+    font-size: 14px;
+    outline: none;
+    transition: border-color 0.2s;
+  }
+  .input-area input:focus { border-color: #1a73e8; }
+  .input-area button {
+    background: #1a73e8;
+    color: #fff;
+    border: none;
+    border-radius: 50%;
+    width: 40px; height: 40px;
+    cursor: pointer;
+    font-size: 18px;
+    display: flex; align-items: center; justify-content: center;
+    transition: background 0.2s;
+  }
+  .input-area button:hover { background: #1557b0; }
+  .input-area button:disabled { background: #ccc; cursor: not-allowed; }
+
+  .conv-id {
+    text-align: center;
+    font-size: 11px;
+    color: #999;
+    padding: 4px;
+    background: #fafafa;
+  }
+
+  .log-panel {
+    position: fixed;
+    right: 20px;
+    top: 20px;
+    width: 360px;
+    max-height: 640px;
+    background: #1e1e1e;
+    color: #d4d4d4;
+    border-radius: 12px;
+    font-family: 'SF Mono', 'Fira Code', monospace;
+    font-size: 11px;
+    overflow: hidden;
+    box-shadow: 0 8px 32px rgba(0,0,0,0.3);
+    display: flex;
+    flex-direction: column;
+  }
+  .log-panel .log-header {
+    background: #333;
+    padding: 8px 12px;
+    font-weight: 600;
+    color: #fff;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+  }
+  .log-panel .log-header button {
+    background: #555; border: none; color: #fff;
+    padding: 2px 8px; border-radius: 4px; cursor: pointer; font-size: 11px;
+  }
+  .log-body {
+    flex: 1;
+    overflow-y: auto;
+    padding: 8px;
+    max-height: 590px;
+  }
+  .log-entry { margin-bottom: 4px; white-space: pre-wrap; }
+  .log-entry.req { color: #569cd6; }
+  .log-entry.res { color: #6a9955; }
+  .log-entry.err { color: #f44747; }
+  .log-entry.info { color: #dcdcaa; }
+</style>
+</head>
+<body>
+
+<div class="chat-container">
+  <div class="chat-header">
+    <div class="avatar">✈</div>
+    <div class="info">
+      <h3>MGP AI Assistant</h3>
+      <span id="status">gpt-5-mini • localhost:8088</span>
+    </div>
+    <button class="new-btn" onclick="newChat()">Новый чат</button>
+  </div>
+
+  <div class="messages" id="messages"></div>
+
+  <div class="conv-id" id="convId">Новый диалог</div>
+
+  <div class="input-area">
+    <input type="text" id="input" placeholder="Введите сообщение..." autocomplete="off"
+           onkeydown="if(event.key==='Enter')sendMsg()">
+    <button id="sendBtn" onclick="sendMsg()">&#10148;</button>
+  </div>
+</div>
+
+<div class="log-panel">
+  <div class="log-header">
+    <span>API Log</span>
+    <button onclick="document.getElementById('logBody').innerHTML=''">Clear</button>
+  </div>
+  <div class="log-body" id="logBody"></div>
+</div>
+
+<script>
+const API = 'http://localhost:8088/api/v1/chat';
+let conversationId = crypto.randomUUID();
+
+function addMsg(text, cls) {
+  const el = document.createElement('div');
+  el.className = 'msg ' + cls;
+  el.textContent = text;
+  document.getElementById('messages').appendChild(el);
+  scrollDown();
+  return el;
+}
+
+function addCards(cards, parentEl) {
+  if (!cards || !cards.length) return;
+  const container = document.createElement('div');
+  container.className = 'tour-cards';
+  cards.forEach((c, i) => {
+    const card = document.createElement('div');
+    card.className = 'tour-card';
+    const stars = c.hotel_stars ? '★'.repeat(c.hotel_stars) + ' (' + c.hotel_stars + '★)' : '';
+    const hr = c.hotel_rating ? parseFloat(c.hotel_rating) : 0;
+    const ratingClass = hr >= 4.0 ? 'high' : hr >= 3.5 ? 'mid' : hr > 0 ? 'low' : 'none';
+    const ratingBadge = hr > 0
+      ? `<span class="rating-badge ${ratingClass}">${hr.toFixed(1)}</span>`
+      : `<span class="rating-badge none">н/д</span>`;
+    const meal = c.meal_description || c.food_type || '';
+    const room = c.room_type && c.room_type !== 'Standard' ? c.room_type : '';
+    const nights = c.nights ? c.nights + ' ноч.' : '';
+    const resort = c.resort || '';
+    const dateFrom = c.date_from || '';
+    const operator = c.operator || '';
+    const price = c.price ? Number(c.price).toLocaleString('ru-RU') + ' ₽' : '';
+    const priceLabel = c.price_per_person ? '(за чел.)' : '(за тур)';
+    card.innerHTML = `
+      <div class="hotel">${i+1}. ${c.hotel_name || 'Отель'} ${stars} ${ratingBadge}</div>
+      <div class="details">${[resort, meal, nights, dateFrom].filter(Boolean).join(' • ')}</div>
+      ${room ? `<div class="details">${room}</div>` : ''}
+      ${price ? `<div class="price">${price} <small>${priceLabel}</small></div>` : ''}
+      ${c.addpayments_per_person ? `<div class="details" style="font-size:11px;color:#e67e22">+ доплаты ~${Number(c.addpayments_total).toLocaleString('ru-RU')} ₽ (${c.addpayments_details.map(d => d.name).join(', ')})</div>` : ''}
+      ${operator ? `<div class="details" style="font-size:11px;color:#999">${operator}</div>` : ''}
+    `;
+    container.appendChild(card);
+  });
+  parentEl.after(container);
+  scrollDown();
+}
+
+function showTyping() {
+  const el = document.createElement('div');
+  el.className = 'typing';
+  el.id = 'typing';
+  el.innerHTML = '<span></span><span></span><span></span>';
+  document.getElementById('messages').appendChild(el);
+  scrollDown();
+}
+function hideTyping() {
+  const el = document.getElementById('typing');
+  if (el) el.remove();
+}
+
+function scrollDown() {
+  const m = document.getElementById('messages');
+  m.scrollTop = m.scrollHeight;
+}
+
+function log(text, cls) {
+  const el = document.createElement('div');
+  el.className = 'log-entry ' + (cls || '');
+  const time = new Date().toLocaleTimeString('ru-RU');
+  el.textContent = `[${time}] ${text}`;
+  document.getElementById('logBody').appendChild(el);
+  document.getElementById('logBody').scrollTop = document.getElementById('logBody').scrollHeight;
+}
+
+async function sendMsg() {
+  const input = document.getElementById('input');
+  const text = input.value.trim();
+  if (!text) return;
+
+  input.value = '';
+  addMsg(text, 'user');
+
+  const payload = { message: text };
+  if (conversationId) payload.conversation_id = conversationId;
+
+  log(`>> POST ${JSON.stringify(payload).substring(0, 200)}`, 'req');
+
+  document.getElementById('sendBtn').disabled = true;
+  showTyping();
+
+  const t0 = performance.now();
+  try {
+    const resp = await fetch(API, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload)
+    });
+    const data = await resp.json();
+    const ms = Math.round(performance.now() - t0);
+
+    hideTyping();
+
+    conversationId = data.conversation_id;
+    document.getElementById('convId').textContent = `conv: ${conversationId}`;
+
+    log(`<< ${ms}ms | ${data.reply?.length || 0} chars | ${data.tour_cards?.length || 0} cards`, 'res');
+
+    if (data.reply) {
+      const botEl = addMsg(data.reply, 'bot');
+      if (data.tour_cards && data.tour_cards.length) {
+        addCards(data.tour_cards, botEl);
+        data.tour_cards.forEach((c,i) => {
+          log(`   ${i+1}. ${c.hotel_name} ${c.hotel_stars||'?'}★ | r:${c.hotel_rating||'?'} | ${c.meal_description||'?'} | ${c.nights||'?'}н | ${c.resort||''}`, 'info');
+        });
+      }
+    } else {
+      addMsg('(пустой ответ)', 'system');
+      log(`   WARNING: empty reply`, 'err');
+    }
+  } catch (e) {
+    hideTyping();
+    addMsg('Ошибка соединения: ' + e.message, 'system');
+    log(`ERROR: ${e.message}`, 'err');
+  }
+  document.getElementById('sendBtn').disabled = false;
+  document.getElementById('input').focus();
+}
+
+function newChat() {
+  conversationId = crypto.randomUUID();
+  document.getElementById('messages').innerHTML = '';
+  document.getElementById('convId').textContent = `conv: ${conversationId}`;
+  log('--- Новый чат ---', 'info');
+  document.getElementById('input').focus();
+}
+
+document.getElementById('input').focus();
+log('Готов к тестированию. API: ' + API, 'info');
+</script>
+
+</body>
+</html>

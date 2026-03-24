@@ -191,6 +191,10 @@ def _is_promised_search(text: str) -> bool:
         # Статус поиска (модель описывает запущенный процесс вместо вызова функции)
         "поиск запущен", "ожидаю результат", "жду результат",
         "запущен, ожидаю", "результаты скоро будут",
+        # Ложное утверждение о показе результатов (без реального вызова)
+        "показал варианты", "нашёл варианты", "нашел варианты",
+        "вот варианты", "подобрал для вас",
+        "вот что нашлось", "вот что я нашёл", "вот что я нашел",
     ]
     return any(phrase in lower for phrase in promise_phrases)
 
@@ -1160,6 +1164,7 @@ _RE_TECH_IDS = re.compile(
     r'(?:'
     r'(?:tourid|tour_id|hotelcode|hotel_code|requestid|request_id)\s*[=:]\s*\S+'
     r'|(?:tourid|hotelcode|requestid)\s+\d+'
+    r'|request\s*=\s*\d+'
     r')',
     re.IGNORECASE
 )
@@ -1385,7 +1390,7 @@ class YandexGPTHandler:
         # 80 сообщений: с учётом tool_call/tool_result в OpenAI handler
         # один поиск = ~8 сообщений, полный цикл (каскад+поиск+консультация+повторный поиск) = ~40-45.
         # Предупреждения показываются на 60 и 72 сообщениях.
-        self._max_history_len = 80
+        self._max_history_len = 100
         
         # Счётчик пустых итераций подряд (для детекции зависаний)
         self._empty_iterations = 0
@@ -1967,6 +1972,16 @@ class YandexGPTHandler:
                     user_text_for_dates
                 )
                 
+                _has_explicit_day_range = re.search(
+                    r'(?:с\s+)?\d{1,2}\s*(?:по|-)\s*\d{1,2}\s*'
+                    r'(?:числ|январ|феврал|март|апрел|ма[еяй]|июн|июл|август|сентябр|октябр|ноябр|декабр)',
+                    user_text_for_dates
+                )
+                if _has_explicit_day_range:
+                    logger.info("🛡️ P4-GUARD: explicit day range detected (%s) — skipping month-part correction",
+                                _has_explicit_day_range.group())
+                    month_part_match = None
+
                 if month_part_match:
                     part = month_part_match.group('part')
                     month_word = month_part_match.group('month')
@@ -1994,12 +2009,11 @@ class YandexGPTHandler:
                             
                             corrected = False
                             
-                            # Fix F3: Исправлены условия — safety-net срабатывает когда модель
-                            # выставила НЕПРАВИЛЬНЫЙ диапазон (слишком узкий ИЛИ слишком широкий).
-                            # «начало» = 01-04 (3 дня), «середина» = 10-20 (10 дней), «конец» = 20-end (10-11 дней)
-                            if 'начал' in part and date_span != 3:
+                            # Safety-net: корректирует диапазон дат когда модель выставила неправильный.
+                            # «начало» = 01-10 (9 дней), «середина» = 10-20 (10 дней), «конец» = 20-end (10-11 дней)
+                            if 'начал' in part and date_span != 9:
                                 new_from = f"01.{detected_month:02d}.{year}"
-                                new_to = f"04.{detected_month:02d}.{year}"
+                                new_to = f"10.{detected_month:02d}.{year}"
                                 corrected = True
                             elif 'середин' in part and not (8 <= date_span <= 12):
                                 new_from = f"10.{detected_month:02d}.{year}"
@@ -2273,7 +2287,8 @@ class YandexGPTHandler:
             if self._last_search_params:
                 _cache_keys = ("departure", "datefrom", "dateto", "nightsfrom", "nightsto",
                                "adults", "child", "childage1", "childage2", "childage3",
-                               "stars", "starsbetter", "meal", "mealbetter")
+                               "stars", "starsbetter", "meal", "mealbetter",
+                               "services", "directflight")
                 _restored = []
                 for _ck in _cache_keys:
                     if (_ck not in args or args[_ck] is None) and _ck in self._last_search_params:
@@ -2283,6 +2298,10 @@ class YandexGPTHandler:
                             _starsbetter_from_cache = True
                 if _restored:
                     logger.info("📋 PARAM-CACHE: restored from previous search: %s", ", ".join(_restored))
+                # Guard: adults-only (services=48) conflicts with children
+                if str(args.get("services", "")) == "48" and _safe_int(args.get("child", 0)) > 0:
+                    args.pop("services", None)
+                    logger.warning("🛡️ CACHE-GUARD: removed services=48 (adults-only) because child=%s", args.get("child"))
                 # Если страна изменилась — сбрасываем region из кэша (другая страна = другие регионы)
                 if args.get("country") != self._last_search_params.get("_country"):
                     if "regions" in args and args.get("regions") == self._last_search_params.get("_regions"):
@@ -2788,6 +2807,11 @@ class YandexGPTHandler:
                 except Exception as _dr_err:
                     logger.warning("Dead route pre-check failed (non-blocking): %s", _dr_err)
 
+            # ── Rating safety-net: API floor >=3.5, tiered post-selection prioritizes >=4.0 ──
+            if args.get("rating") is None and not args.get("hotels"):
+                args["rating"] = 3
+                logger.info("🛡️ RATING DEFAULT: injected rating=3 (API floor >=3.5)")
+
             self._metrics["total_searches"] += 1
             request_id = await self.tourvisor.search_tours(
                 departure=args.get("departure"),
@@ -2842,7 +2866,8 @@ class YandexGPTHandler:
                 k: v for k, v in args.items()
                 if k in ("departure", "datefrom", "dateto", "nightsfrom", "nightsto",
                          "adults", "child", "childage1", "childage2", "childage3",
-                         "stars", "starsbetter", "meal", "mealbetter")
+                         "stars", "starsbetter", "meal", "mealbetter",
+                         "services", "directflight")
                 and v is not None
             }
             # Запоминаем страну, регион и hideregular для детекции смены направления / подсказок
@@ -3001,6 +3026,15 @@ class YandexGPTHandler:
 
                                 if self._last_search_params.get("_regions"):
                                     _options.append("Убрать ограничение по курорту")
+
+                                if self._last_search_params.get("directflight"):
+                                    _options.append("Убрать ограничение на прямой рейс (рассмотреть стыковки)")
+
+                                _svc = str(self._last_search_params.get("services", ""))
+                                if _svc == "48":
+                                    _options.append("Рассмотреть семейные отели (убрать adults-only)")
+                                elif _svc:
+                                    _options.append("Убрать дополнительные услуги / фильтр сервисов")
 
                                 _options.append(f"Попробовать другой город вылета (сейчас: {_dep_city})")
 
@@ -3228,7 +3262,30 @@ class YandexGPTHandler:
                 _scored_hotels.sort(key=lambda x: x[1])
                 logger.info("💰 PRICE SORT: %d hotels sorted by price (budget specified)", len(_scored_hotels))
             
-            simplified = [item[2] for item in _scored_hotels[:5]]
+            # ── Уровень 3: tiered selection by hotel rating ──
+            _RATING_TIERS = [4.0, 3.8, 3.5, 0]
+            _selected = []
+            _seen_idx = set()
+            _tier_counts = []
+            for _threshold in _RATING_TIERS:
+                _before = len(_selected)
+                if _before >= 5:
+                    break
+                for _idx, _item in enumerate(_scored_hotels):
+                    if _idx in _seen_idx:
+                        continue
+                    _hr = _safe_float(_item[2].get("hotelrating"), 0)
+                    if _hr >= _threshold or _threshold == 0:
+                        _selected.append(_item)
+                        _seen_idx.add(_idx)
+                        if len(_selected) >= 5:
+                            break
+                _tier_counts.append(len(_selected) - _before)
+            logger.info(
+                "⭐ RATING TIERS: %s from tiers 4.0+/3.8+/3.5+/other (total %d scored)",
+                _tier_counts, len(_scored_hotels)
+            )
+            simplified = [item[2] for item in _selected]
             
             # ── Строим tour_cards для нового фронтенда ──
             _adults = self._last_search_params.get("adults", 2) if self._last_search_params else 2
@@ -3328,6 +3385,35 @@ class YandexGPTHandler:
                             f"показаны варианты с {_actual_list.lower()}.»"
                         )
                         logger.warning("🍽️ MEAL MISMATCH: requested=%s(%d) actual=%s", _req_name, _req_meal_code, _actual_list)
+
+            # Adults-only detection
+            _child_count = _safe_int(self._last_search_params.get("child", 0)) if self._last_search_params else 0
+            if _child_count and _child_count > 0:
+                _ao_names = [
+                    h.get("hotelname", "") for h in simplified
+                    if re.search(r'(?:adults?\s*only|16\+|18\+)', h.get("hotelname", ""), re.IGNORECASE)
+                ]
+                if _ao_names:
+                    _result_hint += (
+                        f" ⚠️ В выдаче есть отели «только для взрослых»: {', '.join(_ao_names)}. "
+                        "Они НЕ подходят для семей с детьми! ОБЯЗАТЕЛЬНО предупреди клиента."
+                    )
+                    logger.info("⚠️ ADULTS-ONLY hotels in search results for family: %s", _ao_names)
+
+            # Stars mismatch detection
+            _req_stars = _safe_int(self._last_search_params.get("stars"), None) if self._last_search_params else None
+            if _req_stars and simplified:
+                _actual_stars = [_safe_int(h.get("hotelstars"), 0) for h in simplified]
+                _min_actual = min(_actual_stars) if _actual_stars else 0
+                if _min_actual and _min_actual < _req_stars:
+                    _below = [h.get("hotelname", "?") for h, s in zip(simplified, _actual_stars) if s < _req_stars]
+                    if _below:
+                        _result_hint += (
+                            f" ⚠️ Клиент просил {_req_stars}★+, но в выдаче есть отели ниже: "
+                            f"{', '.join(_below[:3])}. Предупреди клиента: «По вашему запросу "
+                            f"{_req_stars}★+ были ограниченные варианты, добавлены отели с меньшей звёздностью.»"
+                        )
+                        logger.warning("⭐ STARS MISMATCH: requested=%d★+ but found %s", _req_stars, _actual_stars)
 
             return {
                 "hotels_found": status.get("hotelsfound", len(hotels)),
