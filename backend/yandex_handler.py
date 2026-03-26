@@ -635,6 +635,8 @@ def _check_cascade_slots(full_history: List[Dict], args: Dict, is_follow_up: boo
             r'\b(?:середин[еуы]|середина)\b',       # "в середине"
             r'\b(?:конц[еуы]|конец)\b',             # "в конце", "конце"
             r'(?:перв\w+|втор\w+)\s+половин',       # "первой половине", "второй половине"
+            r'(?:последн\w+|первая|первую|первой)\s+(?:недел\w+)',  # "последняя неделя", "первая неделя"
+            r'\bс\s+\d{1,2}\b.*?\bпо\s+\d{1,2}\b',                 # "с 24 по 7" — числовой диапазон
         ]
         has_qualifier_loose = any(re.search(p, user_text) for p in month_qualifier_loose)
         if not has_qualifier_loose:
@@ -889,7 +891,7 @@ _DEPARTURE_VALIDATION = [
     (r'(?:из|с)\s+красноярск\w*', 12),
     (r'(?:из|с)\s+ростов\w*', 18),
     (r'(?:из|с)\s+сочи', 56),
-    (r'без\s*перел[её]т\w*', 99),
+    (r'без\s*перел[её]т\w*|(?:на\s+)?поезд\w*|автобус\w*|ж[\./]?д\w*', 99),
 ]
 
 # Паттерны для верификации смены города вылета (без обязательного "из/с").
@@ -899,7 +901,7 @@ _DEPARTURE_VERIFY = {
     4: r'уф[аыуе]', 5: r'петербург|питер|спб',
     6: r'челябинск', 7: r'самар', 8: r'нижн.*новгород|ннов',
     9: r'новосибирск', 10: r'казан', 11: r'краснодар',
-    12: r'красноярск', 18: r'ростов', 56: r'сочи', 99: r'без.*перел',
+    12: r'красноярск', 18: r'ростов', 56: r'сочи', 99: r'без.*перел|поезд|автобус|ж[./]?д|трансфер',
 }
 
 
@@ -1275,7 +1277,7 @@ _FORBIDDEN_PROMISES = re.compile(
     r'(?:с\s+менеджером|у\s+менеджера|у\s+оператора|к\s+менеджеру)',
     re.IGNORECASE
 )
-_MANAGER_RECOMMENDATION = "Рекомендую уточнить у менеджера по телефону: +7 (800) 555-35-35"
+_MANAGER_RECOMMENDATION = "Рекомендую уточнить у менеджера по телефону: +7 (499) 685-25-57"
 
 
 def _apply_grammar_and_compliance(text: str) -> str:
@@ -1799,6 +1801,13 @@ class YandexGPTHandler:
                             _DEPARTURE_CITIES.get(dep_code, "?"), dep_code
                         )
                         _skip_validation = True
+
+                if dep_code == 99:
+                    _skip_validation = True
+                    logger.info(
+                        "DEPARTURE-99-PROTECTED: departure=99 (без перелёта) — "
+                        "skipping city-based departure validation"
+                    )
 
                 if not _skip_validation:
                     user_text_for_dep = " ".join([
@@ -2808,7 +2817,7 @@ class YandexGPTHandler:
                     logger.warning("Dead route pre-check failed (non-blocking): %s", _dr_err)
 
             # ── Rating safety-net: API floor >=3.5, tiered post-selection prioritizes >=4.0 ──
-            if args.get("rating") is None and not args.get("hotels"):
+            if args.get("rating") in (None, 0) and not args.get("hotels"):
                 args["rating"] = 3
                 logger.info("🛡️ RATING DEFAULT: injected rating=3 (API floor >=3.5)")
 
@@ -3690,7 +3699,7 @@ class YandexGPTHandler:
                     "Не удалось получить данные о перелёте от туроператора. "
                     "Скажи клиенту: «К сожалению, туроператор сейчас не предоставляет "
                     "информацию о рейсе. Детали перелёта можно уточнить у нашего менеджера "
-                    "по телефону: +7 (800) 555-35-35.» "
+                    "по телефону: +7 (499) 685-25-57.» "
                     "НЕ обещай «уточню/узнаю/свяжусь». НЕ вызывай get_tour_details повторно."
                 )
                 logger.warning("⚠️ ACTDETAIL ALL ATTEMPTS FAILED — manager hint added")

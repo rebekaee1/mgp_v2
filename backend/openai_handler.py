@@ -262,7 +262,7 @@ class OpenAIHandler(YandexGPTHandler):
              r'новосибирск|нск|краснодар|красноярск|ростов|уф[аеы]|пермь?|'
              r'челябинск|самар[аеу]|нижн\w+ новгород)\w*', None),
             (r'(?:из|с)\s+(?:москв|казан|питер|спб|санкт.?петербург|сочи)\w*', None),
-            (r'без\s*перел[её]т', "без перелёта"),
+            (r'без\s*перел[её]т|(?:на\s+)?поезд\w*|автобус\w*|ж[./]?д', "без перелёта"),
         ],
         "Даты": [
             (r'(\d{1,2}[./]\d{1,2}(?:[./]\d{2,4})?)', None),
@@ -331,7 +331,7 @@ class OpenAIHandler(YandexGPTHandler):
              r'гранд\s*каньон)\b', None),
             # Контекстный паттерн: "отель X" / "hotel X" / "в отеле X"
             # Negative lookahead excludes common non-hotel words
-            (r'(?:(?:в\s+)?отел[ьеи]|hotel)\s+(?!без\b|для\b|с\b|на\b|в\b|у\b|по\b|от\b|до\b|не\b|или\b|и\b|всё\b|все\b|только\b|где\b|как\b|что\b|там\b|тут\b|это\b|рядом\b|около\b|возле\b|недалеко\b)([а-яёa-z]{3,})', None),
+            (r'(?:(?:в\s+)?отел[ьеи]|hotel)\s+(?!без\b|для\b|с\b|на\b|в\b|у\b|по\b|от\b|до\b|не\b|или\b|и\b|всё\b|все\b|только\b|где\b|как\b|что\b|там\b|тут\b|это\b|рядом\b|около\b|возле\b|недалеко\b|который\b|которая\b|которое\b|которые\b|какой\b|какая\b|какое\b|какие\b|такой\b|такая\b|такое\b|другой\b|другая\b|другое\b|этот\b|любой\b|каждый\b|свой\b|один\b|нужен\b|нужна\b|хороший\b|хорошая\b|лучший\b|лучшая\b)([а-яёa-z]{3,})', None),
         ],
     }
 
@@ -505,7 +505,7 @@ class OpenAIHandler(YandexGPTHandler):
         self._update_collected_slots(user_message)
 
         # Detect and pin "без перелёта" intent so it survives trimming
-        if re.search(r'без\s*перел[её]т', user_message, re.IGNORECASE):
+        if re.search(r'без\s*перел[её]т|(?:на\s+)?поезд|автобус\w*|ж[./]?д', user_message, re.IGNORECASE):
             self._pinned_search_intent = "[ПАРАМЕТР КЛИЕНТА: тур БЕЗ ПЕРЕЛЁТА (departure=99). НЕ спрашивай город вылета.]"
             logger.info("📌 Pinned search intent: без перелёта")
 
@@ -735,10 +735,18 @@ class OpenAIHandler(YandexGPTHandler):
                             }, ensure_ascii=False)
                         })
                     empty_retries += 1
-                    if empty_retries >= 3:
+                    if empty_retries >= 2:
                         return (
                             "Что-то пошло не так — попробуйте повторить "
                             "или упростить запрос."
+                        )
+                    if len(self.full_history) > 14:
+                        _keep_start = self.full_history[:2]
+                        _keep_end = self.full_history[-12:]
+                        self.full_history = _keep_start + _keep_end
+                        logger.info(
+                            "✂️ TRUNCATION-TRIM: history trimmed to %d messages before retry",
+                            len(self.full_history)
                         )
                     continue
 
