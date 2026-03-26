@@ -1192,6 +1192,10 @@ _RE_REASONING_MARKERS = re.compile(
     r'|Let me |The conversation|The user|The assistant|The last'
     r'|ChatGPT|GPT-\d|as an AI'
     r'|Мы have|Кажется the|Похоже the'
+    r'|system\s+require|one\s+final|final\s+question'
+    r'|I\s+will\s+now|I\s+am\s+going|based\s+on\s+the'
+    r'|system\s+prompt|internal\s+instruction'
+    r'|according\s+to\s+(?:the|my)|per\s+the\s+instruction'
     r')',
     re.IGNORECASE
 )
@@ -1433,6 +1437,7 @@ class YandexGPTHandler:
         self._user_stated_budget: Optional[int] = None
         self._russia_no_region_hint: bool = False
         self._original_requested_meal: Optional[int] = None
+        self._regions_resolved_via_dict: bool = False
         
         # ── Прогрессивный "ближайший вылет": счётчик попыток и последняя страна ──
         self._nearest_search_attempt: int = 0
@@ -2172,6 +2177,14 @@ class YandexGPTHandler:
                     (r'\b(?:варадеро|гаван[аы])\b', "Кубы", None, 10, None),
                     # ═══ Доминикана (country=11) ═══
                     (r'\b(?:пунта[\s-]*кан[аы]|бока[\s-]*чик[аы])\b', "Доминиканы", None, 11, None),
+                    # ═══ Испания (country=14) — острова ═══
+                    (r'\b(?:тенериф\w*|канар\w*)\b', "Испании", "101", 14, None),
+                    (r'\b(?:майорк\w*|мальорк\w*)\b', "Испании", None, 14, None),
+                    # ═══ Греция (country=6) ═══
+                    (r'\b(?:крит\w*)\b', "Греции", None, 6, None),
+                    (r'\b(?:родос\w*)\b', "Греции", None, 6, None),
+                    # ═══ Кипр (country=15) ═══
+                    (r'\b(?:пафос\w*|лимассол\w*|ларнак\w*|айя[\s-]*нап\w*|протарас\w*)\b', "Кипра", None, 15, None),
                 ]
                 
                 mentioned_resort = None
@@ -2539,46 +2552,60 @@ class YandexGPTHandler:
                     )
 
             if args.get("regions") and not _resort_auto_resolved:
-                _all_user_text_r = " ".join([
-                    msg.get("content", "") for msg in self.full_history
-                    if msg.get("role") == "user" and msg.get("content")
-                ]).lower()
-                _region_keywords = [
-                    r'(?:аланью?|аланья|анталью?|анталья|анталия|анталию|белек\w*|кемер\w*|сиде|мармарис\w*|бодрум\w*|фетхие|даламан\w*|кушадас\w*|стамбул\w*|дидим\w*)',
-                    r'(?:хургад\w*|шарм|марса\s*алам|дахаб\w*|табб\w*|макади|сафаг\w*|сома\s*бей)',
-                    r'(?:паттай\w*|пхукет\w*|самуи|краби|хуа\s*хин\w*|чианг\w*)',
-                    r'(?:нячанг\w*|фукуок\w*|муйне|дананг\w*|хошимин\w*)',
-                    r'(?:дубай|абу.?даби|шардж\w*|рас.?эль|аджман\w*|фуджейр\w*)',
-                    r'(?:сочи|адлер\w*|анап\w*|геленджик\w*|крым\w*|ялт\w*|алушт\w*|калининград\w*)',
-                    r'(?:казан[ьи]\w*|алтай\w*|шерегеш\w*|дагестан\w*|махачкал\w*|дербент\w*)',
-                    r'(?:карели\w*|байкал\w*|домбай\w*|архыз\w*|приэльбрусь\w*|эльбрус\w*)',
-                    r'(?:кмв|кисловодск\w*|пятигорск\w*|ессентуки\w*|абзаков\w*|банно\w*)',
-                    r'(?:красн\w*\s*полян\w*|урал\w*|мурманск\w*|подмосковь\w*|золот\w+\s*кольц\w*)',
-                    r'(?:псков\w*|воронеж\w*|татарстан\w*|питер\w*|санкт.?петербург\w*)',
-                    r'(?:кабардин\w*|ингушети\w*|осети\w*|чечн\w*|адыге\w*)',
-                    r'(?:азовск\w*|туапсе\w*|новоросс\w*|светлогорск\w*|зеленоградск\w*)',
-                    r'(?:велик\w*\s*устюг\w*|петрозаводск\w*|владикавказ\w*|нальчик\w*|грозн\w*)',
-                    r'(?:курорт\w*|район\w*|побережь\w*)',
-                ]
-                _user_wants_region = False
-                for _p in _region_keywords:
-                    for _m in re.finditer(_p, _all_user_text_r):
-                        if not _is_departure_context(_all_user_text_r, _m.start()):
-                            _user_wants_region = True
-                            break
-                    if _user_wants_region:
-                        break
-                if not _user_wants_region:
+                if getattr(self, '_regions_resolved_via_dict', False):
                     logger.info(
-                        "🛡️ SAFETY-NET: regions=%s удалён — пользователь не упоминал конкретный курорт",
+                        "🛡️ SAFETY-NET: regions=%s оставлен — resolved via get_dictionaries(type=region)",
                         args.get("regions")
                     )
-                    args.pop("regions", None)
+                    self._regions_resolved_via_dict = False
                 else:
-                    logger.debug(
-                        "🛡️ SAFETY-NET: regions=%s оставлен — пользователь упоминал курорт",
-                        args.get("regions")
-                    )
+                    _all_user_text_r = " ".join([
+                        msg.get("content", "") for msg in self.full_history
+                        if msg.get("role") == "user" and msg.get("content")
+                    ]).lower()
+                    _region_keywords = [
+                        r'(?:аланью?|аланья|анталью?|анталья|анталия|анталию|белек\w*|кемер\w*|сиде|мармарис\w*|бодрум\w*|фетхие|даламан\w*|кушадас\w*|стамбул\w*|дидим\w*)',
+                        r'(?:хургад\w*|шарм|марса\s*алам|дахаб\w*|табб\w*|макади|сафаг\w*|сома\s*бей)',
+                        r'(?:паттай\w*|пхукет\w*|самуи|краби|хуа\s*хин\w*|чианг\w*)',
+                        r'(?:нячанг\w*|фукуок\w*|муйне|дананг\w*|хошимин\w*)',
+                        r'(?:дубай|абу.?даби|шардж\w*|рас.?эль|аджман\w*|фуджейр\w*)',
+                        r'(?:сочи|адлер\w*|анап\w*|геленджик\w*|крым\w*|ялт\w*|алушт\w*|калининград\w*)',
+                        r'(?:казан[ьи]\w*|алтай\w*|шерегеш\w*|дагестан\w*|махачкал\w*|дербент\w*)',
+                        r'(?:карели\w*|байкал\w*|домбай\w*|архыз\w*|приэльбрусь\w*|эльбрус\w*)',
+                        r'(?:кмв|кисловодск\w*|пятигорск\w*|ессентуки\w*|абзаков\w*|банно\w*)',
+                        r'(?:красн\w*\s*полян\w*|урал\w*|мурманск\w*|подмосковь\w*|золот\w+\s*кольц\w*)',
+                        r'(?:псков\w*|воронеж\w*|татарстан\w*|питер\w*|санкт.?петербург\w*)',
+                        r'(?:кабардин\w*|ингушети\w*|осети\w*|чечн\w*|адыге\w*)',
+                        r'(?:азовск\w*|туапсе\w*|новоросс\w*|светлогорск\w*|зеленоградск\w*)',
+                        r'(?:велик\w*\s*устюг\w*|петрозаводск\w*|владикавказ\w*|нальчик\w*|грозн\w*)',
+                        r'(?:тенериф\w*|канар\w*|майорк\w*|ибиц\w*|коста\w*|барселон\w*|малаг\w*)',
+                        r'(?:крит\w*|родос\w*|корфу|санторин\w*|закинф\w*|халкидик\w*|кос\b|афин\w*)',
+                        r'(?:лимассол\w*|пафос\w*|ларнак\w*|айя.?нап\w*|протарас\w*)',
+                        r'(?:будв\w*|тиват\w*|черногор\w*|котор\w*)',
+                        r'(?:хаммамет\w*|сусс\w*|монастир\w*|джерб\w*)',
+                        r'(?:римини\w*|сардини\w*|сицили\w*|неапол\w*)',
+                        r'(?:варн\w*|бургас\w*|солнечн\w*\s*берег\w*|золот\w*\s*песк\w*)',
+                        r'(?:курорт\w*|район\w*|побережь\w*)',
+                    ]
+                    _user_wants_region = False
+                    for _p in _region_keywords:
+                        for _m in re.finditer(_p, _all_user_text_r):
+                            if not _is_departure_context(_all_user_text_r, _m.start()):
+                                _user_wants_region = True
+                                break
+                        if _user_wants_region:
+                            break
+                    if not _user_wants_region:
+                        logger.info(
+                            "🛡️ SAFETY-NET: regions=%s удалён — пользователь не упоминал конкретный курорт",
+                            args.get("regions")
+                        )
+                        args.pop("regions", None)
+                    else:
+                        logger.debug(
+                            "🛡️ SAFETY-NET: regions=%s оставлен — пользователь упоминал курорт",
+                            args.get("regions")
+                        )
 
             # ── Fix C2: Safety-net для nightsto при "дней" ──
             # Срабатывает ТОЛЬКО когда модель вообще не конвертировала дни→ночи
@@ -3455,6 +3482,7 @@ class YandexGPTHandler:
             elif "subregion" in dict_type:
                 return await self.tourvisor.get_subregions(args.get("regcountry"))
             elif "region" in dict_type:
+                self._regions_resolved_via_dict = True
                 regions = await self.tourvisor.get_regions(args.get("regcountry"))
                 name_filter = args.get("name", "").lower().strip()
                 if name_filter:
