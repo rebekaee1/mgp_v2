@@ -13,6 +13,7 @@ import os
 import smtplib
 import ssl
 from datetime import datetime, timezone
+from email.mime.base import MIMEBase
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from typing import Optional
@@ -29,7 +30,8 @@ _SMTP_USE_SSL = os.getenv("SMTP_USE_SSL", "true").lower() in ("true", "1", "yes"
 _IMAP_HOST = os.getenv("IMAP_HOST", "imap.timeweb.ru")
 _IMAP_PORT = int(os.getenv("IMAP_PORT", "993"))
 
-_LOGO_URL = os.getenv("EMAIL_LOGO_URL", "http://72.56.88.193/static/logo.png")
+_LOGO_PATH = os.path.join(os.path.dirname(__file__), "static", "logo.png")
+_LOGO_CID = "logo_navilet"
 
 
 def _save_to_sent(msg_bytes: bytes) -> None:
@@ -86,7 +88,7 @@ def _build_booking_html(
       <table width="100%" cellpadding="0" cellspacing="0">
         <tr>
           <td style="vertical-align:middle;">
-            <img src="{_LOGO_URL}" alt="{agency_name}" height="38" style="display:block;height:38px;max-width:200px;" />
+            <img src="cid:{_LOGO_CID}" alt="{agency_name}" height="38" style="display:block;height:38px;max-width:200px;" />
           </td>
           <td style="text-align:right;vertical-align:middle;">
             <span style="display:inline-block;background:rgba(255,255,255,0.2);color:#fff;font-size:13px;font-weight:600;padding:6px 14px;border-radius:20px;">Заявка #{request_number}</span>
@@ -246,13 +248,27 @@ def send_booking_email(
         f"Ссылка: {tour_link}\n"
     )
 
-    msg = MIMEMultipart("alternative")
+    msg = MIMEMultipart("related")
     msg["Subject"] = subject
     msg["From"] = f"{_SMTP_FROM_NAME} <{smtp_user}>"
     msg["To"] = to_email
     msg["Date"] = datetime.now(timezone.utc).strftime("%a, %d %b %Y %H:%M:%S +0000")
-    msg.attach(MIMEText(plain_text, "plain", "utf-8"))
-    msg.attach(MIMEText(html_body, "html", "utf-8"))
+
+    alt_part = MIMEMultipart("alternative")
+    alt_part.attach(MIMEText(plain_text, "plain", "utf-8"))
+    alt_part.attach(MIMEText(html_body, "html", "utf-8"))
+    msg.attach(alt_part)
+
+    if os.path.isfile(_LOGO_PATH):
+        with open(_LOGO_PATH, "rb") as f:
+            logo_data = f.read()
+        logo_attach = MIMEBase("image", "png")
+        logo_attach.set_payload(logo_data)
+        from email.encoders import encode_base64
+        encode_base64(logo_attach)
+        logo_attach.add_header("Content-ID", f"<{_LOGO_CID}>")
+        logo_attach.add_header("Content-Disposition", "inline", filename="logo.png")
+        msg.attach(logo_attach)
 
     msg_bytes = msg.as_bytes()
 
