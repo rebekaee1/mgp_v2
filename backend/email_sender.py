@@ -1,13 +1,18 @@
-"""Booking request email sender via SMTP.
+"""Booking request email sender via SMTP + IMAP save-to-sent.
 
 Sends HTML-formatted booking request emails to tenant notification addresses.
-SMTP credentials are configured via environment variables.
+After sending, saves a copy to the Sent folder via IMAP so the message
+appears in Timeweb webmail's «Отправленные».
+
+SMTP/IMAP credentials are configured via environment variables.
 """
 
+import imaplib
 import logging
 import os
 import smtplib
 import ssl
+from datetime import datetime, timezone
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from typing import Optional
@@ -20,6 +25,29 @@ _SMTP_USER = os.getenv("SMTP_USER", "")
 _SMTP_PASS = os.getenv("SMTP_PASS", "")
 _SMTP_FROM_NAME = os.getenv("SMTP_FROM_NAME", "AI-Ассистент")
 _SMTP_USE_SSL = os.getenv("SMTP_USE_SSL", "true").lower() in ("true", "1", "yes")
+
+_IMAP_HOST = os.getenv("IMAP_HOST", "imap.timeweb.ru")
+_IMAP_PORT = int(os.getenv("IMAP_PORT", "993"))
+
+_LOGO_URL = os.getenv("EMAIL_LOGO_URL", "http://72.56.88.193/static/logo.png")
+
+
+def _save_to_sent(msg_bytes: bytes) -> None:
+    """Append sent message to IMAP Sent folder (best-effort, non-blocking)."""
+    if not _SMTP_USER or not _SMTP_PASS:
+        return
+    try:
+        imap = imaplib.IMAP4_SSL(_IMAP_HOST, _IMAP_PORT, timeout=10)
+        imap.login(_SMTP_USER, _SMTP_PASS)
+        for folder in ("Sent", "&BB4EQgQ,BEAEMAQyBDsENQQ9BD0ESwQ1-", "INBOX.Sent"):
+            status, _ = imap.select(folder)
+            if status == "OK":
+                imap.append(folder, "\\Seen", None, msg_bytes)
+                logger.info("📧 Saved copy to IMAP folder '%s'", folder)
+                break
+        imap.logout()
+    except Exception as e:
+        logger.warning("📧 Could not save to IMAP Sent: %s", e)
 
 
 def _build_booking_html(
@@ -52,18 +80,21 @@ def _build_booking_html(
 <body style="margin:0;padding:0;font-family:'Segoe UI',Arial,sans-serif;background:#f4f6f8;">
 <table width="100%" cellpadding="0" cellspacing="0" style="max-width:600px;margin:20px auto;background:#ffffff;border-radius:12px;overflow:hidden;box-shadow:0 2px 12px rgba(0,0,0,0.08);">
 
-  <!-- Header -->
+  <!-- Header with logo -->
   <tr>
-    <td style="background:linear-gradient(135deg,#0066F0 0%,#004BBF 100%);padding:28px 32px;">
+    <td style="background:linear-gradient(135deg,#0066F0 0%,#004BBF 100%);padding:24px 32px;">
       <table width="100%" cellpadding="0" cellspacing="0">
         <tr>
-          <td>
-            <span style="font-size:22px;font-weight:700;color:#ffffff;letter-spacing:-0.3px;">{agency_name}</span>
-            <br>
-            <span style="font-size:13px;color:rgba(255,255,255,0.75);margin-top:4px;display:inline-block;">AI-Ассистент — заявка на тур</span>
+          <td style="vertical-align:middle;">
+            <img src="{_LOGO_URL}" alt="{agency_name}" height="38" style="display:block;height:38px;max-width:200px;" />
           </td>
-          <td style="text-align:right;vertical-align:top;">
+          <td style="text-align:right;vertical-align:middle;">
             <span style="display:inline-block;background:rgba(255,255,255,0.2);color:#fff;font-size:13px;font-weight:600;padding:6px 14px;border-radius:20px;">Заявка #{request_number}</span>
+          </td>
+        </tr>
+        <tr>
+          <td colspan="2" style="padding-top:10px;">
+            <span style="font-size:13px;color:rgba(255,255,255,0.8);">AI-Ассистент — заявка на бронирование тура</span>
           </td>
         </tr>
       </table>
@@ -77,8 +108,8 @@ def _build_booking_html(
         <tr><td style="padding:20px;">
           <div style="font-size:11px;text-transform:uppercase;letter-spacing:1px;color:#6b7280;margin-bottom:12px;font-weight:600;">Данные клиента</div>
           <div style="font-size:18px;font-weight:700;color:#111827;">{client_name}</div>
-          <div style="font-size:15px;color:#374151;margin-top:6px;">📞 <a href="tel:{client_phone}" style="color:#0066F0;text-decoration:none;">{client_phone}</a></div>
-          {"<div style='font-size:15px;color:#374151;margin-top:4px;'>✉️ <a href='mailto:" + client_email + "' style='color:#0066F0;text-decoration:none;'>" + client_email + "</a></div>" if client_email else ""}
+          <div style="font-size:15px;color:#374151;margin-top:6px;">&#128222; <a href="tel:{client_phone}" style="color:#0066F0;text-decoration:none;">{client_phone}</a></div>
+          {"<div style='font-size:15px;color:#374151;margin-top:4px;'>&#9993; <a href='mailto:" + client_email + "' style='color:#0066F0;text-decoration:none;'>" + client_email + "</a></div>" if client_email else ""}
         </td></tr>
       </table>
     </td>
@@ -138,7 +169,7 @@ def _build_booking_html(
   <tr>
     <td style="padding:20px 32px;background:#f9fafb;border-top:1px solid #e5e7eb;">
       <div style="font-size:12px;color:#9ca3af;text-align:center;">
-        Заявка сформирована AI-ассистентом · <a href="https://navilet.ru" style="color:#6b7280;">navilet.ru</a>
+        Заявка сформирована AI-ассистентом &middot; <a href="https://navilet.ru" style="color:#6b7280;">navilet.ru</a>
       </div>
     </td>
   </tr>
@@ -170,13 +201,19 @@ def send_booking_email(
     comment: str = "",
     from_email: Optional[str] = None,
 ) -> dict:
-    """Send a booking request email. Returns {"ok": True, "request_number": N} or {"ok": False, "error": "..."}."""
+    """Send a booking request email and save to Sent folder.
 
+    Returns {"ok": True, "request_number": N} or {"ok": False, "error": "..."}.
+    """
     smtp_user = from_email or _SMTP_USER
     if not smtp_user or not _SMTP_PASS:
         return {"ok": False, "error": "SMTP credentials not configured"}
 
-    subject = f"Заявка #{request_number} от AI-ассистента — {country}, {price:,} руб.".replace(",", " ") if price else f"Заявка #{request_number} от AI-ассистента — {country}"
+    subject = (
+        f"Заявка #{request_number} от AI-ассистента — {country}, {price:,} руб.".replace(",", " ")
+        if price
+        else f"Заявка #{request_number} от AI-ассистента — {country}"
+    )
 
     html_body = _build_booking_html(
         client_name=client_name,
@@ -213,23 +250,31 @@ def send_booking_email(
     msg["Subject"] = subject
     msg["From"] = f"{_SMTP_FROM_NAME} <{smtp_user}>"
     msg["To"] = to_email
-    msg["Reply-To"] = to_email
+    msg["Date"] = datetime.now(timezone.utc).strftime("%a, %d %b %Y %H:%M:%S +0000")
     msg.attach(MIMEText(plain_text, "plain", "utf-8"))
     msg.attach(MIMEText(html_body, "html", "utf-8"))
+
+    msg_bytes = msg.as_bytes()
 
     try:
         if _SMTP_USE_SSL:
             context = ssl.create_default_context()
             with smtplib.SMTP_SSL(_SMTP_HOST, _SMTP_PORT, context=context, timeout=15) as server:
                 server.login(smtp_user, _SMTP_PASS)
-                server.sendmail(smtp_user, [to_email], msg.as_string())
+                server.sendmail(smtp_user, [to_email], msg_bytes)
         else:
             with smtplib.SMTP(_SMTP_HOST, _SMTP_PORT, timeout=15) as server:
                 server.starttls()
                 server.login(smtp_user, _SMTP_PASS)
-                server.sendmail(smtp_user, [to_email], msg.as_string())
+                server.sendmail(smtp_user, [to_email], msg_bytes)
 
-        logger.info("📧 Booking email sent to=%s subject='%s'", to_email, subject)
+        logger.info("📧 Booking email #%d sent to=%s", request_number, to_email)
+
+        try:
+            _save_to_sent(msg_bytes)
+        except Exception:
+            pass
+
         return {"ok": True, "request_number": request_number}
 
     except Exception as e:

@@ -4297,15 +4297,22 @@ class YandexGPTHandler:
             if is_db_available():
                 try:
                     from sqlalchemy import text as sa_text
+                    _aid = getattr(self.runtime_config, "assistant_id", None)
                     with get_db() as db:
                         row = db.execute(sa_text(
-                            "SELECT COUNT(*) FROM messages WHERE role='tool' "
-                            "AND content LIKE '%submit_booking_request%'"
-                        )).scalar()
-                        request_number = (row or 0) + 1
-                except Exception:
-                    import random
-                    request_number = random.randint(100, 9999)
+                            "UPDATE assistants "
+                            "SET runtime_metadata = jsonb_set("
+                            "  COALESCE(runtime_metadata, '{}'),"
+                            "  '{booking_counter}',"
+                            "  to_jsonb(COALESCE((runtime_metadata->>'booking_counter')::int, 0) + 1)"
+                            ") WHERE id = :aid "
+                            "RETURNING (runtime_metadata->>'booking_counter')::int"
+                        ), {"aid": _aid}).scalar()
+                        db.commit()
+                        request_number = row or 1
+                except Exception as _e:
+                    logger.warning("Booking counter fallback: %s", _e)
+                    request_number = int(_dt.now().timestamp()) % 10000
 
             agency_name = (
                 getattr(self.runtime_config, "company_name", None)
