@@ -203,7 +203,7 @@ def _is_promised_search(text: str) -> bool:
 _VALID_FUNCTION_NAMES = frozenset([
     "get_current_date", "search_tours", "get_search_status", "get_search_results",
     "continue_search", "get_dictionaries", "actualize_tour", "get_tour_details",
-    "get_hotel_info", "get_hot_tours",
+    "get_hotel_info", "get_hot_tours", "submit_booking_request",
 ])
 
 # Regex: function_name(...)  — Python-like вызов
@@ -4240,6 +4240,133 @@ class YandexGPTHandler:
                 "_adults_only_warning": _adults_only_warning,
             }
         
+        elif name == "submit_booking_request":
+            wc = getattr(self.runtime_config, "widget_config", None) or {}
+            notification_email = wc.get("notification_email", "").strip()
+            if not wc.get("booking_email_enabled") or not notification_email:
+                return {
+                    "status": "unavailable",
+                    "message": (
+                        "Онлайн-заявка через ассистента пока не настроена для этого агентства. "
+                        "Предложи клиенту нажать кнопку «Оформить тур» на карточке "
+                        "или позвонить менеджеру."
+                    ),
+                }
+
+            client_name = (args.get("client_name") or "").strip()
+            client_phone = (args.get("client_phone") or "").strip()
+            client_email = (args.get("client_email") or "").strip()
+            comment = (args.get("comment") or "").strip()
+
+            if not client_name or not client_phone:
+                return {
+                    "status": "error",
+                    "message": "Не хватает данных. Спроси у клиента имя и телефон.",
+                }
+
+            tour_data = {}
+            tourid = args.get("tourid")
+            tour_pos = args.get("tour_position")
+            if tourid and hasattr(self, "_tourid_map"):
+                for _pos, _entry in self._tourid_map.items():
+                    if str(_entry.get("tourid")) == str(tourid):
+                        tour_data = _entry
+                        break
+            elif tour_pos and hasattr(self, "_tourid_map"):
+                tour_data = self._tourid_map.get(int(tour_pos), {})
+                tourid = tour_data.get("tourid")
+
+            card = {}
+            if tourid:
+                for c in getattr(self, "_pending_tour_cards", []):
+                    if str(c.get("id", "")) == str(tourid) or str(c.get("tourid", "")) == str(tourid):
+                        card = c
+                        break
+
+            if not card and hasattr(self, "full_history"):
+                for entry in reversed(self.full_history):
+                    for tc in (entry.get("tour_cards") or []):
+                        if tourid and str(tc.get("id", "")) == str(tourid):
+                            card = tc
+                            break
+                    if card:
+                        break
+
+            from database import get_db, is_db_available
+            request_number = 1
+            if is_db_available():
+                try:
+                    from sqlalchemy import text as sa_text
+                    with get_db() as db:
+                        row = db.execute(sa_text(
+                            "SELECT COUNT(*) FROM messages WHERE role='tool' "
+                            "AND content LIKE '%submit_booking_request%'"
+                        )).scalar()
+                        request_number = (row or 0) + 1
+                except Exception:
+                    import random
+                    request_number = random.randint(100, 9999)
+
+            agency_name = (
+                getattr(self.runtime_config, "company_name", None)
+                or getattr(self.runtime_config, "assistant_name", None)
+                or "Магазин Горящих Путёвок"
+            )
+
+            booking_base = wc.get("booking_base_url", "")
+            tour_link = ""
+            if tourid and booking_base:
+                tour_link = f"{booking_base.rstrip('/')}#tvtourid={tourid}"
+            elif tourid:
+                tour_link = f"https://mgp.ru/tours/#tvtourid={tourid}"
+
+            from email_sender import send_booking_email
+            result = send_booking_email(
+                to_email=notification_email,
+                client_name=client_name,
+                client_phone=client_phone,
+                client_email=client_email,
+                hotel_name=card.get("hotel_name") or tour_data.get("hotelname", "Не указан"),
+                country=card.get("country", ""),
+                resort=card.get("resort", ""),
+                departure_city=card.get("departure_city") or self._last_departure_city,
+                fly_date=card.get("date_from", ""),
+                nights=card.get("nights", 0),
+                price=card.get("price", 0),
+                operator=card.get("operator", ""),
+                meal=card.get("meal_description") or card.get("food_type", ""),
+                room_type=card.get("room_type", ""),
+                stars=card.get("hotel_stars", 0),
+                tour_link=tour_link,
+                request_number=request_number,
+                agency_name=agency_name,
+                comment=comment,
+            )
+
+            if result.get("ok"):
+                logger.info(
+                    "📧 BOOKING REQUEST #%d sent to %s for tour %s, client=%s",
+                    request_number, notification_email, tourid or "?", client_name,
+                )
+                return {
+                    "status": "success",
+                    "request_number": request_number,
+                    "message": (
+                        f"Заявка #{request_number} успешно отправлена менеджеру. "
+                        f"Скажи клиенту: заявка принята, менеджер свяжется по телефону {client_phone} "
+                        "в ближайшее время для подтверждения и оформления."
+                    ),
+                }
+            else:
+                logger.error("📧 BOOKING REQUEST failed: %s", result.get("error"))
+                return {
+                    "status": "error",
+                    "message": (
+                        "Не удалось отправить заявку автоматически. "
+                        "Предложи клиенту позвонить менеджеру или нажать кнопку «Оформить тур» на карточке."
+                    ),
+                }
+
         elif name == "continue_search":
             # ── P1: Валидация requestid ──
             _rid = str(args.get("requestid", ""))

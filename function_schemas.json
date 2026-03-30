@@ -480,6 +480,41 @@
         },
         "required": ["city", "items"]
       }
+    },
+    {
+      "type": "function",
+      "name": "submit_booking_request",
+      "description": "Отправить заявку на бронирование тура менеджеру. Вызывай ТОЛЬКО когда клиент явно подтвердил бронирование И ты собрал: имя, телефон. Email опционален. tourid или tour_position берётся из ранее показанных карточек.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "client_name": {
+            "type": "string",
+            "description": "Имя клиента (как он представился)"
+          },
+          "client_phone": {
+            "type": "string",
+            "description": "Телефон клиента (любой формат)"
+          },
+          "client_email": {
+            "type": "string",
+            "description": "Email клиента (опционально, может быть пустой строкой)"
+          },
+          "tour_position": {
+            "type": "integer",
+            "description": "Номер тура из показанного списка (1, 2, 3...). Если клиент указал конкретный тур."
+          },
+          "tourid": {
+            "type": "string",
+            "description": "tourid конкретного тура (если известен). Приоритетнее чем tour_position."
+          },
+          "comment": {
+            "type": "string",
+            "description": "Дополнительные пожелания клиента (опционально)"
+          }
+        },
+        "required": ["client_name", "client_phone"]
+      }
     }
   ]
 }
