@@ -1023,22 +1023,18 @@ def _build_hotel_link(tourid, fallback_link: str = "#", booking_base_url: str = 
     """Build booking link for a tour card.
 
     Default (mgp.ru): uses custom #tvtourid= handler on /tours/ page.
-    Custom tenant: prefers fulldesclink from TourVisor (agency-specific URL).
+    Custom tenant: constructs tenant_url#tvtourid=XXX.
     """
-    if booking_base_url:
-        if fallback_link and fallback_link != "#":
-            link = fallback_link.strip()
-            if link.startswith("#!/") or link.startswith("#!"):
-                return booking_base_url.rstrip("/") + "/" + link
-            if link.startswith("http"):
-                return link
-            return booking_base_url.rstrip("/") + "/" + link
-        if tourid:
-            return f"{booking_base_url.rstrip('/')}/#tvtourid={tourid}"
-        return booking_base_url
+    base = booking_base_url or _DEFAULT_BOOKING_BASE_URL
     if tourid:
-        return f"{_DEFAULT_BOOKING_BASE_URL}#tvtourid={tourid}"
-    return fallback_link or "#"
+        return f"{base.rstrip('/')}#tvtourid={tourid}"
+    if fallback_link and fallback_link != "#":
+        link = fallback_link.strip()
+        if link.startswith("http"):
+            return link
+        if link.startswith("#!/") or link.startswith("#!"):
+            return base.rstrip("/") + link
+    return base
 
 
 def _map_hotel_to_card(hotel: dict, departure_city: str = "Москва", adults: int = 2,
