@@ -1654,6 +1654,22 @@ class YandexGPTHandler:
         
         return custom_tools + [web_search_tool]
     
+    def _apply_tenant_search_filters(self, args: dict) -> None:
+        """Inject per-tenant operator/GDS filters from widget_config into search args.
+
+        If widget_config has 'allowed_operators' (comma-separated IDs)
+        the value is merged with any model-specified operators.
+        If widget_config has 'hide_gds' = true, hideregular=1 is forced.
+        """
+        wc = getattr(self.runtime_config, "widget_config", None) or {}
+        tenant_ops = (wc.get("allowed_operators") or "").strip()
+        if tenant_ops and not args.get("operators"):
+            args["operators"] = tenant_ops
+        elif tenant_ops and args.get("operators"):
+            args["operators"] = tenant_ops
+        if wc.get("hide_gds"):
+            args.setdefault("hideregular", 1)
+
     def _load_system_prompt(self) -> str:
         """Загрузить системный промпт + FAQ базу знаний"""
         base_dir = os.path.join(os.path.dirname(__file__), "..")
@@ -2871,6 +2887,7 @@ class YandexGPTHandler:
                 logger.info("🛡️ RATING DEFAULT: injected rating=3 (API floor >=3.5)")
 
             self._metrics["total_searches"] += 1
+            self._apply_tenant_search_filters(args)
             request_id = await self.tourvisor.search_tours(
                 departure=args.get("departure"),
                 country=args.get("country"),
@@ -4061,6 +4078,7 @@ class YandexGPTHandler:
                     ),
                 }
 
+            self._apply_tenant_search_filters(args)
             tours = await self.tourvisor.get_hot_tours(
                 city=args["city"],
                 count=args.get("items", 10),
