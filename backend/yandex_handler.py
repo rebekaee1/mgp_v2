@@ -1020,9 +1020,24 @@ _DEFAULT_BOOKING_BASE_URL = "https://mgp.ru/tours/"
 
 
 def _build_hotel_link(tourid, fallback_link: str = "#", booking_base_url: str = None) -> str:
-    base = (booking_base_url or _DEFAULT_BOOKING_BASE_URL).rstrip("/")
+    """Build booking link for a tour card.
+
+    Default (mgp.ru): uses custom #tvtourid= handler on /tours/ page.
+    Custom tenant: prefers fulldesclink from TourVisor (agency-specific URL).
+    """
+    if booking_base_url:
+        if fallback_link and fallback_link != "#":
+            link = fallback_link.strip()
+            if link.startswith("#!/") or link.startswith("#!"):
+                return booking_base_url.rstrip("/") + "/" + link
+            if link.startswith("http"):
+                return link
+            return booking_base_url.rstrip("/") + "/" + link
+        if tourid:
+            return f"{booking_base_url.rstrip('/')}/#tvtourid={tourid}"
+        return booking_base_url
     if tourid:
-        return f"{base}#tvtourid={tourid}"
+        return f"{_DEFAULT_BOOKING_BASE_URL}#tvtourid={tourid}"
     return fallback_link or "#"
 
 
