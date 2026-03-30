@@ -1016,7 +1016,18 @@ def _pick_best_tour(tours: list, ideal_datefrom: str = None,
     return scored[0][4]
 
 
-def _map_hotel_to_card(hotel: dict, departure_city: str = "Москва", adults: int = 2) -> dict:
+_DEFAULT_BOOKING_BASE_URL = "https://mgp.ru/tours/"
+
+
+def _build_hotel_link(tourid, fallback_link: str = "#", booking_base_url: str = None) -> str:
+    base = (booking_base_url or _DEFAULT_BOOKING_BASE_URL).rstrip("/")
+    if tourid:
+        return f"{base}#tvtourid={tourid}"
+    return fallback_link or "#"
+
+
+def _map_hotel_to_card(hotel: dict, departure_city: str = "Москва", adults: int = 2,
+                       booking_base_url: str = None) -> dict:
     """
     Маппинг отеля из get_search_results → формат tour_card для фронтенда.
     Структура совпадает с ожиданиями createTourCardHTML в script.js.
@@ -1035,7 +1046,7 @@ def _map_hotel_to_card(hotel: dict, departure_city: str = "Москва", adults
     is_no_flight = (departure_city == "Без перелёта") or bool(tour.get("noflight"))
 
     tourid = tour.get("tourid")
-    hotel_link = f"https://mgp.ru/tours/#tvtourid={tourid}" if tourid else (hotel.get("fulldesclink") or "#")
+    hotel_link = _build_hotel_link(tourid, hotel.get("fulldesclink"), booking_base_url)
 
     return {
         "hotel_name": hotel.get("hotelname") or "Отель",
@@ -1075,7 +1086,7 @@ _MEAL_CODE_TO_RU = {
 }
 
 
-def _map_hot_tour_to_card(tour_data: dict) -> dict:
+def _map_hot_tour_to_card(tour_data: dict, booking_base_url: str = None) -> dict:
     """
     Маппинг горящего тура из get_hot_tours → формат tour_card для фронтенда.
     ⚠️ Цена горящих туров — ЗА ЧЕЛОВЕКА!
@@ -1087,7 +1098,7 @@ def _map_hot_tour_to_card(tour_data: dict) -> dict:
     meal_ru = _MEAL_CODE_TO_RU.get(meal_code.strip(), meal_code)
 
     tourid = tour_data.get("tourid")
-    hotel_link = f"https://mgp.ru/tours/#tvtourid={tourid}" if tourid else (tour_data.get("fulldesclink") or "#")
+    hotel_link = _build_hotel_link(tourid, tour_data.get("fulldesclink"), booking_base_url)
 
     return {
         "hotel_name": tour_data.get("hotelname") or "Отель",
@@ -3325,8 +3336,9 @@ class YandexGPTHandler:
             
             # ── Строим tour_cards для нового фронтенда ──
             _adults = self._last_search_params.get("adults", 2) if self._last_search_params else 2
+            _booking_url = (getattr(self.runtime_config, "widget_config", None) or {}).get("booking_base_url")
             self._pending_tour_cards = [
-                _map_hotel_to_card(h, self._last_departure_city, adults=_adults)
+                _map_hotel_to_card(h, self._last_departure_city, adults=_adults, booking_base_url=_booking_url)
                 for h in simplified
             ]
             logger.info("🎴 Built %d tour cards for frontend", len(self._pending_tour_cards))
@@ -4112,8 +4124,9 @@ class YandexGPTHandler:
                 })
             
             # ── Строим tour_cards для нового фронтенда ──
+            _booking_url_hot = (getattr(self.runtime_config, "widget_config", None) or {}).get("booking_base_url")
             self._pending_tour_cards = [
-                _map_hot_tour_to_card(t) for t in simplified
+                _map_hot_tour_to_card(t, booking_base_url=_booking_url_hot) for t in simplified
             ]
             logger.info("🎴 Built %d hot tour cards for frontend", len(self._pending_tour_cards))
             
