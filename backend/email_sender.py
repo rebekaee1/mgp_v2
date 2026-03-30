@@ -88,7 +88,9 @@ def _build_booking_html(
       <table width="100%" cellpadding="0" cellspacing="0">
         <tr>
           <td style="vertical-align:middle;">
-            <img src="cid:{_LOGO_CID}" alt="{agency_name}" height="38" style="display:block;height:38px;max-width:200px;" />
+            <div style="display:inline-block;background:#ffffff;border-radius:8px;padding:6px 12px;">
+              <img src="cid:{_LOGO_CID}" alt="{agency_name}" height="30" style="display:block;height:30px;max-width:180px;" />
+            </div>
           </td>
           <td style="text-align:right;vertical-align:middle;">
             <span style="display:inline-block;background:rgba(255,255,255,0.2);color:#fff;font-size:13px;font-weight:600;padding:6px 14px;border-radius:20px;">Заявка #{request_number}</span>

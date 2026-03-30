@@ -4061,22 +4061,28 @@ class YandexGPTHandler:
                     args["tourtype"] = 1
                     logger.info("✅ P14: tourtype=1 авто-установлен для 'на море'")
             
-            # ── Safety-net: проверка города вылета в тексте пользователя ──
-            _hot_departure_text = " ".join([
-                msg.get("content", "") for msg in self.full_history
-                if msg.get("role") == "user" and msg.get("content")
-                and not msg.get("content", "").startswith("Результаты")
-            ]).lower()
-            _has_departure = any(re.search(p, _hot_departure_text) for p in _DEPARTURE_PATTERNS)
-            if not _has_departure:
-                logger.warning("🛡️ HOT-TOURS-SAFETY: клиент не указал город вылета — блокируем")
-                return {
-                    "status": "error",
-                    "error": (
-                        "⛔ Для горящих туров ОБЯЗАТЕЛЕН город вылета. "
-                        "Клиент НЕ указал город. Спроси: «Из какого города планируете вылет?»"
-                    ),
-                }
+            # ── Safety-net: проверка города вылета ──
+            # Если модель передала валидный city code — доверяем (клиент мог подтвердить
+            # через "да" после уточняющего вопроса, или допустил опечатку, которую LLM исправила)
+            _city_code = args.get("city", 0)
+            if not _city_code or _city_code == 0:
+                _hot_departure_text = " ".join([
+                    msg.get("content", "") for msg in self.full_history
+                    if msg.get("role") == "user" and msg.get("content")
+                    and not msg.get("content", "").startswith("Результаты")
+                ]).lower()
+                _has_departure = any(re.search(p, _hot_departure_text) for p in _DEPARTURE_PATTERNS)
+                if not _has_departure:
+                    logger.warning("🛡️ HOT-TOURS-SAFETY: нет city code и нет города в тексте — блокируем")
+                    return {
+                        "status": "error",
+                        "error": (
+                            "⛔ Для горящих туров ОБЯЗАТЕЛЕН город вылета. "
+                            "Клиент НЕ указал город. Спроси: «Из какого города планируете вылет?»"
+                        ),
+                    }
+            else:
+                logger.info("✅ HOT-TOURS: city=%s — доверяем LLM", _city_code)
 
             self._apply_tenant_search_filters(args)
             tours = await self.tourvisor.get_hot_tours(
