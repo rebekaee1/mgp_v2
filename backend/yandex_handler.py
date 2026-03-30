@@ -1668,7 +1668,7 @@ class YandexGPTHandler:
         elif tenant_ops and args.get("operators"):
             args["operators"] = tenant_ops
         if wc.get("hide_gds"):
-            args.setdefault("hideregular", 1)
+            args["hideregular"] = 1
 
     def _load_system_prompt(self) -> str:
         """Загрузить системный промпт + FAQ базу знаний"""
