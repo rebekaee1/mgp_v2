@@ -1436,6 +1436,7 @@ class YandexGPTHandler:
         # Заполняется в _dispatch_function при get_search_results / get_hot_tours
         # Считывается и очищается в /api/v1/chat после завершения chat()
         self._pending_tour_cards: List[Dict] = []
+        self._booking_cards_cache: Dict[str, Dict] = {}  # tourid → full card (survives across turns)
         self._last_departure_city: str = "Москва"
         
         # ── Идеальные параметры для пересортировки результатов ──
@@ -3369,6 +3370,10 @@ class YandexGPTHandler:
                 _map_hotel_to_card(h, self._last_departure_city, adults=_adults, booking_base_url=_booking_url)
                 for h in simplified
             ]
+            for _c in self._pending_tour_cards:
+                _cid = str(_c.get("id") or _c.get("tourid") or "")
+                if _cid:
+                    self._booking_cards_cache[_cid] = _c
             logger.info("🎴 Built %d tour cards for frontend", len(self._pending_tour_cards))
             
             status = full_results.get("status", {})
@@ -4163,6 +4168,10 @@ class YandexGPTHandler:
             self._pending_tour_cards = [
                 _map_hot_tour_to_card(t, booking_base_url=_booking_url_hot) for t in simplified
             ]
+            for _c in self._pending_tour_cards:
+                _cid = str(_c.get("id") or _c.get("tourid") or "")
+                if _cid:
+                    self._booking_cards_cache[_cid] = _c
             logger.info("🎴 Built %d hot tour cards for frontend", len(self._pending_tour_cards))
             
             # ── Сокращённые данные для AI (без цен/дат/звёзд — они на карточках) ──
@@ -4284,19 +4293,24 @@ class YandexGPTHandler:
 
             card = {}
             if tourid:
+                card = self._booking_cards_cache.get(str(tourid), {})
+            if not card and tourid:
                 for c in getattr(self, "_pending_tour_cards", []):
                     if str(c.get("id", "")) == str(tourid) or str(c.get("tourid", "")) == str(tourid):
                         card = c
                         break
-
-            if not card and hasattr(self, "full_history"):
-                for entry in reversed(self.full_history):
+            if not card:
+                for entry in reversed(getattr(self, "full_history", [])):
                     for tc in (entry.get("tour_cards") or []):
                         if tourid and str(tc.get("id", "")) == str(tourid):
                             card = tc
                             break
                     if card:
                         break
+            if card:
+                logger.info("📧 BOOKING: found card for tourid=%s hotel=%s", tourid, card.get("hotel_name", "?"))
+            else:
+                logger.warning("📧 BOOKING: no card found for tourid=%s tour_pos=%s cache_size=%d", tourid, tour_pos, len(self._booking_cards_cache))
 
             from database import get_db, is_db_available
             request_number = 1
