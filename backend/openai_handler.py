@@ -1258,10 +1258,11 @@ class OpenAIHandler(YandexGPTHandler):
 
                 if _hist_len >= _WARNING_HARD and self._context_warning_stage < 2:
                     summary = self._build_context_summary()
+                    _phone = self._get_manager_phone()
                     warning = (
                         "\n\n---\n"
-                        "Диалог подходит к завершению. Рекомендую связаться с менеджером: "
-                        "+7 (499) 685-25-57 или начать новый чат."
+                        f"Диалог подходит к завершению. Рекомендую связаться с менеджером: "
+                        f"{_phone} или начать новый чат."
                     )
                     if summary:
                         warning += (
@@ -1276,11 +1277,12 @@ class OpenAIHandler(YandexGPTHandler):
                     )
 
                 elif _hist_len >= _WARNING_SOFT and self._context_warning_stage < 1:
+                    _phone = self._get_manager_phone()
                     final_text += (
                         "\n\n---\n"
                         "Наш диалог уже достаточно длинный. Для максимального "
                         "качества подбора рекомендую связаться с менеджером "
-                        "по телефону +7 (499) 685-25-57 — он поможет оформить "
+                        f"по телефону {_phone} — он поможет оформить "
                         "бронирование и ответит на все вопросы. "
                         "Также вы можете начать новый чат."
                     )

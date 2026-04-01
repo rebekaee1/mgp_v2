@@ -1303,17 +1303,25 @@ _FORBIDDEN_PROMISES = re.compile(
     r'(?:с\s+менеджером|у\s+менеджера|у\s+оператора|к\s+менеджеру)',
     re.IGNORECASE
 )
-_MANAGER_RECOMMENDATION = "Рекомендую уточнить у менеджера по телефону: +7 (499) 685-25-57"
+_DEFAULT_MANAGER_PHONE = "+7 (499) 685-25-57"
+
+_PHONE_EXTRACT_RE = re.compile(
+    r'(?:по\s+телефон[уе]:\s*)'
+    r'([\+\d\(\)\s\-]{7,}(?:\s*(?:или|,)\s*[\(\d][\d\(\)\s\-]{5,})?)',
+    re.IGNORECASE,
+)
 
 
-def _apply_grammar_and_compliance(text: str) -> str:
+def _apply_grammar_and_compliance(text: str, manager_phone: str = "") -> str:
     """Fix known grammar errors and replace forbidden promises."""
     if not text:
         return text
     for pattern, replacement in _GRAMMAR_FIXES:
         text = pattern.sub(replacement, text)
     if _FORBIDDEN_PROMISES.search(text):
-        text = _FORBIDDEN_PROMISES.sub(_MANAGER_RECOMMENDATION, text)
+        phone = manager_phone or _DEFAULT_MANAGER_PHONE
+        recommendation = f"Рекомендую уточнить у менеджера по телефону: {phone}"
+        text = _FORBIDDEN_PROMISES.sub(recommendation, text)
         logger.info("🛡️ COMPLIANCE: replaced forbidden promise with manager recommendation")
     return text
 
@@ -1491,6 +1499,27 @@ class YandexGPTHandler:
             getattr(runtime_config, "source", "env-default"),
         )
     
+    def _get_manager_phone(self) -> str:
+        """Return the tenant-specific manager phone number.
+
+        Lookup order:
+        1. widget_config.contact_phone (explicit override)
+        2. Regex extraction from system_prompt (after "по телефону:")
+        3. Default Moscow number
+        """
+        wc = getattr(self.runtime_config, "widget_config", None) or {}
+        explicit = (wc.get("contact_phone") or "").strip()
+        if explicit:
+            return explicit
+
+        prompt = getattr(self.runtime_config, "system_prompt", None) or ""
+        if prompt:
+            m = _PHONE_EXTRACT_RE.search(prompt)
+            if m:
+                return m.group(1).strip()
+
+        return _DEFAULT_MANAGER_PHONE
+
     def get_metrics(self) -> Dict[str, int]:
         """Возвращает метрики сессии для мониторинга"""
         return self._metrics.copy()
@@ -2547,20 +2576,30 @@ class YandexGPTHandler:
                                 "🛡️ SAFETY-NET C1: trusting cache starsbetter=1 (no narrowing detected)"
                             )
                     else:
-                        _user_stars_text = " ".join([
-                            msg.get("content", "") for msg in self.full_history[-20:]
-                            if msg.get("role") == "user" and msg.get("content")
-                        ]).lower()
-                        _wants_better = bool(re.search(
-                            r'(?:от\s+\d|\d\s*\+|\d\s*[-–]\s*\d\s*(?:зв|★|\*)|не\s+ниже|минимум\s+\d|и\s+выше|выше)',
-                            _user_stars_text
-                        ))
-                        if not _wants_better:
-                            args["starsbetter"] = 0
+                        _is_followup = bool(self._last_requestid or self._tourid_map)
+                        if _is_followup:
                             logger.info(
-                                "🛡️ SAFETY-NET C1: starsbetter=1 → 0 при stars=%s (нет 'от/диапазон/не ниже/минимум')",
-                                args.get("stars")
+                                "🛡️ SAFETY-NET C1: trusting LLM starsbetter=1 at stars=%s "
+                                "(follow-up search, _last_requestid=%s)",
+                                args.get("stars"), self._last_requestid
                             )
+                        else:
+                            _user_stars_text = " ".join([
+                                msg.get("content", "") for msg in self.full_history[-20:]
+                                if msg.get("role") == "user" and msg.get("content")
+                            ]).lower()
+                            _wants_better = bool(re.search(
+                                r'(?:от\s+\d|\d\s*\+|\d\s*[-–]\s*\d\s*(?:зв|★|\*)'
+                                r'|не\s+ниже|минимум\s+\d|и\s+выше|выше'
+                                r'|аналог|похож|подобн|такой\s+же|таких\s+же)',
+                                _user_stars_text
+                            ))
+                            if not _wants_better:
+                                args["starsbetter"] = 0
+                                logger.info(
+                                    "🛡️ SAFETY-NET C1: starsbetter=1 → 0 при stars=%s (нет 'от/диапазон/не ниже/минимум')",
+                                    args.get("stars")
+                                )
             
             # ── Safety-net: strip hoteltypes/regions if user never mentioned them ──
             if args.get("hoteltypes"):
@@ -3768,11 +3807,12 @@ class YandexGPTHandler:
                                 break
 
             if isinstance(result, dict) and result.get("iserror"):
+                _phone = self._get_manager_phone()
                 result["_hint"] = (
                     "Не удалось получить данные о перелёте от туроператора. "
                     "Скажи клиенту: «К сожалению, туроператор сейчас не предоставляет "
                     "информацию о рейсе. Детали перелёта можно уточнить у нашего менеджера "
-                    "по телефону: +7 (499) 685-25-57.» "
+                    f"по телефону: {_phone}.» "
                     "НЕ обещай «уточню/узнаю/свяжусь». НЕ вызывай get_tour_details повторно."
                 )
                 logger.warning("⚠️ ACTDETAIL ALL ATTEMPTS FAILED — manager hint added")
@@ -4869,7 +4909,7 @@ class YandexGPTHandler:
                 final_text = _fix_merged_questions(final_text)
 
                 # Grammar fixes and forbidden promises compliance
-                final_text = _apply_grammar_and_compliance(final_text)
+                final_text = _apply_grammar_and_compliance(final_text, self._get_manager_phone())
 
                 # Strip orphaned dialogue-continuation fragments after last '?'
                 final_text = _strip_trailing_fragment(final_text)
