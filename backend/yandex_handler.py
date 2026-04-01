@@ -1689,7 +1689,8 @@ class YandexGPTHandler:
 
         If widget_config has 'allowed_operators' (comma-separated IDs)
         the value is merged with any model-specified operators.
-        If widget_config has 'hide_gds' = true, hideregular=1 is forced.
+        If widget_config has 'hide_gds' = true, hideregular=1 is forced
+        UNLESS the previous search returned 0 results (GDS fallback).
         """
         wc = getattr(self.runtime_config, "widget_config", None) or {}
         tenant_ops = (wc.get("allowed_operators") or "").strip()
@@ -1698,7 +1699,18 @@ class YandexGPTHandler:
         elif tenant_ops and args.get("operators"):
             args["operators"] = tenant_ops
         if wc.get("hide_gds"):
-            args["hideregular"] = 1
+            _prev_zero = (
+                self._last_search_result
+                and self._last_search_result.get("hotels_found", 1) == 0
+                and self._last_search_params.get("_hideregular") == 1
+            )
+            if _prev_zero and args.get("hideregular") == 0:
+                logger.info(
+                    "✈️ GDS-FALLBACK: previous search 0 results with hideregular=1 "
+                    "→ allowing hideregular=0 for this attempt"
+                )
+            else:
+                args["hideregular"] = 1
 
     def _load_system_prompt(self) -> str:
         """Загрузить системный промпт + FAQ базу знаний"""
@@ -3168,6 +3180,13 @@ class YandexGPTHandler:
                                 len(_options) if '_options' in dir() else 0
                             )
 
+                        self._last_search_result = {
+                            "requestid": request_id,
+                            "hotels_found": 0,
+                            "tours_found": 0,
+                            "min_price": None,
+                            "duration_ms": elapsed * 1000,
+                        }
                         raise NoResultsError(
                             f"Поиск завершён: найдено {hotels_found} отелей, {tours_found} туров."
                             f"{_cascade_hint}{_hotel_hint}{_hideregular_hint}",
