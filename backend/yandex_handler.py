@@ -1674,7 +1674,14 @@ class YandexGPTHandler:
                 args["hideregular"] = 1
 
     def _load_system_prompt(self) -> str:
-        """Загрузить системный промпт + FAQ базу знаний"""
+        """Load unified system prompt with per-tenant personalization.
+
+        Architecture:
+        1. Always load base prompt from system_prompt.md (the "brain")
+        2. Replace {{PLACEHOLDERS}} with per-tenant values from widget_config
+        3. Append FAQ (from file or DB)
+        4. If DB has a short personalization-only prompt, append it
+        """
         base_dir = os.path.join(os.path.dirname(__file__), "..")
         prompt_path = os.path.join(base_dir, "system_prompt.md")
         faq_path = os.path.join(base_dir, "faq.md")
@@ -1692,16 +1699,48 @@ class YandexGPTHandler:
         except FileNotFoundError:
             faq = ""
             logger.warning("⚠️ faq.md not found — running without FAQ knowledge base")
-        
+
+        wc = getattr(self.runtime_config, "widget_config", None) or {}
+        company_name = (
+            wc.get("company_name")
+            or getattr(self.runtime_config, "company_name", None)
+            or "Магазин Горящих Путёвок"
+        )
+        manager_phone = self._get_manager_phone()
+
+        personalization_lines = []
+        if wc.get("website"):
+            personalization_lines.append(f"- Сайт агентства: `{wc['website']}`")
+        if wc.get("contact_phone"):
+            personalization_lines.append(f"- Телефон менеджера: `{wc['contact_phone']}`")
+        if wc.get("office_address"):
+            personalization_lines.append(f"- Адрес офиса: `{wc['office_address']}`")
+        if wc.get("contact_email"):
+            personalization_lines.append(f"- Email: `{wc['contact_email']}`")
+        personalization_block = "\n".join(personalization_lines) if personalization_lines else ""
+
+        prompt = prompt.replace("{{COMPANY_NAME}}", company_name)
+        prompt = prompt.replace("{{MANAGER_PHONE}}", manager_phone)
+        prompt = prompt.replace("{{PERSONALIZATION_BLOCK}}", personalization_block)
+
         runtime_prompt = getattr(self.runtime_config, "system_prompt", None)
         runtime_faq = getattr(self.runtime_config, "faq_content", None)
-        if runtime_prompt:
-            prompt = runtime_prompt
+
+        if runtime_prompt and len(runtime_prompt) < 3000:
+            prompt = prompt + "\n\n---\n\n" + runtime_prompt
+            logger.info("📋 Appended short DB system_prompt (%d chars) as personalization", len(runtime_prompt))
+        elif runtime_prompt:
+            logger.info(
+                "⚠️ Ignoring legacy DB system_prompt (%d chars) — using unified base file. "
+                "Migrate to widget_config personalization.",
+                len(runtime_prompt)
+            )
+
         if runtime_faq:
             faq = runtime_faq
-
         if faq:
             prompt = prompt + "\n\n" + faq
+
         return prompt
     
     async def _execute_function(self, name: str, arguments: str, call_id: str) -> Dict:
