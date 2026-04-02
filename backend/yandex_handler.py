@@ -479,47 +479,8 @@ _DEPARTURE_PATTERNS = [
     r'без\s*перел[её]т',
 ]
 
-# Smart defaults per country for "bez raznitsy" / "lyuboy" QC skip.
-# Format: country_id -> (stars, starsbetter, meal_or_None, mealbetter_or_None)
-_SMART_QC_DEFAULTS = {
-    # AI-destinations: 4*+, All Inclusive
-    1: (4, 1, 7, 0),    # Egypt
-    4: (4, 1, 7, 0),    # Turkey
-    5: (3, 1, 7, 0),    # Tunisia
-    8: (4, 1, 7, 0),    # Maldives
-    10: (3, 1, 7, 0),   # Cuba
-    11: (4, 1, 7, 0),   # Dominican Republic
-    # Premium BB: 4*+, BB and above
-    7: (4, 1, 3, 1),    # Indonesia / Bali
-    9: (4, 1, 3, 1),    # UAE
-    # Asian BB: 3*+, BB and above
-    2: (3, 1, 3, 1),    # Thailand
-    3: (3, 1, 3, 1),    # India
-    12: (3, 1, 3, 1),   # Sri Lanka
-    13: (3, 1, 3, 1),   # China
-    16: (3, 1, 3, 1),   # Vietnam
-    25: (3, 1, 3, 1),   # Singapore
-    26: (3, 1, 3, 1),   # Philippines
-    36: (3, 1, 3, 1),   # Malaysia
-    40: (3, 1, 3, 1),   # Cambodia
-    # European: 3*+, BB and above
-    6: (3, 1, 3, 1),    # Greece
-    14: (3, 1, 3, 1),   # Spain
-    15: (3, 1, 3, 1),   # Cyprus
-    20: (3, 1, 3, 1),   # Bulgaria
-    21: (3, 1, 3, 1),   # Montenegro
-    22: (3, 1, 3, 1),   # Croatia
-    24: (3, 1, 3, 1),   # Italy
-    # Russia/CIS: 3*+, no meal filter
-    46: (3, 1, None, None),  # Abkhazia
-    47: (3, 1, None, None),  # Russia
-    53: (3, 1, None, None),  # Armenia
-    54: (3, 1, None, None),  # Georgia
-    55: (3, 1, None, None),  # Azerbaijan
-    57: (3, 1, None, None),  # Belarus
-    78: (3, 1, None, None),  # Kazakhstan
-}
-_SMART_QC_DEFAULT_FALLBACK = (3, 1, 3, 1)
+## [REMOVED] _SMART_QC_DEFAULTS — таблица перенесена в системный промпт §3.6.1.
+## LLM сам подставляет дефолты по стране при «любой/без разницы».
 
 
 def _check_cascade_slots(full_history: List[Dict], args: Dict, is_follow_up: bool = False) -> Tuple[bool, List[str]]:
@@ -1967,66 +1928,10 @@ class YandexGPTHandler:
                     
                     # Случай 2: dateto == datefrom — штатное поведение для точных дат, не трогаем
                     
-                    # Случай 3: конкретная дата + длительность, но dateto слишком далеко
-                    # Если nightsfrom/nightsto указаны и dateto - datefrom > nightsto,
-                    # значит модель интерпретировала dateto как дату окончания тура,
-                    # а не как последнюю дату вылета. Clamp до datefrom (точная дата).
-                    # 
-                    # ── P8: BYPASS если пользователь явно указал "с X по Y" ──
-                    # Паттерн: "с 10 по 17 марта", "с 10.03 по 17.03" — НЕ clampить!
-                    elif has_specific_nights and dateto_dt is not None:
-                        # Проверяем, не указал ли пользователь явный диапазон дат
-                        _user_date_text = " ".join([
-                            msg.get("content", "") for msg in self.full_history[-20:]
-                            if msg.get("role") == "user" and msg.get("content")
-                        ])
-                        _explicit_date_range = bool(re.search(
-                            r'с\s+\d{1,2}[\s./-].*?(?:по|-)\s*\d{1,2}',
-                            _user_date_text, re.IGNORECASE
-                        ))
-                        
-                        if _explicit_date_range:
-                            range_days = (dateto_dt - datefrom_dt).days
-                            nightsfrom_val = nightsfrom or 7
-                            _has_departure_word = bool(re.search(
-                                r'вылет|отлёт|отлет|дат[аыу]\s+вылет',
-                                _user_date_text, re.IGNORECASE
-                            ))
-                            if _has_departure_word:
-                                logger.info(
-                                    "✅ dateto clamp BYPASSED: 'вылет' detected near date range "
-                                    "→ treating as departure range. datefrom=%s, dateto=%s",
-                                    datefrom_str, dateto_str
-                                )
-                            elif range_days > 2 and nightsfrom_val and abs(range_days - nightsfrom_val) <= 1:
-                                corrected_dt = datefrom_dt
-                                self._metrics["dateto_corrections"] = self._metrics.get("dateto_corrections", 0) + 1
-                                logger.info(
-                                    "✅ dateto clamp for explicit range: 'с %s по %s' (%d дней ≈ nights=%d). "
-                                    "Сужаем dateto до %s (точная дата вылета, а не вся поездка)",
-                                    datefrom_str, dateto_str, range_days, nightsfrom_val,
-                                    corrected_dt.strftime("%d.%m.%Y")
-                                )
-                                args["dateto"] = corrected_dt.strftime("%d.%m.%Y")
-                            else:
-                                logger.info(
-                                    "✅ dateto clamp BYPASSED: 'с X по Y' но range=%d != nights=%d — оставляем как есть. "
-                                    "datefrom=%s, dateto=%s",
-                                    range_days, nightsfrom_val, datefrom_str, dateto_str
-                                )
-                        else:
-                            delta_days = (dateto_dt - datefrom_dt).days
-                            effective_nights = nightsto or nightsfrom or 7
-                            if delta_days >= 4 and abs(delta_days - effective_nights) <= 2:
-                                corrected_dt = datefrom_dt
-                                self._metrics["dateto_corrections"] += 1
-                                logger.warning(
-                                    "⚠️ dateto clamp: модель выставила dateto=%s (datefrom+%d дней ≈ nights=%d). "
-                                    "Исправлено на datefrom = %s (точная дата вылета, не дата возвращения!)",
-                                    dateto_str, delta_days, effective_nights,
-                                    corrected_dt.strftime("%d.%m.%Y")
-                                )
-                                args["dateto"] = corrected_dt.strftime("%d.%m.%Y")
+                    # [REMOVED] dateto clamp — доверяем LLM, промпт описывает правила dateto.
+                    # Ранее здесь был код, сужавший dateto до datefrom при совпадении
+                    # разницы дат с ночами. Удалён: LLM корректно интерпретирует dateto
+                    # как последнюю дату вылета (промпт §3.4).
                     
                     # ── Fix P6: Проверка дат в прошлом ──
                     # Если datefrom уже в прошлом — сдвигаем на завтра
@@ -2111,40 +2016,27 @@ class YandexGPTHandler:
                                 import calendar
                                 detected_last_day = 29 if calendar.isleap(year) else 28
                             
-                            corrected = False
-                            
-                            # Safety-net: корректирует диапазон дат когда модель выставила неправильный.
-                            # «начало» = 01-10 (9 дней), «середина» = 10-20 (10 дней), «конец» = 20-end (10-11 дней)
+                            # [LOG-ONLY] P4: проверяем соответствие дат части месяца
+                            # (не корректируем — доверяем LLM, промпт §3.4 имеет таблицу)
+                            _mismatch = False
                             if 'начал' in part and date_span != 9:
-                                new_from = f"01.{detected_month:02d}.{year}"
-                                new_to = f"10.{detected_month:02d}.{year}"
-                                corrected = True
+                                _mismatch = True
                             elif 'середин' in part and not (8 <= date_span <= 12):
-                                new_from = f"10.{detected_month:02d}.{year}"
-                                new_to = f"20.{detected_month:02d}.{year}"
-                                corrected = True
+                                _mismatch = True
                             elif 'конц' in part and not (8 <= date_span <= 14):
-                                new_from = f"20.{detected_month:02d}.{year}"
-                                new_to = f"{detected_last_day:02d}.{detected_month:02d}.{year}"
-                                corrected = True
+                                _mismatch = True
                             elif 'перв' in part and 'половин' in part and not (11 <= date_span <= 15):
-                                new_from = f"01.{detected_month:02d}.{year}"
-                                new_to = f"14.{detected_month:02d}.{year}"
-                                corrected = True
+                                _mismatch = True
                             elif 'втор' in part and 'половин' in part and not (11 <= date_span <= 15):
-                                new_from = f"15.{detected_month:02d}.{year}"
-                                new_to = f"28.{detected_month:02d}.{year}"
-                                corrected = True
+                                _mismatch = True
                             
-                            if corrected:
-                                logger.warning(
-                                    "🛡️ SAFETY-NET P4: '%s %s' → даты скорректированы %s–%s → %s–%s (модель сузила диапазон)",
-                                    part, month_word,
-                                    args["datefrom"], args["dateto"],
-                                    new_from, new_to
+                            if _mismatch:
+                                logger.info(
+                                    "ℹ️ P4-INFO: '%s %s' span=%d дн. (datefrom=%s, dateto=%s) — "
+                                    "не совпадает с ожидаемым, но доверяем LLM",
+                                    part, month_word, date_span,
+                                    args["datefrom"], args["dateto"]
                                 )
-                                args["datefrom"] = new_from
-                                args["dateto"] = new_to
                         except (ValueError, TypeError) as e:
                             logger.warning("⚠️ Ошибка коррекции дат частей месяца: %s", e)
             
@@ -2521,56 +2413,11 @@ class YandexGPTHandler:
                     args.get("meal")
                 )
             
-            # ── Fix F6 + C1 + SMART-DEFAULTS: Safety-net для skip QC ──
-            # Если пользователь сказал "всё равно" / "без разницы" → применяем умные дефолты
-            # по стране вместо удаления stars/meal (чтобы не показывать самые дешёвые)
-            _skip_qc_patterns = [
-                r'(?:без\s*разницы|(?:всё|все)\s*равно(?!\s*когда))',
-                r'(?:не\s*важно|неважно|не\s*принципиально)',
-                r'(?:на\s+(?:ваше?|твоё?|твое?)\s+усмотрени)',
-                r'(?:рассмотрим\s+вариант|покажите?\s+что\s+есть|какие\s+есть)',
-                r'(?:покажите?\s+что-нибудь|что\s+посоветуете)',
-                r'(?:любой|любая|любое)\b',
-            ]
-            _last_user_msgs = [
-                msg.get("content", "") for msg in self.full_history[-4:]
-                if msg.get("role") == "user" and msg.get("content")
-            ]
-            _all_recent_user_text = " ".join(_last_user_msgs).lower()
-            _is_skip_qc = any(re.search(p, _all_recent_user_text) for p in _skip_qc_patterns)
+            # [REMOVED] SMART-DEFAULTS — доверяем LLM.
+            # Промпт §3.6.1 содержит таблицу дефолтов по странам для «любой/без разницы».
+            # LLM сам подставит нужные stars/meal.
 
-            if _is_skip_qc:
-                _has_explicit_stars = bool(re.search(
-                    r'\d[\s\-\+]*(?:зв[её]зд|\*|⭐)', _all_recent_user_text
-                ))
-                _has_explicit_meal = bool(re.search(
-                    r'(?:вс[её]\s*включен|завтрак|полупансион|полный\s*пансион|без\s*питани|all\s*incl|ол+\s*инклюзив)',
-                    _all_recent_user_text
-                ))
-                if _has_explicit_stars or _has_explicit_meal:
-                    logger.info(
-                        "🛡️ SAFETY-NET SKIP-QC ОТМЕНЁН: пользователь явно указал stars/meal в том же тексте "
-                        "(explicit_stars=%s, explicit_meal=%s) → сохраняем stars=%s, meal=%s",
-                        _has_explicit_stars, _has_explicit_meal, args.get("stars"), args.get("meal")
-                    )
-                else:
-                    _country_id = _safe_int(args.get("country"))
-                    _defaults = _SMART_QC_DEFAULTS.get(_country_id, _SMART_QC_DEFAULT_FALLBACK)
-                    _d_stars, _d_starsbetter, _d_meal, _d_mealbetter = _defaults
-                    logger.info(
-                        "🛡️ SMART-DEFAULTS: skip QC обнаружен для country=%s → "
-                        "stars=%s, starsbetter=%s, meal=%s, mealbetter=%s (вместо удаления)",
-                        _country_id, _d_stars, _d_starsbetter, _d_meal, _d_mealbetter
-                    )
-                    args["stars"] = _d_stars
-                    args["starsbetter"] = _d_starsbetter
-                    if _d_meal is not None:
-                        args["meal"] = _d_meal
-                        args["mealbetter"] = _d_mealbetter
-                    else:
-                        args.pop("meal", None)
-                        args.pop("mealbetter", None)
-            elif args.get("stars") is not None:
+            if args.get("stars") is not None:
                 if args.get("starsbetter") is None:
                     args["starsbetter"] = 0
                     logger.info(
@@ -2606,128 +2453,34 @@ class YandexGPTHandler:
                                 args.get("stars"), self._last_requestid
                             )
                         else:
-                            _user_stars_text = " ".join([
-                                msg.get("content", "") for msg in self.full_history[-20:]
-                                if msg.get("role") == "user" and msg.get("content")
-                            ]).lower()
-                            _wants_better = bool(re.search(
-                                r'(?:от\s+\d|\d\s*\+|\d\s*[-–]\s*\d\s*(?:зв|★|\*)'
-                                r'|не\s+ниже|минимум\s+\d|и\s+выше|выше'
-                                r'|аналог|похож|подобн|такой\s+же|таких\s+же)',
-                                _user_stars_text
-                            ))
-                            if not _wants_better:
-                                args["starsbetter"] = 0
-                                logger.info(
-                                    "🛡️ SAFETY-NET C1: starsbetter=1 → 0 при stars=%s (нет 'от/диапазон/не ниже/минимум')",
-                                    args.get("stars")
-                                )
+                            # [REMOVED] C1 aggressive branch — доверяем LLM.
+                            # Если LLM выбрал starsbetter=1, у него есть основания
+                            # (промпт §3.6 описывает когда использовать starsbetter=1).
+                            logger.info(
+                                "✅ TRUST-LLM: starsbetter=1 при stars=%s — доверяем выбору модели",
+                                args.get("stars")
+                            )
             
-            # ── Safety-net: strip hoteltypes/regions if user never mentioned them ──
+            # [REMOVED] hoteltypes removal — доверяем LLM.
+            # Промпт §3.6 + таблица 6.5 описывают когда использовать hoteltypes.
             if args.get("hoteltypes"):
-                _all_user_text = " ".join([
-                    msg.get("content", "") for msg in self.full_history
-                    if msg.get("role") == "user" and msg.get("content")
-                ]).lower()
-                _hoteltype_patterns = [
-                    r'(?:пляжн|beach|у\s+моря|на\s+море|на\s+берегу|первая?\s+лини)',
-                    r'(?:городск|city|в\s+центр|экскурсион)',
-                    r'(?:семейн|family|для\s+семь|с\s+детьми|детский)',
-                    r'(?:лечебн|health|оздоровит|спа|spa)',
-                    r'(?:активн|active|спорт|горнолыжн|лыж|сноуборд|ski)',
-                    r'(?:relax|спокойн|тихий)',
-                    r'(?:люкс|vip|deluxe|премиум)',
-                ]
-                _user_wants_type = any(re.search(p, _all_user_text) for p in _hoteltype_patterns)
-                if not _user_wants_type:
-                    logger.info(
-                        "🛡️ SAFETY-NET: hoteltypes=%s удалён — пользователь не упоминал тип отдыха",
-                        args.get("hoteltypes")
-                    )
-                    args.pop("hoteltypes", None)
-                else:
-                    logger.debug(
-                        "🛡️ SAFETY-NET: hoteltypes=%s оставлен — пользователь упоминал тип отдыха",
-                        args.get("hoteltypes")
-                    )
+                logger.debug("✅ TRUST-LLM: hoteltypes=%s — доверяем выбору модели", args.get("hoteltypes"))
 
+            # [REMOVED] regions keyword scan — доверяем LLM.
+            # Промпт §0.1 + §3.2 описывают правила: «НЕ указал курорт → НЕ передавай regions».
+            # Если LLM передал regions, у него есть основания (user назвал курорт).
             if args.get("regions") and not _resort_auto_resolved:
                 if getattr(self, '_regions_resolved_via_dict', False):
                     logger.info(
-                        "🛡️ SAFETY-NET: regions=%s оставлен — resolved via get_dictionaries(type=region)",
+                        "✅ regions=%s — resolved via get_dictionaries(type=region)",
                         args.get("regions")
                     )
                     self._regions_resolved_via_dict = False
                 else:
-                    _all_user_text_r = " ".join([
-                        msg.get("content", "") for msg in self.full_history
-                        if msg.get("role") == "user" and msg.get("content")
-                    ]).lower()
-                    _region_keywords = [
-                        r'(?:аланью?|аланья|анталью?|анталья|анталия|анталию|белек\w*|кемер\w*|сиде|мармарис\w*|бодрум\w*|фетхие|даламан\w*|кушадас\w*|стамбул\w*|дидим\w*)',
-                        r'(?:хургад\w*|шарм|марса\s*алам|дахаб\w*|табб\w*|макади|сафаг\w*|сома\s*бей)',
-                        r'(?:паттай\w*|пхукет\w*|самуи|краби|хуа\s*хин\w*|чианг\w*)',
-                        r'(?:нячанг\w*|фукуок\w*|муйне|дананг\w*|хошимин\w*)',
-                        r'(?:дубай|абу.?даби|шардж\w*|рас.?эль|аджман\w*|фуджейр\w*)',
-                        r'(?:сочи|адлер\w*|анап\w*|геленджик\w*|крым\w*|ялт\w*|алушт\w*|калининград\w*)',
-                        r'(?:казан[ьи]\w*|алтай\w*|шерегеш\w*|дагестан\w*|махачкал\w*|дербент\w*)',
-                        r'(?:карели\w*|байкал\w*|домбай\w*|архыз\w*|приэльбрусь\w*|эльбрус\w*)',
-                        r'(?:кмв|кисловодск\w*|пятигорск\w*|ессентуки\w*|абзаков\w*|банно\w*)',
-                        r'(?:красн\w*\s*полян\w*|урал\w*|мурманск\w*|подмосковь\w*|золот\w+\s*кольц\w*)',
-                        r'(?:псков\w*|воронеж\w*|татарстан\w*|питер\w*|санкт.?петербург\w*)',
-                        r'(?:кабардин\w*|ингушети\w*|осети\w*|чечн\w*|адыге\w*)',
-                        r'(?:азовск\w*|туапсе\w*|новоросс\w*|светлогорск\w*|зеленоградск\w*)',
-                        r'(?:велик\w*\s*устюг\w*|петрозаводск\w*|владикавказ\w*|нальчик\w*|грозн\w*)',
-                        r'(?:тенериф\w*|канар\w*|майорк\w*|ибиц\w*|коста\w*|барселон\w*|малаг\w*)',
-                        r'(?:крит\w*|родос\w*|корфу|санторин\w*|закинф\w*|халкидик\w*|кос\b|афин\w*)',
-                        r'(?:лимассол\w*|пафос\w*|ларнак\w*|айя.?нап\w*|протарас\w*)',
-                        r'(?:будв\w*|тиват\w*|черногор\w*|котор\w*)',
-                        r'(?:хаммамет\w*|сусс\w*|монастир\w*|джерб\w*)',
-                        r'(?:римини\w*|сардини\w*|сицили\w*|неапол\w*)',
-                        r'(?:варн\w*|бургас\w*|солнечн\w*\s*берег\w*|золот\w*\s*песк\w*)',
-                        r'(?:курорт\w*|район\w*|побережь\w*)',
-                    ]
-                    _user_wants_region = False
-                    for _p in _region_keywords:
-                        for _m in re.finditer(_p, _all_user_text_r):
-                            if not _is_departure_context(_all_user_text_r, _m.start()):
-                                _user_wants_region = True
-                                break
-                        if _user_wants_region:
-                            break
-                    if not _user_wants_region:
-                        logger.info(
-                            "🛡️ SAFETY-NET: regions=%s удалён — пользователь не упоминал конкретный курорт",
-                            args.get("regions")
-                        )
-                        args.pop("regions", None)
-                    else:
-                        logger.debug(
-                            "🛡️ SAFETY-NET: regions=%s оставлен — пользователь упоминал курорт",
-                            args.get("regions")
-                        )
+                    logger.debug("✅ TRUST-LLM: regions=%s — доверяем выбору модели", args.get("regions"))
 
-            # ── Fix C2: Safety-net для nightsto при "дней" ──
-            # Срабатывает ТОЛЬКО когда модель вообще не конвертировала дни→ночи
-            # (nightsfrom == nightsto == raw_days). Если nightsfrom уже = days-1,
-            # значит модель конвертировала корректно и nightsto = days — это верхний предел.
-            if args.get("nightsto") is not None and args.get("nightsfrom") is not None:
-                _user_dur_text = " ".join([
-                    msg.get("content", "") for msg in self.full_history[-6:]
-                    if msg.get("role") == "user" and msg.get("content")
-                ]).lower()
-                _days_match = re.search(r'(\d+)\s*(?:дней|дня|день)\b', _user_dur_text)
-                if _days_match and 'ноч' not in _user_dur_text:
-                    _max_days = int(_days_match.group(1))
-                    _expected_nights = _max_days - 1
-                    if (args["nightsto"] == _max_days
-                            and args["nightsfrom"] == _max_days
-                            and _expected_nights >= 3):
-                        logger.info(
-                            "🛡️ SAFETY-NET C2: nightsfrom=%d→%d, nightsto=%d (kept) (пользователь сказал '%d дней')",
-                            _max_days, _expected_nights, _max_days, _max_days
-                        )
-                        args["nightsfrom"] = _expected_nights
+            # [REMOVED] C2 days→nights conversion — доверяем LLM.
+            # Промпт §3.4 описывает правило: «X дней = nightsfrom=X-1, nightsto=X».
             
             # ── Fix P7: Safety-net для "около N тыс" → диапазон ±20% ──
             if args.get("priceto") and not args.get("pricefrom"):
@@ -4125,15 +3878,8 @@ class YandexGPTHandler:
             # Fix B4: модель может передать "country" (singular) вместо "countries" (plural)
             # Принимаем оба варианта через fallback
             
-            # ── P14: tourtype=1 для "на море" если не указан ──
-            if args.get("tourtype", 0) == 0:
-                _hot_user_text = " ".join([
-                    msg.get("content", "") for msg in self.full_history[-20:]
-                    if msg.get("role") == "user" and msg.get("content")
-                ]).lower()
-                if re.search(r'(?:на\s+мор[еёюя]|пляж\w*|beach)', _hot_user_text):
-                    args["tourtype"] = 1
-                    logger.info("✅ P14: tourtype=1 авто-установлен для 'на море'")
+            # [REMOVED] P14 tourtype auto — доверяем LLM.
+            # Промпт §4 описывает опциональные фильтры включая tourtype.
             
             # ── Safety-net: проверка города вылета ──
             # Если модель передала валидный city code — доверяем (клиент мог подтвердить
