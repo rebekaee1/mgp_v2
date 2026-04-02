@@ -1988,7 +1988,17 @@ class YandexGPTHandler:
                         if _explicit_date_range:
                             range_days = (dateto_dt - datefrom_dt).days
                             nightsfrom_val = nightsfrom or 7
-                            if range_days > 2 and nightsfrom_val and abs(range_days - nightsfrom_val) <= 1:
+                            _has_departure_word = bool(re.search(
+                                r'вылет|отлёт|отлет|дат[аыу]\s+вылет',
+                                _user_date_text, re.IGNORECASE
+                            ))
+                            if _has_departure_word:
+                                logger.info(
+                                    "✅ dateto clamp BYPASSED: 'вылет' detected near date range "
+                                    "→ treating as departure range. datefrom=%s, dateto=%s",
+                                    datefrom_str, dateto_str
+                                )
+                            elif range_days > 2 and nightsfrom_val and abs(range_days - nightsfrom_val) <= 1:
                                 corrected_dt = datefrom_dt
                                 self._metrics["dateto_corrections"] = self._metrics.get("dateto_corrections", 0) + 1
                                 logger.info(
