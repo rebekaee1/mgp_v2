@@ -4352,15 +4352,18 @@ class YandexGPTHandler:
         parts = []
         sp = self._last_search_params
         if sp:
-            if sp.get("country_name"):
-                parts.append(f"Направление: {sp['country_name']}")
+            _country = ""
+            if self._booking_cards_cache:
+                _country = next(iter(self._booking_cards_cache.values())).get("country", "")
+            if _country:
+                parts.append(f"Направление: {_country}")
             if sp.get("datefrom"):
                 s = f"Даты: {sp['datefrom']}"
                 if sp.get("dateto"):
                     s += f" — {sp['dateto']}"
                 parts.append(s)
             adults = sp.get("adults", 2)
-            kids = sp.get("kids", 0)
+            kids = sp.get("child", 0)
             parts.append(f"Состав: {adults} взр." + (f" + {kids} дет." if kids else ""))
             if sp.get("priceto"):
                 parts.append(f"Бюджет до: {sp['priceto']} руб.")
