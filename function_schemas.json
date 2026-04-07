@@ -515,6 +515,33 @@
         },
         "required": ["client_name", "client_phone"]
       }
+    },
+    {
+      "type": "function",
+      "name": "submit_client_request",
+      "description": "Передать контакт клиента менеджеру в CRM. Вызывай когда клиент оставляет имя и телефон для связи с менеджером. НЕ требуется выбор конкретного тура — если тур был актуализирован, данные о нём добавятся автоматически. НЕ путай с submit_booking_request (тот отправляет email).",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "client_name": {
+            "type": "string",
+            "description": "Имя клиента (как он представился)"
+          },
+          "client_phone": {
+            "type": "string",
+            "description": "Телефон клиента (любой формат)"
+          },
+          "client_email": {
+            "type": "string",
+            "description": "Email клиента (опционально)"
+          },
+          "comment": {
+            "type": "string",
+            "description": "Дополнительные пожелания или комментарий клиента (опционально)"
+          }
+        },
+        "required": ["client_name", "client_phone"]
+      }
     }
   ]
 }

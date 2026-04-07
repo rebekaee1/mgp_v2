@@ -203,7 +203,7 @@ def _is_promised_search(text: str) -> bool:
 _VALID_FUNCTION_NAMES = frozenset([
     "get_current_date", "search_tours", "get_search_status", "get_search_results",
     "continue_search", "get_dictionaries", "actualize_tour", "get_tour_details",
-    "get_hotel_info", "get_hot_tours", "submit_booking_request",
+    "get_hotel_info", "get_hot_tours", "submit_booking_request", "submit_client_request",
 ])
 
 # Regex: function_name(...)  — Python-like вызов
@@ -477,6 +477,7 @@ _DEPARTURE_PATTERNS = [
     r'(?:вылет|вылетаем|летим|улетаем)\s+(?:из|с)\s+\w+',
     r'(?:из|с)\s+\w+\s+(?:вылет|вылетаем|улетаем)',
     r'без\s*перел[её]т',
+    r'только\s*отел[ьяию]',
 ]
 
 ## [REMOVED] _SMART_QC_DEFAULTS — таблица перенесена в системный промпт §3.6.1.
@@ -1430,6 +1431,12 @@ class YandexGPTHandler:
         self._russia_no_region_hint: bool = False
         self._original_requested_meal: Optional[int] = None
         self._regions_resolved_via_dict: bool = False
+        
+        # ── U-ON CRM ──
+        from uon_client import UONClient
+        self.uon_client = UONClient(runtime_config=runtime_config)
+        self._crm_submitted: Optional[Dict] = None  # dedup guard: {phone, email, type}
+        self._tour_actualized_id: Optional[str] = None  # tourid explicitly actualized by LLM
         
         # ── Прогрессивный "ближайший вылет": счётчик попыток и последняя страна ──
         self._nearest_search_attempt: int = 0
@@ -2785,6 +2792,7 @@ class YandexGPTHandler:
             # Инвалидируем tourid_map и prefetch cache — новый поиск, старые tourid недействительны
             self._tourid_map = {}
             self._tour_details_cache = {}
+            self._tour_actualized_id = None
             if hasattr(self, '_shown_flight_signatures'):
                 self._shown_flight_signatures = {}
             if args.get("priceto"):
@@ -3537,11 +3545,14 @@ class YandexGPTHandler:
                         f"⛔ НЕВЕРНЫЙ tourid: '{_tid}'. tourid — это ЧИСЛОВАЯ строка (например '99195143679290'), "
                         f"которую возвращает get_search_results. Используй ТОЧНЫЙ tourid из результатов поиска."
                     )}
-            return await self.tourvisor.actualize_tour(
+            act_result = await self.tourvisor.actualize_tour(
                 tour_id=args["tourid"],
                 request_mode=args.get("request", 2),
                 currency=args.get("currency", 0)
             )
+            if isinstance(act_result, dict) and not act_result.get("iserror"):
+                self._tour_actualized_id = str(args["tourid"])
+            return act_result
         
         elif name == "get_tour_details":
             # ── P1: Валидация tourid ──
@@ -4263,9 +4274,171 @@ class YandexGPTHandler:
                 "message": f"Продолжение поиска запущено (страница {page}). Вызови get_search_status для ожидания завершения, затем get_search_results."
             }
         
+        elif name == "submit_client_request":
+            return await self._handle_submit_client_request(args)
+        
         else:
             return {"error": f"Неизвестная функция: {name}"}
     
+    # ── U-ON CRM handlers ────────────────────────────────────────────────
+
+    async def _handle_submit_client_request(self, args: Dict) -> Dict:
+        """Validate, dedup, and route to lead or request creation in U-ON CRM."""
+        client_name = (args.get("client_name") or "").strip()
+        client_phone = (args.get("client_phone") or "").strip()
+        client_email = (args.get("client_email") or "").strip()
+        comment = (args.get("comment") or "").strip()
+
+        if not client_name or not client_phone:
+            return {
+                "status": "error",
+                "message": "Не хватает данных. Спроси у клиента имя и телефон.",
+            }
+
+        digits = re.sub(r'\D', '', client_phone)
+        if len(digits) < 10 or len(digits) > 12:
+            return {
+                "status": "error",
+                "message": f"Телефон '{client_phone}' выглядит некорректно (нужно 10-12 цифр). Уточни номер у клиента.",
+            }
+
+        if self._crm_submitted:
+            prev_phone = self._crm_submitted.get("phone", "")
+            prev_email = self._crm_submitted.get("email", "")
+            if digits == re.sub(r'\D', '', prev_phone) and client_email == prev_email:
+                return {
+                    "status": "duplicate",
+                    "message": "Контакт уже передан менеджеру. Скажи клиенту, что менеджер свяжется в ближайшее время.",
+                }
+            logger.info("CRM: correction detected — prev phone=%s, new phone=%s", prev_phone, client_phone)
+
+        has_actualized = bool(self._tour_actualized_id)
+
+        if has_actualized:
+            result = await self._crm_create_request(client_name, client_phone, client_email)
+            crm_type = "request"
+        else:
+            result = await self._crm_create_lead(client_name, client_phone, client_email)
+            crm_type = "lead"
+
+        if result.get("ok"):
+            self._crm_submitted = {"phone": client_phone, "email": client_email, "type": crm_type}
+            logger.info(
+                "CRM %s created: name=%s phone=%s email=%s",
+                crm_type, client_name, client_phone, client_email,
+            )
+            return {
+                "status": "success",
+                "type": crm_type,
+                "message": (
+                    "Контакт успешно передан менеджеру. "
+                    "Скажи клиенту: данные переданы, менеджер свяжется "
+                    f"по телефону {client_phone} в ближайшее время."
+                ),
+            }
+
+        logger.error("CRM %s failed: %s", crm_type, result.get("error"))
+        manager_phone = self._get_manager_phone()
+        return {
+            "status": "error",
+            "message": (
+                "Не удалось передать контакт автоматически. "
+                f"Предложи клиенту позвонить менеджеру: {manager_phone}."
+            ),
+        }
+
+    async def _crm_create_lead(self, name: str, phone: str, email: str) -> Dict:
+        """Build context note from search params and create a lead in U-ON."""
+        parts = []
+        sp = self._last_search_params
+        if sp:
+            if sp.get("country_name"):
+                parts.append(f"Направление: {sp['country_name']}")
+            if sp.get("datefrom"):
+                s = f"Даты: {sp['datefrom']}"
+                if sp.get("dateto"):
+                    s += f" — {sp['dateto']}"
+                parts.append(s)
+            adults = sp.get("adults", 2)
+            kids = sp.get("kids", 0)
+            parts.append(f"Состав: {adults} взр." + (f" + {kids} дет." if kids else ""))
+            if sp.get("priceto"):
+                parts.append(f"Бюджет до: {sp['priceto']} руб.")
+
+        agency = (
+            getattr(self.runtime_config, "company_name", None)
+            or getattr(self.runtime_config, "assistant_name", None)
+            or "AI-Ассистент"
+        )
+        parts.append(f"Источник: виджет {agency}")
+        note = "; ".join(parts)
+
+        return await self.uon_client.create_lead(name, phone, email, note)
+
+    async def _crm_create_request(self, name: str, phone: str, email: str) -> Dict:
+        """Build context note from actualized tour and create a request in U-ON."""
+        parts = []
+        price = None
+        date_begin = None
+        date_end = None
+
+        card = None
+        act_tid = self._tour_actualized_id
+        if act_tid and self._booking_cards_cache:
+            card = self._booking_cards_cache.get(str(act_tid))
+        if not card and self._booking_cards_cache:
+            card = next(iter(self._booking_cards_cache.values()))
+
+        if card:
+            if card.get("hotel_name"):
+                parts.append(f"Отель: {card['hotel_name']}")
+            if card.get("country"):
+                parts.append(f"Страна: {card['country']}")
+            if card.get("date_from"):
+                parts.append(f"Вылет: {card['date_from']}")
+                date_begin = card["date_from"]
+            if card.get("nights"):
+                parts.append(f"Ночей: {card['nights']}")
+            if card.get("price"):
+                parts.append(f"Цена: {card['price']} руб.")
+                try:
+                    price = float(str(card["price"]).replace(" ", "").replace(",", "."))
+                except (ValueError, TypeError):
+                    pass
+            if card.get("operator"):
+                parts.append(f"Оператор: {card['operator']}")
+
+        if not parts and act_tid and self._tour_details_cache.get(act_tid):
+            tour = self._tour_details_cache[act_tid]
+            if tour.get("hotel"):
+                parts.append(f"Отель: {tour['hotel']}")
+            if tour.get("country"):
+                parts.append(f"Страна: {tour['country']}")
+            if tour.get("flydate"):
+                parts.append(f"Вылет: {tour['flydate']}")
+                date_begin = tour["flydate"]
+            if tour.get("nights"):
+                parts.append(f"Ночей: {tour['nights']}")
+            if tour.get("price"):
+                parts.append(f"Цена: {tour['price']} руб.")
+                try:
+                    price = float(str(tour["price"]).replace(" ", "").replace(",", "."))
+                except (ValueError, TypeError):
+                    pass
+
+        agency = (
+            getattr(self.runtime_config, "company_name", None)
+            or getattr(self.runtime_config, "assistant_name", None)
+            or "AI-Ассистент"
+        )
+        parts.append(f"Источник: виджет {agency}")
+        note = "; ".join(parts)
+
+        return await self.uon_client.create_request(
+            name, phone, email, note,
+            price=price, date_begin=date_begin, date_end=date_end,
+        )
+
     def _call_api_sync(self, stream: bool = False):
         """
         Синхронный вызов Completion API через прямой HTTP.
@@ -5252,6 +5425,8 @@ class YandexGPTHandler:
         self._last_message_usage = None
         self._last_departure_city = "Москва"
         self._tour_details_cache = {}
+        self._tour_actualized_id = None
+        self._crm_submitted = None
         self._shown_flight_signatures = {}
         self._original_requested_meal = None
         logger.info("🔄 HANDLER RESET  cleared %d messages from full_history", old_len)

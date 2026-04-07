@@ -505,7 +505,7 @@ class OpenAIHandler(YandexGPTHandler):
         self._update_collected_slots(user_message)
 
         # Detect and pin "без перелёта" intent so it survives trimming
-        if re.search(r'без\s*перел[её]т|(?:на\s+)?поезд|автобус\w*|ж[./]?д', user_message, re.IGNORECASE):
+        if re.search(r'без\s*перел[её]т|только\s*отел[ьяию]|(?:на\s+)?поезд|автобус\w*|ж[./]?д', user_message, re.IGNORECASE):
             self._pinned_search_intent = "[ПАРАМЕТР КЛИЕНТА: тур БЕЗ ПЕРЕЛЁТА (departure=99). НЕ спрашивай город вылета.]"
             logger.info("📌 Pinned search intent: без перелёта")
 
@@ -591,7 +591,7 @@ class OpenAIHandler(YandexGPTHandler):
                 error_str = str(e)
                 logger.error(
                     "🤖 OPENAI API !! ERROR  %dms  %s",
-                    api_ms, error_str[:300]
+                    api_ms, error_str[:300], exc_info=True
                 )
 
                 # Rate limit
@@ -857,6 +857,11 @@ class OpenAIHandler(YandexGPTHandler):
                 # Update pinned context when tour cards are available
                 if self._tourid_map:
                     lines = ["[КОНТЕКСТ: текущие показанные туры]"]
+                    _ctx_country = ""
+                    if self._pending_tour_cards:
+                        _ctx_country = self._pending_tour_cards[0].get("country", "")
+                    if _ctx_country:
+                        lines.append(f"Направление: {_ctx_country}, вылет: {self._last_departure_city}")
                     for pos, entry in sorted(self._tourid_map.items()):
                         lines.append(
                             f"{pos}. {entry.get('hotelname', '?')} "
@@ -1390,6 +1395,8 @@ class OpenAIHandler(YandexGPTHandler):
         self._last_requestid = None
         self._tourid_map = {}
         self._tour_details_cache = {}
+        self._tour_actualized_id = None
+        self._crm_submitted = None
         self._shown_flight_signatures = {}
         self._last_search_params = {}
         self._user_stated_budget = None

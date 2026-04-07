@@ -28,6 +28,11 @@ class Settings(BaseSettings):
     ai_report_model: str = ""
     ai_report_api_key: str = ""
 
+    # --- U-ON CRM ---
+    uon_api_key: str = ""
+    uon_source: str = "AI-Ассистент"
+    uon_dry_run: bool = True
+
     # --- TourVisor ---
     tourvisor_auth_login: str = ""
     tourvisor_auth_pass: str = ""

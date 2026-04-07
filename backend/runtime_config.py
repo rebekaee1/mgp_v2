@@ -33,6 +33,9 @@ class RuntimeTenantConfig:
     widget_config: Dict[str, Any] = field(default_factory=dict)
     runtime_metadata: Dict[str, Any] = field(default_factory=dict)
     runtime_service_auth_secret: Optional[str] = None
+    uon_api_key: Optional[str] = None
+    uon_source: str = "AI-Ассистент"
+    uon_dry_run: bool = True
     source: str = "env-default"
 
 
@@ -48,6 +51,9 @@ def build_default_runtime_config() -> RuntimeTenantConfig:
         tourvisor_login=settings.tourvisor_auth_login or None,
         tourvisor_pass=settings.tourvisor_auth_pass or None,
         tourvisor_base_url=settings.tourvisor_base_url,
+        uon_api_key=settings.uon_api_key or None,
+        uon_source=settings.uon_source,
+        uon_dry_run=settings.uon_dry_run,
     )
 
 
