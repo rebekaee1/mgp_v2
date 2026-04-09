@@ -1442,6 +1442,13 @@ class YandexGPTHandler:
         self._nearest_search_attempt: int = 0
         self._last_nearest_country: Optional[int] = None
         
+        # ── Пул результатов для "покажите ещё" (continue_search из кеша) ──
+        self._results_pool: List[tuple] = []     # Все scored hotels с текущей страницы
+        self._results_pool_offset: int = 0       # Сколько уже показано из пула
+        self._results_pool_page: int = 0         # Номер страницы пула
+        self._results_pool_requestid: Optional[str] = None
+        self._results_pool_status: Optional[Dict] = None  # hotels_found/tours_found
+
         # ── Для логирования результатов поиска (hotels_found/tours_found/min_price) ──
         self._last_search_result: Optional[Dict] = None
         
@@ -1525,6 +1532,94 @@ class YandexGPTHandler:
             return first
         
         return None
+
+    async def _serve_next_pool_batch(self) -> Dict:
+        """Отдаёт следующую порцию (до 5) отелей из кешированного пула результатов.
+
+        Вызывается из continue_search когда в пуле ещё есть непоказанные отели.
+        Формирует tour_cards и tourid_map — аналогично get_search_results.
+        """
+        batch_size = 5
+        offset = self._results_pool_offset
+        batch = self._results_pool[offset:offset + batch_size]
+        self._results_pool_offset = offset + len(batch)
+
+        remaining_after = len(self._results_pool) - self._results_pool_offset
+        logger.info(
+            "📦 POOL SERVE: showing %d hotels (offset %d→%d), %d remaining in cache",
+            len(batch), offset, self._results_pool_offset, remaining_after
+        )
+
+        simplified = [item[2] for item in batch]
+
+        _adults = self._last_search_params.get("adults", 2) if self._last_search_params else 2
+        _booking_url = (getattr(self.runtime_config, "widget_config", None) or {}).get("booking_base_url")
+        self._pending_tour_cards = [
+            _map_hotel_to_card(h, self._last_departure_city, adults=_adults, booking_base_url=_booking_url)
+            for h in simplified
+        ]
+        for _c in self._pending_tour_cards:
+            _cid = str(_c.get("id") or _c.get("tourid") or "")
+            if _cid:
+                self._booking_cards_cache[_cid] = _c
+        logger.info("🎴 Built %d tour cards from pool cache", len(self._pending_tour_cards))
+
+        ai_hotels = []
+        for h in simplified:
+            tour = h.get("tour") or {}
+            warnings = []
+            if tour.get("nightflight"):
+                warnings.append("ночной перелёт")
+            if tour.get("noflight"):
+                warnings.append("без перелёта")
+            if tour.get("notransfer"):
+                warnings.append("без трансфера")
+            if tour.get("nomedinsurance"):
+                warnings.append("без мед.страховки")
+            if tour.get("nomeal"):
+                warnings.append("без питания")
+            if tour.get("onrequest"):
+                warnings.append("под запрос")
+            entry = {
+                "hotelcode": h.get("hotelcode"),
+                "hotelname": h.get("hotelname"),
+                "tourid": (h.get("tour") or {}).get("tourid"),
+            }
+            if warnings:
+                entry["warnings"] = warnings
+            ai_hotels.append(entry)
+
+        self._tourid_map = {}
+        for idx, h_entry in enumerate(ai_hotels, 1):
+            tid = h_entry.get("tourid")
+            if tid:
+                self._tourid_map[idx] = {
+                    "tourid": str(tid),
+                    "hotelcode": h_entry.get("hotelcode"),
+                    "hotelname": h_entry.get("hotelname"),
+                }
+        if self._tourid_map:
+            logger.info("🗂️ TOURID-CACHE (pool): сохранено %d позиций: %s",
+                        len(self._tourid_map),
+                        {k: v["tourid"] for k, v in self._tourid_map.items()})
+            self._start_prefetch()
+
+        pool_status = self._results_pool_status or {}
+        _result_hint = (
+            "Карточки с фото, ценами, датами, питанием, звёздами УЖЕ отображены фронтендом. "
+            "НЕ перечисляй отели, цены, описания, даты, питание, звёзды в тексте! "
+            "Напиши ТОЛЬКО краткий комментарий (1-2 предложения) и спроси клиента. "
+            "Добавь: «Окончательная стоимость — при оформлении тура.»"
+        )
+
+        return {
+            "hotels_found": pool_status.get("hotelsfound", 0),
+            "tours_found": pool_status.get("toursfound", 0),
+            "hotels": ai_hotels,
+            "remaining_in_cache": remaining_after,
+            "_hint": _result_hint,
+            "_skip_search_status": True,
+        }
 
     def _start_prefetch(self):
         """Launch background thread to prefetch actdetail for top-3 displayed tours."""
@@ -2789,10 +2884,12 @@ class YandexGPTHandler:
             # ── P13: Кэшируем requestid для валидации в get_search_status ──
             self._last_requestid = str(request_id)
             self._requestid_poll_count = 0
-            # Инвалидируем tourid_map и prefetch cache — новый поиск, старые tourid недействительны
+            # Инвалидируем tourid_map, prefetch cache и пул результатов
             self._tourid_map = {}
             self._tour_details_cache = {}
             self._tour_actualized_id = None
+            self._results_pool = []
+            self._results_pool_offset = 0
             if hasattr(self, '_shown_flight_signatures'):
                 self._shown_flight_signatures = {}
             if args.get("priceto"):
@@ -3229,6 +3326,26 @@ class YandexGPTHandler:
                 "⭐ RATING TIERS: %s from tiers 4.0+/3.8+/3.5+/other (total %d scored)",
                 _tier_counts, len(_scored_hotels)
             )
+
+            # ── Пул: первые 5 (tiered) + остальные в порядке сортировки ──
+            _remaining = [item for _idx, item in enumerate(_scored_hotels) if _idx not in _seen_idx]
+            _full_pool = _selected + _remaining
+            self._results_pool = _full_pool
+            self._results_pool_offset = min(5, len(_full_pool))
+            self._results_pool_page = int(args.get("page", 1))
+            self._results_pool_requestid = args.get("requestid")
+            _pool_status = full_results.get("status", {})
+            self._results_pool_status = {
+                "hotelsfound": _pool_status.get("hotelsfound", 0),
+                "toursfound": _pool_status.get("toursfound", 0),
+                "minprice": _pool_status.get("minprice"),
+            }
+            if len(_full_pool) > 5:
+                logger.info(
+                    "📦 POOL CACHED: %d hotels total, showing first 5, %d more available in cache",
+                    len(_full_pool), len(_full_pool) - 5
+                )
+
             simplified = [item[2] for item in _selected]
             
             # ── Строим tour_cards для нового фронтенда ──
@@ -4267,6 +4384,13 @@ class YandexGPTHandler:
                     args["requestid"] = self._last_requestid
                 else:
                     return {"error": f"⛔ НЕВЕРНЫЙ requestid: '{_rid}'. Сначала вызови search_tours."}
+
+            # ── Проверяем кеш: есть ли ещё непоказанные отели с текущей страницы ──
+            if (self._results_pool
+                    and self._results_pool_offset < len(self._results_pool)
+                    and self._results_pool_requestid == args.get("requestid", self._last_requestid)):
+                return await self._serve_next_pool_batch()
+
             result = await self.tourvisor.continue_search(args["requestid"])
             page = result.get("page", "2")
             return {

@@ -231,7 +231,7 @@
     {
       "type": "function",
       "name": "continue_search",
-      "description": "Продолжает поиск для доп. туров. Считается отдельным запросом. После вызова нужен get_search_status → get_search_results.",
+      "description": "Показывает ещё туры. Может вернуть результаты сразу (поле hotels) — тогда НЕ вызывай get_search_status/get_search_results. Если вернул только page — вызови get_search_status → get_search_results.",
       "parameters": {
         "type": "object",
         "properties": {
