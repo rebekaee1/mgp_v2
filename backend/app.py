@@ -1474,6 +1474,7 @@ def chat_v1():
     message = data.get('message', '').strip()
     conversation_id = data.get('conversation_id', str(uuid.uuid4()))
     assistant_id = data.get('assistant_id') or request.headers.get('X-Assistant-Id')
+    lead_info = data.get('lead_info')
     auth_error = _runtime_auth_error_response(conversation_id=conversation_id)
     if auth_error:
         return auth_error
@@ -1539,6 +1540,9 @@ def chat_v1():
     _write_dialogue_log(session_id, "USER", message)
 
     handler = get_handler(session_id, assistant_id=assistant_id)
+
+    if lead_info and lead_info.get('name'):
+        handler._lead_info = lead_info
 
     try:
         _hist_before = len(handler.full_history)

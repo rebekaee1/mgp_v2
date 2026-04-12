@@ -109,6 +109,8 @@ class OpenAIHandler(YandexGPTHandler):
         # Collected cascade slots — injected as system message to prevent "forgetting"
         self._collected_slots: Dict[str, str] = {}
         self._nights_from_date_range = False
+        # Pre-collected client contacts from widget form (set by app.py from lead_info payload)
+        self._lead_info: Optional[Dict] = None
 
         # 0 = не показывали, 1 = мягкое (60 msgs), 2 = финальное (72 msgs)
         self._context_warning_stage = 0
@@ -218,6 +220,22 @@ class OpenAIHandler(YandexGPTHandler):
                     "[СОБРАННЫЕ ПАРАМЕТРЫ КЛИЕНТА — НЕ переспрашивай]\n"
                     + "\n".join(slot_lines)
                     + _slots_suffix
+                )
+            })
+
+        # Pre-collected client contacts from widget form (survives trimming)
+        if self._lead_info and self._lead_info.get('name'):
+            _name = self._lead_info['name']
+            _phone = self._lead_info.get('phone', 'не указан')
+            _email = self._lead_info.get('email', 'не указан')
+            messages.append({
+                "role": "system",
+                "content": (
+                    f"[КОНТАКТ КЛИЕНТА ИЗ ФОРМЫ НА САЙТЕ]\n"
+                    f"Имя: {_name}\n"
+                    f"Телефон: {_phone}\n"
+                    f"Email: {_email}\n"
+                    f"Обращайся к клиенту по имени. Правила — см. §26."
                 )
             })
 
