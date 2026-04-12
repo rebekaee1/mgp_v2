@@ -45,3 +45,6 @@ backend/dev.db
 
 # Dashboard build
 dashboard/dist/
+
+# Backups (sensitive — never commit)
+reserve/
