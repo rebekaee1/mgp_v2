@@ -3304,7 +3304,7 @@ class YandexGPTHandler:
                 logger.info("💰 PRICE SORT: %d hotels sorted by price (budget specified)", len(_scored_hotels))
             
             # ── Уровень 3: tiered selection by hotel rating ──
-            _RATING_TIERS = [4.0, 3.8, 3.5, 0]
+            _RATING_TIERS = [4.3, 4.0, 3.8, 0]
             _selected = []
             _seen_idx = set()
             _tier_counts = []
@@ -3323,7 +3323,7 @@ class YandexGPTHandler:
                             break
                 _tier_counts.append(len(_selected) - _before)
             logger.info(
-                "⭐ RATING TIERS: %s from tiers 4.0+/3.8+/3.5+/other (total %d scored)",
+                "⭐ RATING TIERS: %s from tiers 4.3+/4.0+/3.8+/other (total %d scored)",
                 _tier_counts, len(_scored_hotels)
             )
 
