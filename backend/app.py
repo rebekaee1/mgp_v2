@@ -1631,7 +1631,8 @@ def chat_v1():
         return jsonify({
             'reply': reply,
             'tour_cards': tour_cards,
-            'conversation_id': conversation_id
+            'conversation_id': conversation_id,
+            'crm_submitted': bool(getattr(handler, '_crm_submitted', None))
         })
 
     except Exception as e:
@@ -1641,7 +1642,8 @@ def chat_v1():
             'error': 'internal_error',
             'reply': 'Что-то пошло не так — попробуйте ещё раз!',
             'tour_cards': [],
-            'conversation_id': conversation_id
+            'conversation_id': conversation_id,
+            'crm_submitted': bool(getattr(handler, '_crm_submitted', None))
         }), 500
 
     finally:
