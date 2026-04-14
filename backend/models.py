@@ -71,6 +71,8 @@ class Assistant(Base):
     runtime_metadata: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
     bot_server_url: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     allowed_domains: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    uon_api_key: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    uon_source: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow

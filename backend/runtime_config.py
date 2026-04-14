@@ -112,6 +112,8 @@ def resolve_runtime_config(assistant_id: Optional[str] = None) -> RuntimeTenantC
             runtime_config.runtime_service_auth_secret = (
                 (assistant.runtime_metadata or {}).get("service_auth", {}) or {}
             ).get("secret")
+            runtime_config.uon_api_key = getattr(assistant, "uon_api_key", None) or runtime_config.uon_api_key
+            runtime_config.uon_source = getattr(assistant, "uon_source", None) or runtime_config.uon_source
             runtime_config.source = "assistant-db"
             return runtime_config
     except Exception:

@@ -1909,6 +1909,8 @@ def assistant_update(assistant_id):
             "faq_content",
             "tourvisor_login",
             "tourvisor_pass",
+            "uon_api_key",
+            "uon_source",
         ):
             if field in data:
                 setattr(a, field, data[field])
