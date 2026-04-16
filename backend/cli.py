@@ -184,6 +184,8 @@ def create_user(args: argparse.Namespace) -> None:
                 widget_config=payload["assistant"]["widget_config"],
                 bot_server_url=args.bot_server_url or None,
                 allowed_domains=args.allowed_domains or None,
+                uon_api_key=getattr(args, "uon_api_key", None) or None,
+                uon_source=getattr(args, "uon_source", None) or None,
             )
             db.add(assistant)
             db.flush()
@@ -199,6 +201,8 @@ def create_user(args: argparse.Namespace) -> None:
                 "llm_model": args.llm_model,
                 "bot_server_url": args.bot_server_url,
                 "allowed_domains": args.allowed_domains,
+                "uon_api_key": getattr(args, "uon_api_key", None),
+                "uon_source": getattr(args, "uon_source", None),
             }
             for field, value in field_updates.items():
                 if value:
@@ -308,6 +312,8 @@ def main() -> None:
     cu.add_argument("--widget-primary-color", default=None)
     cu.add_argument("--widget-position", default=None)
     cu.add_argument("--widget-logo-url", default=None)
+    cu.add_argument("--uon-api-key", default=None, help="U-ON CRM API key (per-tenant)")
+    cu.add_argument("--uon-source", default=None, help="U-ON CRM source label")
     cu.add_argument("--dry-run", action="store_true", help="Validate provisioning without DB writes")
 
     pt = sub.add_parser("provision-tenant", help="Provision tenant runtime from template defaults")
