@@ -48,3 +48,9 @@ dashboard/dist/
 
 # Backups (sensitive — never commit)
 reserve/
+
+# Cursor IDE autosave backups
+.cursor-backups/
+
+# Local Docker Compose overrides (e.g. per-host port mappings)
+docker-compose.override.yml
