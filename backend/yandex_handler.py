@@ -4411,7 +4411,11 @@ class YandexGPTHandler:
         client_name = (args.get("client_name") or "").strip()
         client_phone = (args.get("client_phone") or "").strip()
         client_email = (args.get("client_email") or "").strip()
-        comment = (args.get("comment") or "").strip()
+        # LLM-generated request summary; capped to 1500 chars to stay within
+        # safe U-ON "note" field limits. Passed down to helpers so it is
+        # actually persisted in the CRM payload (previously it was extracted
+        # but silently dropped — see fix/crm-comment-from-llm).
+        comment = (args.get("comment") or "").strip()[:1500]
 
         if not client_name or not client_phone:
             return {
@@ -4439,10 +4443,16 @@ class YandexGPTHandler:
         has_actualized = bool(self._tour_actualized_id)
 
         if has_actualized:
-            result = await self._crm_create_request(client_name, client_phone, client_email)
+            result = await self._crm_create_request(
+                client_name, client_phone, client_email,
+                llm_comment=comment,
+            )
             crm_type = "request"
         else:
-            result = await self._crm_create_lead(client_name, client_phone, client_email)
+            result = await self._crm_create_lead(
+                client_name, client_phone, client_email,
+                llm_comment=comment,
+            )
             crm_type = "lead"
 
         if result.get("ok"):
@@ -4471,9 +4481,17 @@ class YandexGPTHandler:
             ),
         }
 
-    async def _crm_create_lead(self, name: str, phone: str, email: str) -> Dict:
-        """Build context note from search params and create a lead in U-ON."""
+    async def _crm_create_lead(self, name: str, phone: str, email: str,
+                               llm_comment: str = "") -> Dict:
+        """Build context note from search params and create a lead in U-ON.
+
+        llm_comment — краткое описание запроса клиента от LLM (из tool args).
+        Если задано, добавляется первым сегментом в note, чтобы менеджер
+        сразу видел суть запроса даже без контекста поиска.
+        """
         parts = []
+        if llm_comment:
+            parts.append(f"Запрос клиента: {llm_comment}")
         sp = self._last_search_params
         if sp:
             _country = ""
@@ -4502,9 +4520,16 @@ class YandexGPTHandler:
 
         return await self.uon_client.create_lead(name, phone, email, note)
 
-    async def _crm_create_request(self, name: str, phone: str, email: str) -> Dict:
-        """Build context note from actualized tour and create a request in U-ON."""
+    async def _crm_create_request(self, name: str, phone: str, email: str,
+                                  llm_comment: str = "") -> Dict:
+        """Build context note from actualized tour and create a request in U-ON.
+
+        llm_comment — краткое описание запроса клиента от LLM (из tool args).
+        Если задано, добавляется первым сегментом в note.
+        """
         parts = []
+        if llm_comment:
+            parts.append(f"Запрос клиента: {llm_comment}")
         price = None
         date_begin = None
         date_end = None
@@ -4515,6 +4540,11 @@ class YandexGPTHandler:
             card = self._booking_cards_cache.get(str(act_tid))
         if not card and self._booking_cards_cache:
             card = next(iter(self._booking_cards_cache.values()))
+
+        # Запомнить размер parts ДО card-блока, чтобы понять — дал ли card какие-то
+        # данные. Ранее проверка была `if not parts`, но теперь parts может уже
+        # содержать llm_comment, поэтому опираемся на прирост длины.
+        parts_len_before_card = len(parts)
 
         if card:
             if card.get("hotel_name"):
@@ -4535,7 +4565,7 @@ class YandexGPTHandler:
             if card.get("operator"):
                 parts.append(f"Оператор: {card['operator']}")
 
-        if not parts and act_tid and self._tour_details_cache.get(act_tid):
+        if len(parts) == parts_len_before_card and act_tid and self._tour_details_cache.get(act_tid):
             tour = self._tour_details_cache[act_tid]
             if tour.get("hotel"):
                 parts.append(f"Отель: {tour['hotel']}")
