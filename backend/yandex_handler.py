@@ -1495,6 +1495,30 @@ class YandexGPTHandler:
 
         return _DEFAULT_MANAGER_PHONE
 
+    def _user_facing_error(self, kind: str = "generic") -> str:
+        """Client-friendly error message based on history length and error kind.
+
+        Priority:
+        1. If history >= 80 messages → context-overflow message (start new chat / leave contact)
+        2. Otherwise, kind-specific:
+           - "content_filter" → ask to rephrase
+           - "max_iterations" → ask to refine parameters
+           - "generic" (default) → ask to retry in a minute
+        """
+        if len(self.full_history) >= 80:
+            _phone = self._get_manager_phone()
+            return (
+                "Наш диалог получился длинным, и мне не удалось ответить. "
+                "Начните новый чат, чтобы продолжить с чистого листа. "
+                "Или оставьте имя и телефон — менеджер перезвонит и поможет лично. "
+                f"Также можно позвонить самому: {_phone}."
+            )
+        if kind == "content_filter":
+            return "Попробуйте, пожалуйста, переформулировать запрос другими словами."
+        if kind == "max_iterations":
+            return "Не получилось собрать ответ с первой попытки. Попробуйте уточнить параметры и повторить."
+        return "Секундочку — не удалось ответить. Повторите запрос через минуту, пожалуйста."
+
     def get_metrics(self) -> Dict[str, int]:
         """Возвращает метрики сессии для мониторинга"""
         return self._metrics.copy()
@@ -4763,7 +4787,7 @@ class YandexGPTHandler:
                             {"role": "user", "content": "Пожалуйста, продолжи помогать с подбором тура."}
                         ]
                         continue
-                    return "Что-то пошло не так — попробуйте повторить запрос ещё раз."
+                    return self._user_facing_error("generic")
                 
                 if "429" in error_str or "Too Many" in error_str:
                     return "Секундочку, сейчас много обращений — повторите через пару секунд!"
@@ -4799,7 +4823,7 @@ class YandexGPTHandler:
                     return "Наш диалог получился длинным. Оставьте имя и телефон — менеджер перезвонит и поможет завершить подбор. Или начните новый чат."
                 
                 self.previous_response_id = None
-                return "Что-то пошло не так — попробуйте повторить запрос ещё раз."
+                return self._user_facing_error("generic")
             
             # Проверяем function calls
             has_function_calls = False
@@ -4859,7 +4883,7 @@ class YandexGPTHandler:
                         # ── P3: Если карточки уже есть — позитивный fallback ──
                         if self._pending_tour_cards:
                             return "Вот что нашёл по вашему запросу! Посмотрите варианты и скажите, какой заинтересовал — расскажу подробнее."
-                        return "Что-то пошло не так — попробуйте повторить запрос ещё раз."
+                        return self._user_facing_error("generic")
                     # Fallback: пересылаем всю историю + nudge сообщение
                     self.previous_response_id = None
                     nudge = {"role": "user", "content": "Продолжи обработку моего запроса на основе полученных данных."}
@@ -4879,7 +4903,7 @@ class YandexGPTHandler:
                     logger.warning("⚠️ %s detected (#%d): \"%s\"", reason, empty_retries, (final_text or '')[:100])
                     
                     if empty_retries >= 3:
-                        return "Что-то пошло не так — попробуйте переформулировать запрос."
+                        return self._user_facing_error("content_filter")
                     
                     # Стратегия: вставляем контекстное приветствие ассистента ПЕРЕД первым
                     # сообщением пользователя. _call_api_sync строит messages из full_history.
@@ -5179,7 +5203,7 @@ class YandexGPTHandler:
                             {"role": "user", "content": "Пожалуйста, продолжи помогать с подбором тура."}
                         ]
                         continue
-                    return "Что-то пошло не так — попробуйте повторить запрос ещё раз."
+                    return self._user_facing_error("generic")
                 
                 # 429 Too Many Requests — rate limiting
                 if "429" in error_str or "Too Many" in error_str:
@@ -5216,7 +5240,7 @@ class YandexGPTHandler:
                     return "Наш диалог получился длинным. Оставьте имя и телефон — менеджер перезвонит и поможет завершить подбор. Или начните новый чат."
                 
                 self.previous_response_id = None
-                return "Что-то пошло не так — попробуйте повторить запрос ещё раз."
+                return self._user_facing_error("generic")
             
             # Обрабатываем streaming ответ
             full_text = ""
@@ -5325,7 +5349,7 @@ class YandexGPTHandler:
                                    self._empty_iterations, full_text[:100])
                     if self._empty_iterations >= 3:
                         self._empty_iterations = 0
-                        return "Что-то пошло не так — попробуйте переформулировать запрос."
+                        return self._user_facing_error("content_filter")
                     # Стратегия: вставляем контекстное приветствие ассистента
                     _CF_GREETING = "Здравствуйте! Я помогу вам подобрать тур. Куда хотите поехать?"
                     has_greeting = any(item.get("_cf_greeting") for item in self.full_history)

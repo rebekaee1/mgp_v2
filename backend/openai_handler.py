@@ -549,10 +549,7 @@ class OpenAIHandler(YandexGPTHandler):
                     "⏱ WALL-CLOCK TIMEOUT after %.1fs at iteration %d",
                     elapsed, iteration
                 )
-                return (
-                    "Что-то пошло не так — попробуйте повторить "
-                    "запрос ещё раз."
-                )
+                return self._user_facing_error("generic")
 
             messages = self._build_openai_messages()
 
@@ -697,10 +694,7 @@ class OpenAIHandler(YandexGPTHandler):
                         await asyncio.sleep(3)
                         continue
 
-                return (
-                    "Что-то пошло не так — попробуйте повторить "
-                    "запрос ещё раз."
-                )
+                return self._user_facing_error("generic")
 
             # ── Handle tool calls (native) ──
             if message.tool_calls:
@@ -755,10 +749,7 @@ class OpenAIHandler(YandexGPTHandler):
                         })
                     empty_retries += 1
                     if empty_retries >= 2:
-                        return (
-                            "Что-то пошло не так — попробуйте повторить "
-                            "или упростить запрос."
-                        )
+                        return self._user_facing_error("generic")
                     if len(self.full_history) > 14:
                         _keep_start = self.full_history[:2]
                         _keep_end = self.full_history[-12:]
@@ -802,10 +793,7 @@ class OpenAIHandler(YandexGPTHandler):
                         self._json_error_streak = getattr(self, '_json_error_streak', 0) + 1
                         if self._json_error_streak >= 3:
                             self.full_history.pop()
-                            return (
-                                "Что-то пошло не так — попробуйте повторить "
-                                "запрос ещё раз."
-                            )
+                            return self._user_facing_error("generic")
                         if self._json_error_streak >= 2:
                             result["output"] = json.dumps({
                                 "error": (
@@ -860,10 +848,7 @@ class OpenAIHandler(YandexGPTHandler):
                         })
 
                     if _had_json_error and getattr(self, '_json_error_streak', 0) >= 3:
-                        return (
-                            "Что-то пошло не так — попробуйте повторить "
-                            "запрос ещё раз."
-                        )
+                        return self._user_facing_error("generic")
 
                 if not _had_json_error:
                     self._json_error_streak = 0
@@ -902,10 +887,7 @@ class OpenAIHandler(YandexGPTHandler):
                     empty_retries, final_text[:100]
                 )
                 if empty_retries >= 3:
-                    return (
-                        "Что-то пошло не так — попробуйте "
-                        "переформулировать запрос."
-                    )
+                    return self._user_facing_error("content_filter")
                 self.full_history.append({
                     "role": "user",
                     "content": (
@@ -940,10 +922,7 @@ class OpenAIHandler(YandexGPTHandler):
                             "Посмотрите варианты и скажите, "
                             "какой заинтересовал — расскажу подробнее."
                         )
-                    return (
-                        "Что-то пошло не так — попробуйте повторить "
-                        "запрос ещё раз."
-                    )
+                    return self._user_facing_error("generic")
                 self.full_history.append({
                     "role": "user",
                     "content": (
@@ -1274,7 +1253,7 @@ class OpenAIHandler(YandexGPTHandler):
 
             # ── Context limit warning ──
             _hist_len = len(self.full_history)
-            _is_error_response = final_text.startswith(("Что-то пошло не так", "Секундочку", "Наш диалог получился", "Извините", "Произошла", "К сожалению"))
+            _is_error_response = final_text.startswith(("Что-то пошло не так", "Секундочку", "Наш диалог получился", "Не получилось", "Попробуйте, пожалуйста", "Извините", "Произошла", "К сожалению"))
 
             if not _is_error_response and self._context_warning_stage < 2:
                 _WARNING_SOFT = 80
@@ -1324,10 +1303,7 @@ class OpenAIHandler(YandexGPTHandler):
             return final_text
 
         logger.error("🤖 MAX ITERATIONS REACHED (%d)", max_iterations)
-        return (
-            "Что-то пошло не так — попробуйте уточнить "
-            "параметры и повторить."
-        )
+        return self._user_facing_error("max_iterations")
 
     # ─── History Cleanup ──────────────────────────────────────────────────
 
