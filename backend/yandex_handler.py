@@ -1063,6 +1063,14 @@ def _map_hot_tour_to_card(tour_data: dict, booking_base_url: str = None) -> dict
     """
     Маппинг горящего тура из get_hot_tours → формат tour_card для фронтенда.
     ⚠️ Цена горящих туров — ЗА ЧЕЛОВЕКА!
+    
+    Флаги для фронта:
+    - is_hot_tour: True — сигнал фронту рендерить как горящий тур (не как search_tours).
+      Использование: заменить подпись "за тур" на "от X ₽ / чел" и показать
+      примерную оценку "≈ Y ₽ за двоих".
+    - may_have_flight_surcharge: True/False/None — если True, фронт показывает
+      бейдж "Возможна доплата за перелёт". Устанавливается _annotate_hot_tours
+      через actualize.regular=1. None если annotation не применялся (backward compat).
     """
     flydate_raw = tour_data.get("flydate", "")
     nights = _safe_int(tour_data.get("nights"), 7)
@@ -1073,7 +1081,7 @@ def _map_hot_tour_to_card(tour_data: dict, booking_base_url: str = None) -> dict
     tourid = tour_data.get("tourid")
     hotel_link = _build_hotel_link(tourid, tour_data.get("fulldesclink"), booking_base_url)
 
-    return {
+    card = {
         "hotel_name": tour_data.get("hotelname") or "Отель",
         "hotel_stars": _safe_int(tour_data.get("hotelstars")),
         "hotel_rating": _safe_float(tour_data.get("hotelrating")),
@@ -1095,7 +1103,15 @@ def _map_hot_tour_to_card(tour_data: dict, booking_base_url: str = None) -> dict
         "is_hotel_only": False,
         "flight_included": True,
         "operator": tour_data.get("operatorname") or "",
+        "is_hot_tour": True,                  # Signal for frontend to render as hot tour
     }
+
+    # Surcharge warning flag (if annotation was applied)
+    _surcharge_flag = tour_data.get("_may_have_flight_surcharge")
+    if _surcharge_flag is not None:
+        card["may_have_flight_surcharge"] = _surcharge_flag
+
+    return card
 
 
 def _dedup_response(text: str) -> str:
@@ -1798,6 +1814,80 @@ class YandexGPTHandler:
                 )
             else:
                 args["hideregular"] = 1
+
+    async def _annotate_hot_tours(self, tours: List[Dict]) -> Tuple[List[Dict], Dict[str, int]]:
+        """Annotate hot tours with may_have_flight_surcharge flag (no hiding).
+
+        Strategy: mark tours that have regular flights (which may carry hidden
+        flight surcharges at booking time) with _may_have_flight_surcharge=True.
+        Tours are NEVER removed from the output — frontend will render a warning
+        badge for tours with the flag set.
+
+        FAIL-SAFE: if actualize API fails (timeout/iserror/exception), tour is
+        marked as surcharge-risk (better extra badge than missed Kadikale-like
+        toxic tour).
+
+        Opt-in via widget_config.warn_regular_hot_tours (independent flag, does
+        NOT affect search_tours behavior like hide_gds does).
+
+        Uses tourvisor.actualize_tour(request_mode=2) — cached call, does NOT
+        consume TourVisor API quota. Called DIRECTLY (not via _dispatch_function)
+        to avoid side-effects on _tour_actualized_id (which belongs to explicit
+        client intent in CRM logic).
+
+        Returns: (tours_with_annotations, stats_dict).
+        """
+        if not tours:
+            return [], {"total": 0, "annotated": 0, "safe": 0}
+
+        wc = getattr(self.runtime_config, "widget_config", None) or {}
+        if not wc.get("warn_regular_hot_tours"):
+            # Opt-out: no flag set, don't even call actualize — zero overhead
+            return tours, {"total": len(tours), "filter": "disabled"}
+
+        async def _check(tour):
+            tid = tour.get("tourid")
+            if not tid:
+                tour["_may_have_flight_surcharge"] = True  # fail-safe
+                return tour, "no_tourid_warn"
+            try:
+                r = await asyncio.wait_for(
+                    self.tourvisor.actualize_tour(tour_id=str(tid), request_mode=2),
+                    timeout=5.0
+                )
+                if r.get("iserror"):
+                    tour["_may_have_flight_surcharge"] = True
+                    return tour, "api_error_warn"
+                if _safe_int(r.get("regular")) == 1:
+                    tour["_may_have_flight_surcharge"] = True
+                    return tour, "regular_flight_warn"
+                # Clean: regular flight flag not set → no warning needed
+                tour["_may_have_flight_surcharge"] = False
+                return tour, "safe"
+            except asyncio.TimeoutError:
+                tour["_may_have_flight_surcharge"] = True
+                return tour, "timeout_warn"
+            except Exception as e:
+                logger.warning("HOT-ANNOTATE tourid=%s: %s", tid, str(e)[:100])
+                tour["_may_have_flight_surcharge"] = True
+                return tour, "exception_warn"
+
+        results = await asyncio.gather(*(_check(t) for t in tours))
+        stats = {"total": len(tours), "annotated": 0, "safe": 0}
+        reasons: Dict[str, int] = {}
+        for tour, reason in results:
+            reasons[reason] = reasons.get(reason, 0) + 1
+            if tour.get("_may_have_flight_surcharge"):
+                stats["annotated"] += 1
+            else:
+                stats["safe"] += 1
+
+        logger.info(
+            "🔥 HOT-ANNOTATE total=%d annotated=%d safe=%d reasons=%s",
+            stats["total"], stats["annotated"], stats["safe"], reasons
+        )
+        stats["reasons"] = reasons
+        return tours, stats
 
     def _load_system_prompt(self) -> str:
         """Load unified system prompt with per-tenant personalization.
@@ -4118,7 +4208,17 @@ class YandexGPTHandler:
                 picturetype=1,  # Fix R7: всегда 250px для качественных фото
                 currency=args.get("currency", 0)
             )
-            
+
+            # ── Post-annotate: mark tours with possible flight surcharge (opt-in) ──
+            _wc_hot = getattr(self.runtime_config, "widget_config", None) or {}
+            _hot_warn_enabled = bool(_wc_hot.get("warn_regular_hot_tours"))
+            if _hot_warn_enabled:
+                tours, _annot_stats = await self._annotate_hot_tours(tours)
+                logger.info(
+                    "🔥 HOT-WARN company=%s stats=%s",
+                    getattr(self.runtime_config, "company_name", "?"), _annot_stats
+                )
+
             # ── Safety-net: 0 результатов — честный ответ ──
             if not tours:
                 self._pending_tour_cards = []
@@ -4166,7 +4266,9 @@ class YandexGPTHandler:
                     "meal": t.get("meal"),
                     "tourid": t.get("tourid"),
                     "picturelink": picture if has_real_photo else None,  # Только реальные фото
-                    "fulldesclink": t.get("fulldesclink")  # Ссылка
+                    "fulldesclink": t.get("fulldesclink"),  # Ссылка
+                    # Pass-through from _annotate_hot_tours (if applied)
+                    "_may_have_flight_surcharge": t.get("_may_have_flight_surcharge"),
                 })
             
             # ── Строим tour_cards для нового фронтенда ──
