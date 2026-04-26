@@ -2958,36 +2958,44 @@ class YandexGPTHandler:
 
             self._metrics["total_searches"] += 1
             self._apply_tenant_search_filters(args)
-            request_id = await self.tourvisor.search_tours(
-                departure=args.get("departure"),
-                country=args.get("country"),
-                date_from=args.get("datefrom"),
-                date_to=args.get("dateto"),
-                nights_from=args.get("nightsfrom", 7),
-                nights_to=args.get("nightsto", 10),
-                adults=args.get("adults", 2),
-                children=args.get("child", 0),
-                child_ages=[args.get(f"childage{i}") for i in [1,2,3] if args.get(f"childage{i}")],
-                stars=args.get("stars"),
-                meal=args.get("meal"),
-                rating=args.get("rating"),
-                hotels=args.get("hotels"),
-                regions=args.get("regions"),
-                subregions=args.get("subregions"),
-                operators=args.get("operators"),
-                price_from=args.get("pricefrom"),
-                price_to=args.get("priceto"),
-                hotel_types=args.get("hoteltypes"),
-                services=args.get("services"),
-                onrequest=args.get("onrequest"),
-                directflight=args.get("directflight"),
-                flightclass=args.get("flightclass"),
-                currency=args.get("currency"),
-                pricetype=args.get("pricetype"),
-                starsbetter=args.get("starsbetter"),
-                mealbetter=args.get("mealbetter"),
-                hideregular=args.get("hideregular")
-            )
+
+            # Готовим именованные kwargs для tourvisor.search_tours (имена в API клиенте
+            # отличаются от LLM-args). Сохраняем эту dict в self._last_full_search_args,
+            # чтобы AUTO-RETRY GDS мог переиспользовать те же параметры с hideregular=0.
+            _tv_kwargs = {
+                "departure": args.get("departure"),
+                "country": args.get("country"),
+                "date_from": args.get("datefrom"),
+                "date_to": args.get("dateto"),
+                "nights_from": args.get("nightsfrom", 7),
+                "nights_to": args.get("nightsto", 10),
+                "adults": args.get("adults", 2),
+                "children": args.get("child", 0),
+                "child_ages": [args.get(f"childage{i}") for i in [1, 2, 3] if args.get(f"childage{i}")],
+                "stars": args.get("stars"),
+                "meal": args.get("meal"),
+                "rating": args.get("rating"),
+                "hotels": args.get("hotels"),
+                "regions": args.get("regions"),
+                "subregions": args.get("subregions"),
+                "operators": args.get("operators"),
+                "price_from": args.get("pricefrom"),
+                "price_to": args.get("priceto"),
+                "hotel_types": args.get("hoteltypes"),
+                "services": args.get("services"),
+                "onrequest": args.get("onrequest"),
+                "directflight": args.get("directflight"),
+                "flightclass": args.get("flightclass"),
+                "currency": args.get("currency"),
+                "pricetype": args.get("pricetype"),
+                "starsbetter": args.get("starsbetter"),
+                "mealbetter": args.get("mealbetter"),
+                "hideregular": args.get("hideregular"),
+            }
+            self._last_full_search_args = dict(_tv_kwargs)
+            self._gds_retry_done = False  # сбрасываем флаг: каждый новый search_tours имеет право на 1 retry
+
+            request_id = await self.tourvisor.search_tours(**_tv_kwargs)
             
             if request_id is None:
                 return {
@@ -3105,6 +3113,82 @@ class YandexGPTHandler:
                     # Проверяем есть ли результаты
                     hotels_found = last_status.get("hotelsfound", 0)
                     tours_found = last_status.get("toursfound", 0)
+
+                    # ════════════════════════════════════════════════════════════
+                    # AUTO-RETRY GDS: если у tenant включён hide_gds=true и первый
+                    # поиск с hideregular=1 (forced backend'ом) дал 0 результатов —
+                    # автоматически повторяем с hideregular=0 (направление без чартеров,
+                    # например Мальдивы). LLM не видит промежуточного 0 — получает
+                    # сразу финальный результат с _warning о возможных доплатах.
+                    # ════════════════════════════════════════════════════════════
+                    if (
+                        (hotels_found == 0 or tours_found == 0)
+                        and not getattr(self, "_gds_retry_done", False)
+                        and self._last_search_params.get("_hideregular") == 1
+                    ):
+                        _wc = getattr(self.runtime_config, "widget_config", None) or {}
+                        if _wc.get("hide_gds"):
+                            self._gds_retry_done = True
+                            logger.info(
+                                "✈️ AUTO-RETRY GDS: 0 results with hideregular=1 → retrying with hideregular=0"
+                            )
+                            try:
+                                _retry_kwargs = dict(getattr(self, "_last_full_search_args", {}))
+                                _retry_kwargs["hideregular"] = 0  # явный override
+
+                                _new_request_id = await self.tourvisor.search_tours(**_retry_kwargs)
+                                if _new_request_id:
+                                    logger.info(
+                                        "✈️ AUTO-RETRY GDS: new request_id=%s, polling up to 60s",
+                                        _new_request_id,
+                                    )
+                                    # Запоминаем remap: если LLM позже вызовет get_search_results
+                                    # со старым requestid (без AUTO-RETRY), мы подменим на новый.
+                                    if not hasattr(self, "_gds_retry_remap"):
+                                        self._gds_retry_remap = {}
+                                    self._gds_retry_remap[str(request_id)] = str(_new_request_id)
+                                    self._last_requestid = str(_new_request_id)
+                                    self._last_search_params["_hideregular"] = 0
+                                    request_id = str(_new_request_id)
+
+                                    # Inline polling — тот же таймаут что и у основного цикла
+                                    _retry_status = {}
+                                    for _ in range(20):
+                                        await asyncio.sleep(3)
+                                        _retry_status = await self.tourvisor.get_search_status(_new_request_id)
+                                        _retry_state = _retry_status.get("state")
+                                        _retry_hf = _retry_status.get("hotelsfound", 0)
+                                        if _retry_state == "finished":
+                                            break
+                                        if _retry_hf >= 3:
+                                            break
+
+                                    # Подменяем переменные внешнего scope, чтобы дальше
+                                    # код пошёл по существующим веткам (success / 0-results)
+                                    last_status = _retry_status
+                                    hotels_found = _retry_status.get("hotelsfound", 0)
+                                    tours_found = _retry_status.get("toursfound", 0)
+
+                                    if hotels_found > 0:
+                                        # Успех! Добавим warning о доплатах для LLM/клиента
+                                        last_status["_warning"] = (
+                                            "Туры могут быть с регулярными рейсами — у некоторых возможны "
+                                            "доплаты при актуализации цены. Перед оформлением рекомендуется "
+                                            "actualize_tour для проверки итоговой стоимости."
+                                        )
+                                        logger.info(
+                                            "✈️ AUTO-RETRY GDS: SUCCESS — %d hotels, %d tours",
+                                            hotels_found, tours_found,
+                                        )
+                                    else:
+                                        logger.info(
+                                            "✈️ AUTO-RETRY GDS: still 0 results — fall through to standard 0-result handling"
+                                        )
+                            except Exception as _re:
+                                logger.warning("✈️ AUTO-RETRY GDS failed: %s", _re, exc_info=True)
+                    # ════════════════════════════════════════════════════════════
+                    # END AUTO-RETRY GDS
+                    # ════════════════════════════════════════════════════════════
 
                     if hotels_found == 0 or tours_found == 0:
                         _dep_code = self._last_search_params.get("departure")
@@ -3310,6 +3394,18 @@ class YandexGPTHandler:
                 else:
                     return {"hotels_found": 0, "tours_found": 0, "hotels": [],
                             "error": f"⛔ НЕВЕРНЫЙ requestid: '{_rid}'. Сначала вызови search_tours для получения числового requestid."}
+
+            # ── AUTO-RETRY GDS REMAP: если LLM передаёт устаревший requestid, который был
+            # подменён auto-retry'ем — используем новый из remap-таблицы. Это исключает
+            # ситуацию когда LLM получила hotels=0/tours=0 потому что обращается к старому ID.
+            _remap = getattr(self, "_gds_retry_remap", {})
+            _orig_rid = str(args.get("requestid", ""))
+            if _orig_rid in _remap and _orig_rid != _remap[_orig_rid]:
+                logger.info(
+                    "✈️ AUTO-RETRY GDS REMAP: get_search_results requestid %s → %s",
+                    _orig_rid, _remap[_orig_rid],
+                )
+                args["requestid"] = _remap[_orig_rid]
             
             _pool_size = 30 if self._ideal_datefrom else 10
             _actual_per_page = max(int(args.get("onpage", _pool_size)), _pool_size)
