@@ -686,6 +686,97 @@ def check_conversation_booking_intent(user_messages: list) -> bool:
     return any(has_booking_intent(msg) for msg in user_messages if msg)
 
 
+def _valid_ip(raw: str) -> str:
+    value = (raw or "").strip()
+    if not value:
+        return ""
+    if value.startswith("[") and "]" in value:
+        value = value[1:value.index("]")]
+    elif value.count(":") == 1 and "." in value:
+        value = value.rsplit(":", 1)[0]
+    try:
+        ipaddress.ip_address(value)
+        return value
+    except ValueError:
+        return ""
+
+
+def _client_ip() -> str:
+    """Return the best client IP available for logging/analytics.
+
+    ProxyFix already rewrites request.remote_addr for normal nginx traffic.
+    If a request reaches the container directly from the Docker gateway, use
+    proxy headers when present; otherwise we can only record the gateway IP.
+    """
+    remote = _valid_ip(request.remote_addr or "")
+    if remote and not (remote.startswith("172.") or remote in ("127.0.0.1", "::1")):
+        return remote
+
+    for header_name in ("X-Real-IP", "CF-Connecting-IP", "X-Forwarded-For"):
+        raw = request.headers.get(header_name, "")
+        if header_name == "X-Forwarded-For":
+            candidates = [part.strip() for part in raw.split(",")]
+        else:
+            candidates = [raw]
+        for candidate in candidates:
+            ip = _valid_ip(candidate)
+            if ip:
+                return ip
+    return remote or "unknown"
+
+
+def _client_user_agent() -> str:
+    return (request.headers.get("User-Agent") or "")[:500]
+
+
+def _device_label(user_agent: str) -> str:
+    ua = (user_agent or "").lower()
+    if not ua:
+        return "unknown"
+    if "curl/" in ua:
+        return "script/curl"
+    if "python-httpx" in ua or "python-requests" in ua:
+        return "script/python"
+    if "bot" in ua or "crawler" in ua or "spider" in ua:
+        return "bot"
+
+    if "iphone" in ua:
+        os_name, device = "iOS", "mobile"
+    elif "ipad" in ua:
+        os_name, device = "iPadOS", "tablet"
+    elif "android" in ua:
+        os_name = "Android"
+        device = "mobile" if "mobile" in ua else "tablet"
+    elif "windows" in ua:
+        os_name, device = "Windows", "desktop"
+    elif "mac os x" in ua or "macintosh" in ua:
+        os_name, device = "macOS", "desktop"
+    elif "linux" in ua:
+        os_name, device = "Linux", "desktop"
+    else:
+        os_name, device = "unknown", "unknown"
+
+    browser = "browser"
+    if "edg/" in ua:
+        browser = "Edge"
+    elif "opr/" in ua or "opera" in ua:
+        browser = "Opera"
+    elif "firefox/" in ua:
+        browser = "Firefox"
+    elif "chrome/" in ua or "crios/" in ua:
+        browser = "Chrome"
+    elif "safari/" in ua:
+        browser = "Safari"
+    return f"{device}/{os_name}/{browser}"
+
+
+def _request_origin_label() -> str:
+    origin = (request.headers.get("Origin") or "").strip()
+    referer = (request.headers.get("Referer") or "").strip()
+    host = (request.headers.get("Host") or "").strip()
+    return origin or referer or host or "-"
+
+
 # === DB LOGGING (полный путь диалога для аналитики и личного кабинета) ===
 
 def _log_chat_to_db(session_id: str, user_message: str, reply: str,
@@ -735,8 +826,8 @@ def _log_chat_to_db(session_id: str, user_message: str, reply: str,
                 ua = user_agent
                 if ip_addr is None:
                     try:
-                        ip_addr = request.remote_addr
-                        ua = request.headers.get('User-Agent', '')[:500]
+                        ip_addr = _client_ip()
+                        ua = _client_user_agent()
                     except RuntimeError:
                         pass
                 conv = Conversation(
@@ -1044,7 +1135,7 @@ _DASHBOARD_DIR = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__
 
 def _is_internal_request() -> bool:
     """Check if request comes from localhost or Docker internal network."""
-    ip = request.remote_addr or ""
+    ip = _client_ip()
     return ip in ("127.0.0.1", "::1", "172.18.0.1") or ip.startswith("172.") or ip.startswith("10.")
 
 
@@ -1297,12 +1388,27 @@ def _log_request_start():
     _init_infrastructure()
     g._req_start = time.perf_counter()
     g.request_id = uuid.uuid4().hex[:8]
-    logger.info("-> %s %s rid=%s ip=%s", request.method, request.path, g.request_id, request.remote_addr)
+    g.client_ip = _client_ip()
+    g.user_agent = _client_user_agent()
+    g.device_label = _device_label(g.user_agent)
+    g.origin_label = _request_origin_label()
+    logger.info(
+        "-> %s %s rid=%s client_ip=%s remote_ip=%s device=%s origin=%s xff=%s ua=%s",
+        request.method,
+        request.path,
+        g.request_id,
+        g.client_ip,
+        request.remote_addr,
+        g.device_label,
+        g.origin_label,
+        request.headers.get("X-Forwarded-For", "-"),
+        g.user_agent[:120] or "-",
+    )
 
     try:
         from cache import rate_limit_check
         from config import settings
-        ip = request.remote_addr or "unknown"
+        ip = getattr(g, "client_ip", None) or _client_ip()
 
         if request.path in ('/api/auth/login', '/api/auth/refresh'):
             auth_key = f"rl:auth:{ip}:{int(time.time()) // 300}"
@@ -1446,6 +1552,7 @@ def chat():
         _log_chat_to_db(session_id, message, response, tour_cards,
                         _latency_ms, model_name=getattr(handler, 'model', 'unknown'),
                         llm_provider=getattr(getattr(handler, 'runtime_config', None), 'llm_provider', _llm_provider),
+                        ip_address=getattr(g, "client_ip", None), user_agent=getattr(g, "user_agent", None),
                         history_snapshot=_new_entries,
                         assistant_id=assistant_id,
                         search_result=getattr(handler, '_last_search_result', None),
@@ -1620,6 +1727,7 @@ def chat_v1():
         _log_chat_to_db(session_id, message, reply, tour_cards, _latency_ms,
                         model_name=getattr(handler, 'model', 'unknown'),
                         llm_provider=getattr(getattr(handler, 'runtime_config', None), 'llm_provider', _llm_provider),
+                        ip_address=getattr(g, "client_ip", None), user_agent=getattr(g, "user_agent", None),
                         history_snapshot=_new_entries,
                         assistant_id=assistant_id,
                         search_result=getattr(handler, '_last_search_result', None),
@@ -1678,8 +1786,8 @@ def chat_stream():
     _write_dialogue_log(session_id, "USER", message)
     
     handler = get_handler(session_id, assistant_id=_stream_assistant_id)
-    _stream_ip = request.remote_addr
-    _stream_ua = request.headers.get('User-Agent', '')[:500]
+    _stream_ip = getattr(g, "client_ip", None) or _client_ip()
+    _stream_ua = getattr(g, "user_agent", None) or _client_user_agent()
     _stream_start = time.perf_counter()
     log(f"📊 Модель: {handler.model}", "INFO")
     log(f"📊 История: {len(handler.input_list)} сообщений", "INFO")
