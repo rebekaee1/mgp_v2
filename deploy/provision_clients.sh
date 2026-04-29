@@ -11,14 +11,15 @@ set -euo pipefail
 #   - Containers rebuilt (docker compose up -d --build)
 #
 # Usage:
-#   ./deploy/provision_clients.sh [shelkovo|krasnogorsk|all]
+#   ./deploy/provision_clients.sh [shelkovo|krasnogorsk|vyhino|all]
 #
 # What it does for each company:
 #   1. Runs Alembic migration (adds uon_api_key/uon_source columns if missing)
 #   2. Creates Company + User + Assistant via CLI
 #   3. Updates widget_config JSON with full personalization
-#   4. Sets U-ON CRM API key (Krasnogorsk) or prints instructions (Shelkovo)
-#   5. Loads custom FAQ from clients/<slug>/faq.md
+#   4. Sets U-ON CRM API key (Krasnogorsk, Vyhino) or prints instructions (Shelkovo)
+#   5. Loads custom FAQ from clients/<slug>/faq.md (Shelkovo, Krasnogorsk only;
+#      Vyhino uses the common faq.md without override, like Kirishi/Tambov)
 # ============================================================================
 
 ROOT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
@@ -215,6 +216,76 @@ provision_krasnogorsk() {
     echo ""
 }
 
+# ── Vyhino ────────────────────────────────────────────────────────────────────
+
+provision_vyhino() {
+    log "════════════════════════════════════════════════"
+    log "  Provisioning: МГП Выхино"
+    log "════════════════════════════════════════════════"
+
+    local EXISTING_AID
+    EXISTING_AID=$(get_assistant_id "mgp-vyhino" 2>/dev/null || true)
+
+    if [ -n "$EXISTING_AID" ]; then
+        log "Company mgp-vyhino already exists (assistant: $EXISTING_AID) — updating config"
+    else
+        local PASSWORD
+        PASSWORD=$(openssl rand -base64 12)
+
+        log "Creating company + user + assistant..."
+        run_cli create-user \
+            --email "Mgp-vyhino@mail.ru" \
+            --password "${PASSWORD}" \
+            --company "МГП Выхино" \
+            --slug "mgp-vyhino" \
+            --assistant-name "МГП Выхино AI Assistant" \
+            --widget-title "Горящие туры" \
+            --widget-subtitle "Турагентство" \
+            --widget-primary-color "#E30613" \
+            --uon-api-key "Hy7CFjPZ28akdnr5V09M1777458672" \
+            --uon-source "AI-Ассистент" \
+            --role admin
+
+        log "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        log "📋 CREDENTIALS (save now!):"
+        log "   Email:    Mgp-vyhino@mail.ru"
+        log "   Password: ${PASSWORD}"
+        log "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    fi
+
+    local ASSISTANT_ID
+    ASSISTANT_ID=$(get_assistant_id "mgp-vyhino")
+    [ -n "$ASSISTANT_ID" ] || err "Failed to find assistant for mgp-vyhino"
+    log "Assistant ID: ${ASSISTANT_ID}"
+
+    log "Setting widget_config personalization..."
+    update_widget_config "$ASSISTANT_ID" '{
+        "title": "Горящие туры",
+        "subtitle": "Турагентство",
+        "primary_color": "#E30613",
+        "welcome_message": "👋 Здравствуйте! Я — ИИ-ассистент туристического агентства.\n\nЯ помогу вам:\n• 🔍 Подобрать тур по вашим параметрам\n• 🔥 Найти горящие предложения\n• ❓ Ответить на вопросы о визах, оплате, документах\n\nКуда бы вы хотели поехать?",
+        "company_name": "Горящие туры (МГП Выхино)",
+        "website": "https://mgp-volna.ru",
+        "booking_base_url": "https://mgp-volna.ru",
+        "contact_phone": "+7 916 168-47-10",
+        "office_address": "г. Москва, ул. Вешняковская, д. 20Б. Режим работы: Пн-Пт 10:00-20:00, Сб 10:00-18:00, Вс выходной"
+    }'
+
+    log "Setting allowed_domains..."
+    run_sql "UPDATE assistants SET allowed_domains = 'mgp-volna.ru,www.mgp-volna.ru' WHERE id = '${ASSISTANT_ID}';"
+
+    log "Ensuring U-ON CRM credentials (per-tenant Vyhino key)..."
+    run_sql "UPDATE assistants SET uon_api_key = 'Hy7CFjPZ28akdnr5V09M1777458672', uon_source = 'AI-Ассистент' WHERE id = '${ASSISTANT_ID}';"
+
+    log "Note: Vyhino uses common faq.md (no per-tenant FAQ override) — like Кириши/Тамбов"
+
+    log ""
+    log "✅ МГП Выхино — provisioned (assistant: ${ASSISTANT_ID})"
+    log "   U-ON API key: Hy7CFjPZ28akdnr5V09M1777458672 (set, per-tenant)"
+    log "   ⚠️  Verify U-ON whitelist for this server's IP (POST + GET) for the Vyhino key"
+    echo ""
+}
+
 # ── Alembic migration ─────────────────────────────────────────────────────────
 
 run_migration() {
@@ -238,10 +309,15 @@ case "${1:-all}" in
         run_migration
         provision_krasnogorsk
         ;;
+    vyhino)
+        run_migration
+        provision_vyhino
+        ;;
     all)
         run_migration
         provision_shelkovo
         provision_krasnogorsk
+        provision_vyhino
         echo ""
         log "════════════════════════════════════════════════"
         log "  ALL CLIENTS PROVISIONED"
@@ -258,28 +334,35 @@ case "${1:-all}" in
         log "2. [Красногорск] Verify U-ON IP whitelist:"
         log "   - Ensure server IP is allowed for key ghh8Fw63d4lY9J5ZNy6M"
         log ""
-        log "3. LK setup (lk.navilet.ru) — for each company:"
-        log "   - Create widget linked to assistant_id"
-        log "   - Enable pre-chat start form (name + phone)"
+        log "3. [Выхино] Verify U-ON IP whitelist + activate POST/GET:"
+        log "   - Log into Vyhino's U-ON, Settings > Integrations > API"
+        log "   - Activate POST and GET methods for key Hy7CFjPZ28akdnr5V09M1777458672"
+        log "   - Add server IP to U-ON whitelist"
+        log ""
+        log "4. LK setup (lk.navilet.ru) — for each company:"
+        log "   - Create widget linked to assistant_id (same UUID as in MGP DB)"
+        log "   - Enable pre-chat start form (name + phone) where requested"
         log "   - Set allowed_domains"
         log ""
-        log "4. Embed code — install on client websites:"
+        log "5. Embed code — install on client websites:"
         log "   - c-mgp.ru (Щёлково)"
         log "   - mgput.ru (Красногорск)"
+        log "   - mgp-volna.ru (Выхино)"
         log ""
-        log "5. Test full flow for each company:"
+        log "6. Test full flow for each company:"
         log "   - Widget opens with correct branding"
         log "   - Start form collects name + phone"
         log "   - Tour search works, booking links go to correct site"
         log "   - CRM lead created in correct U-ON instance"
         ;;
     *)
-        echo "Usage: $0 [shelkovo|krasnogorsk|all]"
+        echo "Usage: $0 [shelkovo|krasnogorsk|vyhino|all]"
         echo ""
         echo "Options:"
         echo "  shelkovo     — provision МГП Щёлково only"
         echo "  krasnogorsk  — provision МГП Красногорск only"
-        echo "  all          — provision both (default)"
+        echo "  vyhino       — provision МГП Выхино only"
+        echo "  all          — provision all three (default)"
         exit 1
         ;;
 esac
