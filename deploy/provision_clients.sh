@@ -11,15 +11,15 @@ set -euo pipefail
 #   - Containers rebuilt (docker compose up -d --build)
 #
 # Usage:
-#   ./deploy/provision_clients.sh [shelkovo|krasnogorsk|vyhino|all]
+#   ./deploy/provision_clients.sh [shelkovo|krasnogorsk|vyhino|belgorod|all]
 #
 # What it does for each company:
 #   1. Runs Alembic migration (adds uon_api_key/uon_source columns if missing)
 #   2. Creates Company + User + Assistant via CLI
 #   3. Updates widget_config JSON with full personalization
-#   4. Sets U-ON CRM API key (Krasnogorsk, Vyhino) or prints instructions (Shelkovo)
+#   4. Sets U-ON CRM API key (Krasnogorsk, Vyhino, Belgorod) or prints instructions (Shelkovo)
 #   5. Loads custom FAQ from clients/<slug>/faq.md (Shelkovo, Krasnogorsk only;
-#      Vyhino uses the common faq.md without override, like Kirishi/Tambov)
+#      Vyhino, Belgorod use the common faq.md without override, like Kirishi/Tambov)
 # ============================================================================
 
 ROOT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
@@ -286,6 +286,76 @@ provision_vyhino() {
     echo ""
 }
 
+# ── Belgorod ──────────────────────────────────────────────────────────────────
+
+provision_belgorod() {
+    log "════════════════════════════════════════════════"
+    log "  Provisioning: МГП Белгород"
+    log "════════════════════════════════════════════════"
+
+    local EXISTING_AID
+    EXISTING_AID=$(get_assistant_id "mgp-belgorod" 2>/dev/null || true)
+
+    if [ -n "$EXISTING_AID" ]; then
+        log "Company mgp-belgorod already exists (assistant: $EXISTING_AID) — updating config"
+    else
+        local PASSWORD
+        PASSWORD=$(openssl rand -base64 12)
+
+        log "Creating company + user + assistant..."
+        run_cli create-user \
+            --email "Belg@mgp.ru" \
+            --password "${PASSWORD}" \
+            --company "МГП Белгород" \
+            --slug "mgp-belgorod" \
+            --assistant-name "МГП Белгород AI Assistant" \
+            --widget-title "Горящие туры" \
+            --widget-subtitle "Турагентство" \
+            --widget-primary-color "#E30613" \
+            --uon-api-key "DkRQ339sbeWQdU92P8tv1777547148" \
+            --uon-source "AI-Ассистент" \
+            --role admin
+
+        log "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        log "📋 CREDENTIALS (save now!):"
+        log "   Email:    Belg@mgp.ru"
+        log "   Password: ${PASSWORD}"
+        log "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    fi
+
+    local ASSISTANT_ID
+    ASSISTANT_ID=$(get_assistant_id "mgp-belgorod")
+    [ -n "$ASSISTANT_ID" ] || err "Failed to find assistant for mgp-belgorod"
+    log "Assistant ID: ${ASSISTANT_ID}"
+
+    log "Setting widget_config personalization..."
+    update_widget_config "$ASSISTANT_ID" '{
+        "title": "Горящие туры",
+        "subtitle": "Турагентство",
+        "primary_color": "#E30613",
+        "welcome_message": "👋 Здравствуйте! Я — ИИ-ассистент туристического агентства.\n\nЯ помогу вам:\n• 🔍 Подобрать тур по вашим параметрам\n• 🔥 Найти горящие предложения\n• ❓ Ответить на вопросы о визах, оплате, документах\n\nКуда бы вы хотели поехать?",
+        "company_name": "Горящие туры (МГП Белгород)",
+        "website": "https://mgp-belgorod.ru",
+        "booking_base_url": "https://mgp-belgorod.ru",
+        "contact_phone": "+7 910 741-57-00",
+        "office_address": "г. Белгород, ул. Щорса, д. 64, ТЦ \"Ситимолл\". Режим работы: ежедневно 10:00-22:00"
+    }'
+
+    log "Setting allowed_domains..."
+    run_sql "UPDATE assistants SET allowed_domains = 'mgp-belgorod.ru,www.mgp-belgorod.ru' WHERE id = '${ASSISTANT_ID}';"
+
+    log "Ensuring U-ON CRM credentials (per-tenant Belgorod key)..."
+    run_sql "UPDATE assistants SET uon_api_key = 'DkRQ339sbeWQdU92P8tv1777547148', uon_source = 'AI-Ассистент' WHERE id = '${ASSISTANT_ID}';"
+
+    log "Note: Belgorod uses common faq.md (no per-tenant FAQ override) — like Vyhino/Kirishi/Tambov"
+
+    log ""
+    log "✅ МГП Белгород — provisioned (assistant: ${ASSISTANT_ID})"
+    log "   U-ON API key: DkRQ339sbeWQdU92P8tv1777547148 (set, per-tenant)"
+    log "   ⚠️  Verify U-ON whitelist for this server's IP (POST + GET) for the Belgorod key"
+    echo ""
+}
+
 # ── Alembic migration ─────────────────────────────────────────────────────────
 
 run_migration() {
@@ -313,11 +383,16 @@ case "${1:-all}" in
         run_migration
         provision_vyhino
         ;;
+    belgorod)
+        run_migration
+        provision_belgorod
+        ;;
     all)
         run_migration
         provision_shelkovo
         provision_krasnogorsk
         provision_vyhino
+        provision_belgorod
         echo ""
         log "════════════════════════════════════════════════"
         log "  ALL CLIENTS PROVISIONED"
@@ -339,30 +414,37 @@ case "${1:-all}" in
         log "   - Activate POST and GET methods for key Hy7CFjPZ28akdnr5V09M1777458672"
         log "   - Add server IP to U-ON whitelist"
         log ""
-        log "4. LK setup (lk.navilet.ru) — for each company:"
+        log "4. [Белгород] Verify U-ON IP whitelist + activate POST/GET:"
+        log "   - Log into Belgorod's U-ON, Settings > Integrations > API"
+        log "   - Activate POST and GET methods for key DkRQ339sbeWQdU92P8tv1777547148"
+        log "   - Add server IPs to U-ON whitelist (72.56.88.193 + 5.129.202.189)"
+        log ""
+        log "5. LK setup (lk.navilet.ru) — for each company:"
         log "   - Create widget linked to assistant_id (same UUID as in MGP DB)"
         log "   - Enable pre-chat start form (name + phone) where requested"
         log "   - Set allowed_domains"
         log ""
-        log "5. Embed code — install on client websites:"
+        log "6. Embed code — install on client websites:"
         log "   - c-mgp.ru (Щёлково)"
         log "   - mgput.ru (Красногорск)"
         log "   - mgp-volna.ru (Выхино)"
+        log "   - mgp-belgorod.ru (Белгород)"
         log ""
-        log "6. Test full flow for each company:"
+        log "7. Test full flow for each company:"
         log "   - Widget opens with correct branding"
         log "   - Start form collects name + phone"
         log "   - Tour search works, booking links go to correct site"
         log "   - CRM lead created in correct U-ON instance"
         ;;
     *)
-        echo "Usage: $0 [shelkovo|krasnogorsk|vyhino|all]"
+        echo "Usage: $0 [shelkovo|krasnogorsk|vyhino|belgorod|all]"
         echo ""
         echo "Options:"
         echo "  shelkovo     — provision МГП Щёлково only"
         echo "  krasnogorsk  — provision МГП Красногорск only"
         echo "  vyhino       — provision МГП Выхино only"
-        echo "  all          — provision all three (default)"
+        echo "  belgorod     — provision МГП Белгород only"
+        echo "  all          — provision all four (default)"
         exit 1
         ;;
 esac
