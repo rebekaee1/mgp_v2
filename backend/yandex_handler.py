@@ -43,6 +43,55 @@ _CYR_TO_LAT = {
 }
 _CYR_TO_LAT_ALT = {**_CYR_TO_LAT, 'ф': 'ph', 'х': 'kh'}
 
+# ── Feature: "Статус заявки" (get_client_request_status) ──────────────────
+# Tenants where this feature is enabled. Whitelist by company_slug.
+# Локальный тест: добавляем mgp-tour и LK-канал основного офиса.
+# Для других компаний tool отдаёт redirect_to_manager и LLM зовёт менеджера.
+_STATUS_LOOKUP_ALLOWED_SLUGS = {
+    "mgp-tour",
+    "lk-prodlike-1773077586",
+}
+
+# Финальные негативные/закрытые статусы — клиенту НЕ показываем,
+# отдаём общий redirect к менеджеру. Слова сравниваются нечувствительно к регистру.
+_STATUS_LOOKUP_CLOSED_NAMES = {
+    "отказ",
+    "отказано",
+    "закрыта",
+    "закрыто",
+    "закрытая",
+    "отменена",
+    "отменено",
+    "отмена",
+    "не интересно",
+    "дубль",
+    "спам",
+    "архив",
+}
+
+# Лимит вызовов tool на одну conversation — защита от циклов LLM и DoS U-ON.
+_STATUS_LOOKUP_MAX_CALLS = 3
+# Лимит неуспешных попыток верификации; после этого — soft-fail к менеджеру.
+_STATUS_LOOKUP_MAX_VERIFY_ATTEMPTS = 2
+
+# Поля U-ON, которые tool ВОЗВРАЩАЕТ LLM. Любые PII (паспорт, email, ДР, адрес,
+# номер карты, заметки менеджера) НИКОГДА не должны попадать в LLM-контекст.
+_STATUS_LOOKUP_ALLOWED_REQUEST_FIELDS = {
+    "id",
+    "status_name",
+    "status",
+    "created_at",
+    "date_create",
+}
+
+
+def _normalize_name_for_compare(name: str) -> str:
+    """Lower + trim + collapse spaces + ё→е. Для нечёткой сверки имени с CRM."""
+    if not name:
+        return ""
+    s = str(name).lower().strip().replace("ё", "е")
+    return re.sub(r"\s+", " ", s)
+
 
 def _transliterate(text: str, mapping: dict = None) -> str:
     """Cyrillic → Latin transliteration optimised for hotel name matching."""
@@ -1453,6 +1502,11 @@ class YandexGPTHandler:
         self.uon_client = UONClient(runtime_config=runtime_config)
         self._crm_submitted: Optional[Dict] = None  # dedup guard: {phone, email, type}
         self._tour_actualized_id: Optional[str] = None  # tourid explicitly actualized by LLM
+
+        # ── Feature "Статус заявки" — session state ──
+        self._status_lookup_calls: int = 0          # счётчик вызовов tool за сессию
+        self._status_lookup_attempts: int = 0       # неуспешные попытки верификации (mismatch имени)
+        self._status_lookup_verified_uid: Optional[int] = None  # u_id после успешной верификации
         
         # ── Прогрессивный "ближайший вылет": счётчик попыток и последняя страна ──
         self._nearest_search_attempt: int = 0
@@ -4622,7 +4676,10 @@ class YandexGPTHandler:
         
         elif name == "submit_client_request":
             return await self._handle_submit_client_request(args)
-        
+
+        elif name == "get_client_request_status":
+            return await self._handle_get_client_request_status(args)
+
         else:
             return {"error": f"Неизвестная функция: {name}"}
     
@@ -4817,6 +4874,207 @@ class YandexGPTHandler:
             name, phone, email, note,
             price=price, date_begin=date_begin, date_end=date_end,
         )
+
+    # ── Feature: "Статус заявки клиента" ─────────────────────────────────
+
+    async def _handle_get_client_request_status(self, args: Dict) -> Dict:
+        """Узнать статус существующей заявки клиента в U-ON CRM.
+
+        Возвращает один из вариантов (LLM получает только эти поля):
+          {"status": "ok", "requests": [{"id": 13122, "status": "В работе"}, ...]}
+          {"status": "ask_more", "missing": "client_name" | "client_phone"}
+          {"status": "redirect_to_manager", "manager_phone": "+7..."}
+
+        Никогда не возвращает PII (паспорт/ДР/email/адрес/заметки),
+        никогда не произносит слова "отказ"/"закрыта"/"отменена".
+        """
+        manager_phone = self._get_manager_phone()
+        redirect_payload = {
+            "status": "redirect_to_manager",
+            "manager_phone": manager_phone,
+            "message": (
+                "Скажи клиенту, что для уточнения статуса по его заявке нужно "
+                f"связаться с менеджером по телефону {manager_phone}. "
+                "НЕ произноси слова 'отказ', 'отменено', 'закрыто' и не сообщай, "
+                "что мы 'не нашли' клиента в базе — только нейтральная "
+                "формулировка про менеджера."
+            ),
+        }
+
+        # ── 1. Tenant guard ──
+        slug = (getattr(self.runtime_config, "company_slug", None) or "").strip().lower()
+        if slug not in _STATUS_LOOKUP_ALLOWED_SLUGS:
+            logger.info(
+                "STATUS-LOOKUP: tenant '%s' not in allowed list — redirect_to_manager",
+                slug or "<unknown>",
+            )
+            return redirect_payload
+
+        # ── 2. Rate limit (per session) ──
+        self._status_lookup_calls += 1
+        if self._status_lookup_calls > _STATUS_LOOKUP_MAX_CALLS:
+            logger.warning(
+                "STATUS-LOOKUP: rate limit exceeded (%d calls) for slug=%s",
+                self._status_lookup_calls, slug,
+            )
+            return redirect_payload
+
+        # ── 3. Validate input ──
+        client_name = (args.get("client_name") or "").strip()
+        client_phone = (args.get("client_phone") or "").strip()
+        if not client_phone:
+            return {"status": "ask_more", "missing": "client_phone"}
+        if not client_name:
+            return {"status": "ask_more", "missing": "client_name"}
+
+        digits = re.sub(r"\D", "", client_phone)
+        if len(digits) < 10 or len(digits) > 12:
+            return {"status": "ask_more", "missing": "client_phone"}
+
+        # ── 4. Lookup user in U-ON ──
+        try:
+            user_resp = await self.uon_client.get_user_by_phone(client_phone)
+        except Exception as exc:
+            logger.error("STATUS-LOOKUP: get_user_by_phone failed: %s", exc, exc_info=True)
+            return redirect_payload
+
+        if not user_resp.get("ok"):
+            logger.info("STATUS-LOOKUP: user not found by phone (%s) — redirect", user_resp.get("error"))
+            return redirect_payload
+
+        users = user_resp.get("users") or []
+        if not users:
+            logger.info("STATUS-LOOKUP: no users for phone — redirect")
+            return redirect_payload
+
+        # Если уже верифицировались в этой же сессии — пропустим сверку имени.
+        match_user: Optional[Dict] = None
+        if self._status_lookup_verified_uid is not None:
+            for u in users:
+                if str(u.get("u_id") or u.get("id")) == str(self._status_lookup_verified_uid):
+                    match_user = u
+                    break
+
+        # ── 5. Verify name (если ещё не верифицировались) ──
+        if match_user is None:
+            normalized_name = _normalize_name_for_compare(client_name)
+            for u in users:
+                u_name = _normalize_name_for_compare(u.get("u_name") or "")
+                u_surname = _normalize_name_for_compare(u.get("u_surname") or "")
+                if not normalized_name:
+                    break
+                if (
+                    (u_name and normalized_name in u_name)
+                    or (u_name and u_name in normalized_name)
+                    or (u_surname and normalized_name in u_surname)
+                    or (u_surname and u_surname in normalized_name)
+                ):
+                    match_user = u
+                    break
+
+            if match_user is None:
+                self._status_lookup_attempts += 1
+                logger.info(
+                    "STATUS-LOOKUP: name mismatch attempt %d/%d (slug=%s)",
+                    self._status_lookup_attempts,
+                    _STATUS_LOOKUP_MAX_VERIFY_ATTEMPTS,
+                    slug,
+                )
+                if self._status_lookup_attempts >= _STATUS_LOOKUP_MAX_VERIFY_ATTEMPTS:
+                    return redirect_payload
+                return {
+                    "status": "ask_more",
+                    "missing": "client_name",
+                    "hint": (
+                        "Имя или фамилия не совпали с CRM. Попроси клиента ещё раз "
+                        "уточнить имя или фамилию (без раскрытия деталей CRM). "
+                        "Если клиент откажется или повторно не совпадёт — "
+                        f"скажи связаться с менеджером по телефону {manager_phone}."
+                    ),
+                }
+
+            uid_raw = match_user.get("u_id") or match_user.get("id")
+            try:
+                self._status_lookup_verified_uid = int(uid_raw) if uid_raw else None
+            except (ValueError, TypeError):
+                self._status_lookup_verified_uid = None
+
+        u_id = self._status_lookup_verified_uid
+        if not u_id:
+            logger.warning("STATUS-LOOKUP: verified user has no u_id — redirect")
+            return redirect_payload
+
+        # ── 6. Get client requests + leads ──
+        try:
+            req_resp = await self.uon_client.get_requests_by_client(u_id)
+        except Exception as exc:
+            logger.error("STATUS-LOOKUP: get_requests failed: %s", exc, exc_info=True)
+            req_resp = {"ok": False}
+
+        try:
+            lead_resp = await self.uon_client.get_leads_by_client(u_id)
+        except Exception as exc:
+            logger.error("STATUS-LOOKUP: get_leads failed: %s", exc, exc_info=True)
+            lead_resp = {"ok": False}
+
+        items: List[Dict[str, Any]] = []
+        if req_resp.get("ok"):
+            items.extend(req_resp.get("requests") or [])
+        if lead_resp.get("ok"):
+            items.extend(lead_resp.get("leads") or [])
+
+        if not items:
+            logger.info("STATUS-LOOKUP: u_id=%s — no requests/leads", u_id)
+            return redirect_payload
+
+        # ── 7. Filter PII + drop closed/negative statuses ──
+        active_filtered: List[Dict[str, Any]] = []
+        seen_ids = set()
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            iid = item.get("id") or item.get("r_id") or item.get("l_id")
+            if iid is None or iid in seen_ids:
+                continue
+            seen_ids.add(iid)
+            status_raw = (item.get("status_name") or item.get("status") or "").strip()
+            status_lower = status_raw.lower()
+            if not status_raw:
+                continue
+            if any(closed in status_lower for closed in _STATUS_LOOKUP_CLOSED_NAMES):
+                continue
+            active_filtered.append({
+                "id": iid,
+                "status": status_raw,
+            })
+
+        # Сортировка: id desc (грубо — последняя = свежая); максимум 3.
+        try:
+            active_filtered.sort(key=lambda x: int(x["id"]), reverse=True)
+        except (ValueError, TypeError):
+            pass
+        active_filtered = active_filtered[:3]
+
+        if not active_filtered:
+            logger.info(
+                "STATUS-LOOKUP: u_id=%s — only closed statuses, redirecting to manager",
+                u_id,
+            )
+            return redirect_payload
+
+        logger.info(
+            "STATUS-LOOKUP OK: slug=%s u_id=%s active=%d",
+            slug, u_id, len(active_filtered),
+        )
+        return {
+            "status": "ok",
+            "requests": active_filtered,
+            "message": (
+                "Передай клиенту статус его заявки коротко: 'Ваша заявка №{id} "
+                "в статусе: {status}'. БЕЗ направления, дат, имени менеджера, "
+                "эмодзи. Если несколько заявок — каждая отдельной строкой."
+            ),
+        }
 
     def _call_api_sync(self, stream: bool = False):
         """
@@ -5808,6 +6066,9 @@ class YandexGPTHandler:
         self._crm_submitted = None
         self._shown_flight_signatures = {}
         self._original_requested_meal = None
+        self._status_lookup_calls = 0
+        self._status_lookup_attempts = 0
+        self._status_lookup_verified_uid = None
         logger.info("🔄 HANDLER RESET  cleared %d messages from full_history", old_len)
 
 
