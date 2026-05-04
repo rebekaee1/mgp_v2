@@ -62,6 +62,11 @@ def resolve_runtime_config(assistant_id: Optional[str] = None) -> RuntimeTenantC
     if not assistant_id:
         return runtime_config
 
+    # Сохраняем входящий assistant_id ещё до DB-lookup — чтобы он был
+    # доступен даже при early return (assistant неактивен / DB недоступен).
+    # Нужно для tenant guard в фичах с whitelist по ID.
+    runtime_config.assistant_id = str(assistant_id)
+
     try:
         assistant_uuid = uuid.UUID(str(assistant_id))
     except (ValueError, TypeError, AttributeError):

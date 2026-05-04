@@ -44,12 +44,22 @@ _CYR_TO_LAT = {
 _CYR_TO_LAT_ALT = {**_CYR_TO_LAT, 'ф': 'ph', 'х': 'kh'}
 
 # ── Feature: "Статус заявки" (get_client_request_status) ──────────────────
-# Tenants where this feature is enabled. Whitelist by company_slug.
-# Локальный тест: добавляем mgp-tour и LK-канал основного офиса.
+# Tenants where this feature is enabled. Двойной whitelist:
+#   1) company_slug (основной критерий — работает когда runtime_config загружен из БД).
+#   2) assistant_id (fallback — работает даже когда runtime_config вернул defaults,
+#      например на проде у assistant с is_active=false где slug не подгружается).
 # Для других компаний tool отдаёт redirect_to_manager и LLM зовёт менеджера.
 _STATUS_LOOKUP_ALLOWED_SLUGS = {
     "mgp-tour",
     "lk-prodlike-1773077586",
+}
+_STATUS_LOOKUP_ALLOWED_ASSISTANT_IDS = {
+    # Прод: mgp-tour direct (виджет на mgp.ru)
+    "593471b7-42da-4ae0-8499-904dcedd6a4b",
+    # Прод: mgp-tour через LK Navilet канал
+    "2b7b20bd-d904-49bf-b43f-de3c4028ae6a",
+    # Локальный mgp-tour (для разработки)
+    "d1327f41-3c31-4776-9f80-f22cde9bd579",
 }
 
 # Финальные негативные/закрытые статусы — клиенту НЕ показываем,
@@ -4901,12 +4911,16 @@ class YandexGPTHandler:
             ),
         }
 
-        # ── 1. Tenant guard ──
+        # ── 1. Tenant guard (slug OR assistant_id whitelist) ──
         slug = (getattr(self.runtime_config, "company_slug", None) or "").strip().lower()
-        if slug not in _STATUS_LOOKUP_ALLOWED_SLUGS:
+        assistant_id = (getattr(self.runtime_config, "assistant_id", None) or "").strip().lower()
+        slug_ok = slug in _STATUS_LOOKUP_ALLOWED_SLUGS
+        aid_ok = assistant_id in _STATUS_LOOKUP_ALLOWED_ASSISTANT_IDS
+        if not (slug_ok or aid_ok):
             logger.info(
-                "STATUS-LOOKUP: tenant '%s' not in allowed list — redirect_to_manager",
+                "STATUS-LOOKUP: tenant blocked slug='%s' aid='%s' — redirect_to_manager",
                 slug or "<unknown>",
+                assistant_id or "<unknown>",
             )
             return redirect_payload
 
