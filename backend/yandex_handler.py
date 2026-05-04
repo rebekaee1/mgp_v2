@@ -62,9 +62,9 @@ _STATUS_LOOKUP_ALLOWED_SLUGS = {
     "lk-prodlike-1773077586",    # mgp-tour LK канал, тот же global key
     "mgp-kirishi",               # GET API активирован 04.05.2026
     "mgp-krasnogorsk",           # GET API активирован 04.05.2026
+    "mgp-shelkovo",              # GET API активирован 04.05.2026
     # NOT YET (нужна активация GET в U-ON админке клиента):
     # "mgp-belgorod"   — HTTP 406 "API is not active"
-    # "mgp-shelkovo"   — HTTP 406 "API is not active"
     # "mgp-vyhino"     — HTTP 406 "API is not active"
     # NEVER (email-only, без CRM):
     # "mgp-tambov"
@@ -78,6 +78,8 @@ _STATUS_LOOKUP_ALLOWED_ASSISTANT_IDS = {
     "1a7f1b86-3aa0-4edd-a911-568a25d19df3",
     # Прод: mgp-krasnogorsk
     "fedfe143-554c-4dd6-ae3a-37ff6f81a021",
+    # Прод: mgp-shelkovo
+    "d5c16833-539b-4ed9-a6d6-042cc0064be8",
     # Локальный mgp-tour (для разработки)
     "d1327f41-3c31-4776-9f80-f22cde9bd579",
 }
