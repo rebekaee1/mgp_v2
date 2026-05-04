@@ -48,16 +48,36 @@ _CYR_TO_LAT_ALT = {**_CYR_TO_LAT, 'ф': 'ph', 'х': 'kh'}
 #   1) company_slug (основной критерий — работает когда runtime_config загружен из БД).
 #   2) assistant_id (fallback — работает даже когда runtime_config вернул defaults,
 #      например на проде у assistant с is_active=false где slug не подгружается).
-# Для других компаний tool отдаёт redirect_to_manager и LLM зовёт менеджера.
+#
+# КРИТЕРИИ ВКЛЮЧЕНИЯ ТЕНАНТА:
+#   - Тенант использует U-ON CRM (не email-only).
+#   - На U-ON ключе тенанта АКТИВИРОВАН GET API
+#     (Settings → Integrations → API в админке U-ON).
+#   - Если GET НЕ активирован — фичу не включаем, иначе клиенты будут всегда
+#     получать "свяжитесь с менеджером" даже на активных заявках (плохой UX).
+#
+# Для остальных компаний tool отдаёт redirect_to_manager и LLM зовёт менеджера.
 _STATUS_LOOKUP_ALLOWED_SLUGS = {
-    "mgp-tour",
-    "lk-prodlike-1773077586",
+    "mgp-tour",                  # основной офис, global UON_API_KEY
+    "lk-prodlike-1773077586",    # mgp-tour LK канал, тот же global key
+    "mgp-kirishi",               # GET API активирован 04.05.2026
+    "mgp-krasnogorsk",           # GET API активирован 04.05.2026
+    # NOT YET (нужна активация GET в U-ON админке клиента):
+    # "mgp-belgorod"   — HTTP 406 "API is not active"
+    # "mgp-shelkovo"   — HTTP 406 "API is not active"
+    # "mgp-vyhino"     — HTTP 406 "API is not active"
+    # NEVER (email-only, без CRM):
+    # "mgp-tambov"
 }
 _STATUS_LOOKUP_ALLOWED_ASSISTANT_IDS = {
     # Прод: mgp-tour direct (виджет на mgp.ru)
     "593471b7-42da-4ae0-8499-904dcedd6a4b",
     # Прод: mgp-tour через LK Navilet канал
     "2b7b20bd-d904-49bf-b43f-de3c4028ae6a",
+    # Прод: mgp-kirishi
+    "1a7f1b86-3aa0-4edd-a911-568a25d19df3",
+    # Прод: mgp-krasnogorsk
+    "fedfe143-554c-4dd6-ae3a-37ff6f81a021",
     # Локальный mgp-tour (для разработки)
     "d1327f41-3c31-4776-9f80-f22cde9bd579",
 }
