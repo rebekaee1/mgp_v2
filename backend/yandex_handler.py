@@ -4772,6 +4772,46 @@ class YandexGPTHandler:
                 "CRM %s created: name=%s phone=%s email=%s",
                 crm_type, client_name, client_phone, client_email,
             )
+
+            try:
+                wc = getattr(self.runtime_config, "widget_config", None) or {}
+                lead_email_enabled = bool(wc.get("lead_email_enabled"))
+                lead_email_to = (wc.get("lead_email_to") or "").strip()
+                if lead_email_enabled and lead_email_to:
+                    crm_id = None
+                    data = result.get("data") or {}
+                    if isinstance(data, dict):
+                        crm_id = (
+                            data.get("id")
+                            or data.get("lead_id")
+                            or data.get("request_id")
+                        )
+                    asyncio.create_task(
+                        self._send_lead_email_duplicate(
+                            to_email=lead_email_to,
+                            client_name=client_name,
+                            client_phone=client_phone,
+                            client_email=client_email,
+                            comment=comment,
+                            crm_type=crm_type,
+                            crm_id=crm_id,
+                        )
+                    )
+                    logger.info(
+                        "LEAD-EMAIL: scheduled background send to=%s crm_type=%s crm_id=%s",
+                        lead_email_to, crm_type, crm_id,
+                    )
+                else:
+                    logger.debug(
+                        "LEAD-EMAIL: skipped (enabled=%s, to=%s)",
+                        lead_email_enabled, "<set>" if lead_email_to else "<empty>",
+                    )
+            except Exception as _e:
+                logger.warning(
+                    "LEAD-EMAIL: scheduling failed (non-fatal): %s",
+                    _e, exc_info=True,
+                )
+
             return {
                 "status": "success",
                 "type": crm_type,
@@ -4791,6 +4831,192 @@ class YandexGPTHandler:
                 f"Предложи клиенту позвонить менеджеру: {manager_phone}."
             ),
         }
+
+    async def _send_lead_email_duplicate(
+        self,
+        to_email: str,
+        client_name: str,
+        client_phone: str,
+        client_email: str,
+        comment: str,
+        crm_type: str,
+        crm_id: Optional[int] = None,
+    ) -> None:
+        """Send a best-effort copy of the just-created CRM lead/request to email.
+
+        Никогда не бросает: все исключения логируются как warning. Используется
+        только когда `widget_config.lead_email_enabled` явно включён для тенанта.
+        """
+        try:
+            request_number = await self._next_lead_email_counter() or (crm_id or 0)
+
+            agency_name = (
+                getattr(self.runtime_config, "company_name", None)
+                or getattr(self.runtime_config, "assistant_name", None)
+                or "Магазин Горящих Путёвок"
+            )
+
+            wc = getattr(self.runtime_config, "widget_config", None) or {}
+            booking_base = wc.get("booking_base_url", "") if isinstance(wc, dict) else ""
+
+            tour_kwargs: Dict = {}
+            search_kwargs: Dict = {}
+
+            card = None
+            tourid = None
+            act_tid = self._tour_actualized_id
+            if act_tid and self._booking_cards_cache:
+                card = self._booking_cards_cache.get(str(act_tid))
+                tourid = act_tid
+            if not card and self._booking_cards_cache:
+                first_key = next(iter(self._booking_cards_cache))
+                card = self._booking_cards_cache.get(first_key)
+                tourid = first_key
+
+            if act_tid and card:
+                tour_link = ""
+                if tourid and booking_base:
+                    tour_link = f"{booking_base.rstrip('/')}#tvtourid={tourid}"
+                elif tourid:
+                    tour_link = f"https://mgp.ru/tours/#tvtourid={tourid}"
+
+                price_int = 0
+                try:
+                    price_raw = str(card.get("price", "") or "").replace(" ", "").replace(",", ".")
+                    if price_raw:
+                        price_int = int(float(price_raw))
+                except (ValueError, TypeError):
+                    price_int = 0
+
+                stars_int = 0
+                try:
+                    stars_int = int(card.get("hotel_stars", 0) or 0)
+                except (ValueError, TypeError):
+                    stars_int = 0
+
+                nights_int = 0
+                try:
+                    nights_int = int(card.get("nights", 0) or 0)
+                except (ValueError, TypeError):
+                    nights_int = 0
+
+                tour_kwargs = {
+                    "hotel_name": card.get("hotel_name") or "",
+                    "country": card.get("country", "") or "",
+                    "resort": card.get("resort", "") or "",
+                    "fly_date": card.get("date_from", "") or "",
+                    "nights": nights_int,
+                    "price": price_int,
+                    "operator": card.get("operator", "") or "",
+                    "meal": card.get("meal_description") or card.get("food_type", "") or "",
+                    "room_type": card.get("room_type", "") or "",
+                    "stars": stars_int,
+                    "tour_link": tour_link,
+                    "departure_city": (
+                        card.get("departure_city")
+                        or self._last_departure_city
+                        or ""
+                    ),
+                }
+            else:
+                sp = self._last_search_params or {}
+                country_name = ""
+                if self._booking_cards_cache:
+                    try:
+                        country_name = next(
+                            iter(self._booking_cards_cache.values())
+                        ).get("country", "") or ""
+                    except Exception:
+                        country_name = ""
+
+                dates_str = ""
+                if sp.get("datefrom"):
+                    dates_str = str(sp.get("datefrom"))
+                    if sp.get("dateto"):
+                        dates_str += f" — {sp['dateto']}"
+
+                pax_str = ""
+                if sp:
+                    adults = sp.get("adults", 2)
+                    kids = sp.get("child", 0)
+                    pax_str = f"{adults} взр." + (f" + {kids} дет." if kids else "")
+
+                budget_str = ""
+                if sp.get("priceto"):
+                    budget_str = f"до {sp['priceto']} руб."
+
+                search_kwargs = {
+                    "search_country": country_name,
+                    "search_dates": dates_str,
+                    "search_pax": pax_str,
+                    "search_budget": budget_str,
+                    "departure_city": self._last_departure_city or "",
+                }
+
+            from email_sender import send_lead_email
+            result = await asyncio.to_thread(
+                send_lead_email,
+                to_email=to_email,
+                client_name=client_name,
+                client_phone=client_phone,
+                request_number=request_number,
+                crm_type=crm_type,
+                crm_id=crm_id,
+                client_email=client_email,
+                comment=comment,
+                agency_name=agency_name,
+                **tour_kwargs,
+                **search_kwargs,
+            )
+
+            if result.get("ok"):
+                logger.info(
+                    "LEAD-EMAIL: sent to=%s req=%s crm_type=%s crm_id=%s phone=%s",
+                    to_email, request_number, crm_type, crm_id, client_phone,
+                )
+            else:
+                logger.warning(
+                    "LEAD-EMAIL: send failed to=%s err=%s",
+                    to_email, result.get("error"),
+                )
+        except Exception as _e:
+            logger.warning(
+                "LEAD-EMAIL: duplicate inner exception (non-fatal): %s",
+                _e, exc_info=True,
+            )
+
+    async def _next_lead_email_counter(self) -> int:
+        """Atomically increment widget-level counter for lead-email enumeration.
+
+        Использует тот же паттерн `jsonb_set(... + 1) RETURNING`, что и
+        booking_counter. Отдельный ключ `lead_email_counter`, чтобы не
+        конфликтовать с нумерацией submit_booking_request.
+
+        Возвращает 0 при недоступности БД (caller fallback на crm_id).
+        """
+        try:
+            from database import get_db, is_db_available
+            if not is_db_available():
+                return 0
+            from sqlalchemy import text as sa_text
+            aid = getattr(self.runtime_config, "assistant_id", None)
+            if not aid:
+                return 0
+            with get_db() as db:
+                row = db.execute(sa_text(
+                    "UPDATE assistants "
+                    "SET runtime_metadata = jsonb_set("
+                    "  COALESCE(runtime_metadata, '{}'),"
+                    "  '{lead_email_counter}',"
+                    "  to_jsonb(COALESCE((runtime_metadata->>'lead_email_counter')::int, 0) + 1)"
+                    ") WHERE id = :aid "
+                    "RETURNING (runtime_metadata->>'lead_email_counter')::int"
+                ), {"aid": aid}).scalar()
+                db.commit()
+                return int(row or 0)
+        except Exception as _e:
+            logger.debug("LEAD-EMAIL counter fallback: %s", _e)
+            return 0
 
     async def _crm_create_lead(self, name: str, phone: str, email: str,
                                llm_comment: str = "") -> Dict:
