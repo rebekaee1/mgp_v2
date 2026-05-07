@@ -20,10 +20,21 @@ set -euo pipefail
 #   4. Sets U-ON CRM API key (Krasnogorsk, Vyhino, Belgorod) or prints instructions (Shelkovo)
 #   5. Loads custom FAQ from clients/<slug>/faq.md (Shelkovo, Krasnogorsk only;
 #      Vyhino, Belgorod use the common faq.md without override, like Kirishi/Tambov)
+#   6. Configures runtime_metadata.reporting (PUSH webhook MGP → LK control-plane).
+#      Per-tenant shared secret can be supplied via env vars
+#      MGP_REPORTING_SECRET_<UPPER_SLUG_WITH_UNDERSCORES> (e.g.
+#      MGP_REPORTING_SECRET_MGP_VYHINO=…). If absent, an existing secret in DB is
+#      kept; otherwise a new one is generated locally and printed for manual
+#      mirroring on the LK side (lk_navylet).
 # ============================================================================
 
 ROOT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 cd "$ROOT_DIR"
+
+# ── Reporting / control-plane defaults (override via env if needed) ──────────
+REPORTING_ENDPOINT_URL="${MGP_REPORTING_ENDPOINT:-https://lk.navilet.ru/api/control-plane/runtime/events}"
+REPORTING_CONTRACT_VERSION="${MGP_REPORTING_CONTRACT:-2026-03-09}"
+REPORTING_AUTH_HEADER="${MGP_REPORTING_AUTH_HEADER:-X-MGP-Service-Token}"
 
 log() { echo "[$(date +%H:%M:%S)] $*"; }
 err() { echo "[$(date +%H:%M:%S)] ERROR: $*" >&2; exit 1; }
@@ -63,6 +74,77 @@ update_widget_config() {
     local assistant_id="$1"
     local json_patch="$2"
     run_sql "UPDATE assistants SET widget_config = COALESCE(widget_config, '{}'::jsonb) || '${json_patch}'::jsonb WHERE id = '${assistant_id}';"
+}
+
+# ── Reporting (control-plane PUSH MGP → LK) ──────────────────────────────────
+#
+# Idempotent. Resolution order for the shared_secret:
+#   1) Env var MGP_REPORTING_SECRET_<UPPER_SLUG> (slug with `-` → `_`)
+#   2) Existing secret already stored in runtime_metadata.reporting.auth.secret
+#   3) Locally generated 43-char URL-safe random string (printed for the admin
+#      to mirror on the LK side; without that mirror PUSH will be rejected 401).
+#
+# Even if the secret stays the same, we still rewrite the full reporting block
+# so that endpoint_url / contract_version / event types are guaranteed correct.
+setup_reporting() {
+    local assistant_id="$1"
+    local slug="$2"
+    local upper_slug
+    upper_slug=$(echo "$slug" | tr '[:lower:]-' '[:upper:]_')
+    local var_name="MGP_REPORTING_SECRET_${upper_slug}"
+    local env_secret="${!var_name:-}"
+
+    local current_secret
+    current_secret=$(run_sql "SELECT COALESCE(runtime_metadata::jsonb->'reporting'->'auth'->>'secret','') FROM assistants WHERE id='${assistant_id}';" || true)
+    current_secret=$(printf '%s' "$current_secret" | tr -d '\r\n')
+
+    local secret=""
+    local source_marker=""
+
+    if [ -n "$env_secret" ]; then
+        secret="$env_secret"
+        source_marker="from-env(${var_name})"
+        if [ -n "$current_secret" ] && [ "$current_secret" != "$env_secret" ]; then
+            log "⚠️  Reporting secret in DB differs from ${var_name} — overwriting with env value."
+        fi
+    elif [ -n "$current_secret" ]; then
+        secret="$current_secret"
+        source_marker="kept-existing"
+    else
+        secret=$(openssl rand -base64 32 | tr -d '=+/' | cut -c1-43)
+        source_marker="generated-locally"
+        log "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        log "⚠️  Reporting secret for ${slug} was missing — generated a new one."
+        log "   Mirror it on the LK side (lk_navylet) NOW or PUSH will 401."
+        log "   ${var_name}=${secret}"
+        log "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    fi
+
+    if [[ ! "$secret" =~ ^[A-Za-z0-9_-]+$ ]]; then
+        err "Reporting secret for ${slug} contains unsupported characters; refuse to embed it in SQL"
+    fi
+
+    docker compose exec -T postgres psql -U mgp -d mgp -v ON_ERROR_STOP=1 <<EOSQL
+UPDATE assistants
+SET runtime_metadata = jsonb_set(
+    COALESCE(runtime_metadata::jsonb, '{}'::jsonb),
+    '{reporting}',
+    jsonb_build_object(
+        'mode', 'batch_snapshot',
+        'contract_version', '${REPORTING_CONTRACT_VERSION}',
+        'endpoint_url', '${REPORTING_ENDPOINT_URL}',
+        'accepted_event_types', jsonb_build_array('conversation_snapshot'),
+        'auth', jsonb_build_object(
+            'type', 'shared_secret',
+            'header_name', '${REPORTING_AUTH_HEADER}',
+            'secret', '${secret}'
+        )
+    ),
+    true
+)
+WHERE id = '${assistant_id}';
+EOSQL
+    log "Reporting configured for ${slug} (source: ${source_marker}, endpoint: ${REPORTING_ENDPOINT_URL})"
 }
 
 # ── Shelkovo ──────────────────────────────────────────────────────────────────
@@ -127,6 +209,9 @@ provision_shelkovo() {
 
     log "Loading custom FAQ..."
     load_faq "$ASSISTANT_ID" "$ROOT_DIR/clients/shelkovo/faq.md"
+
+    log "Configuring runtime_metadata.reporting (PUSH → LK)..."
+    setup_reporting "$ASSISTANT_ID" "mgp-shelkovo"
 
     log ""
     log "⚠️  U-ON API KEY: not set yet"
@@ -209,6 +294,9 @@ provision_krasnogorsk() {
     log "Loading custom FAQ..."
     load_faq "$ASSISTANT_ID" "$ROOT_DIR/clients/krasnogorsk/faq.md"
 
+    log "Configuring runtime_metadata.reporting (PUSH → LK)..."
+    setup_reporting "$ASSISTANT_ID" "mgp-krasnogorsk"
+
     log ""
     log "✅ МГП Красногорск — provisioned (assistant: ${ASSISTANT_ID})"
     log "   U-ON API key: ghh8Fw63d4lY9J5ZNy6M (set)"
@@ -279,6 +367,9 @@ provision_vyhino() {
 
     log "Note: Vyhino uses common faq.md (no per-tenant FAQ override) — like Кириши/Тамбов"
 
+    log "Configuring runtime_metadata.reporting (PUSH → LK)..."
+    setup_reporting "$ASSISTANT_ID" "mgp-vyhino"
+
     log ""
     log "✅ МГП Выхино — provisioned (assistant: ${ASSISTANT_ID})"
     log "   U-ON API key: Hy7CFjPZ28akdnr5V09M1777458672 (set, per-tenant)"
@@ -348,6 +439,9 @@ provision_belgorod() {
     run_sql "UPDATE assistants SET uon_api_key = 'DkRQ339sbeWQdU92P8tv1777547148', uon_source = 'AI-Ассистент' WHERE id = '${ASSISTANT_ID}';"
 
     log "Note: Belgorod uses common faq.md (no per-tenant FAQ override) — like Vyhino/Kirishi/Tambov"
+
+    log "Configuring runtime_metadata.reporting (PUSH → LK)..."
+    setup_reporting "$ASSISTANT_ID" "mgp-belgorod"
 
     log ""
     log "✅ МГП Белгород — provisioned (assistant: ${ASSISTANT_ID})"
@@ -423,6 +517,11 @@ case "${1:-all}" in
         log "   - Create widget linked to assistant_id (same UUID as in MGP DB)"
         log "   - Enable pre-chat start form (name + phone) where requested"
         log "   - Set allowed_domains"
+        log "   - Mirror reporting secret (auth.shared_secret) on the LK side."
+        log "     If the script logged 'generated-locally' for a tenant, copy that"
+        log "     MGP_REPORTING_SECRET_<UPPER_SLUG>=… into LK runtime_metadata.reporting."
+        log "     If the LK side already has a secret you want to keep, re-run this"
+        log "     script with MGP_REPORTING_SECRET_<UPPER_SLUG>=<value> exported."
         log ""
         log "6. Embed code — install on client websites:"
         log "   - c-mgp.ru (Щёлково)"
