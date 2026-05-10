@@ -22,6 +22,15 @@ trap 'rm -f "$LOCK_FILE"' EXIT
 
 cd "$APP_DIR"
 
+# Only auto-deploy when production tracks main. On feature/* branches we are
+# in a hand-controlled rollout (e.g. feature/max-bridge migration); cron must
+# not race against the operator.
+CURRENT_BRANCH=$(git rev-parse --abbrev-ref HEAD)
+if [ "$CURRENT_BRANCH" != "main" ]; then
+    log "skipping auto-deploy: current branch is $CURRENT_BRANCH (expected main)"
+    exit 0
+fi
+
 git fetch origin main --quiet 2>>"$LOG_FILE"
 
 LOCAL_HEAD=$(git rev-parse HEAD)
