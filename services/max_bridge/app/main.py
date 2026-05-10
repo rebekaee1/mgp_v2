@@ -14,6 +14,7 @@ from fastapi import FastAPI
 
 from .chat_proxy import ChatProxy
 from .config import Settings, get_settings
+from .image_cache import ImageCache
 from .observability import configure_logging
 from .session_store import SessionStore
 from .webhook import router as webhook_router
@@ -33,6 +34,9 @@ async def lifespan(app: FastAPI):
         service_token=settings.max_backend_service_token,
         timeout=settings.backend_request_timeout_seconds,
     )
+    image_cache = ImageCache.from_url(
+        settings.max_redis_url, ttl_seconds=settings.max_image_cache_ttl_seconds
+    )
 
     redis_ok = False
     try:
@@ -45,6 +49,7 @@ async def lifespan(app: FastAPI):
     app.state.settings = settings
     app.state.session_store = session_store
     app.state.chat_proxy = chat_proxy
+    app.state.image_cache = image_cache
     app.state.redis_ok_on_start = redis_ok
 
     tenant_count = len(settings.tenant_bindings())
@@ -54,12 +59,15 @@ async def lifespan(app: FastAPI):
         tenant_count=tenant_count,
         webhook=settings.max_webhook_public_url or "<not_set>",
         redis_ok=redis_ok,
+        render_tour_cards=settings.max_render_tour_cards,
+        tour_cards_limit=settings.max_tour_cards_limit,
     )
     try:
         yield
     finally:
         await chat_proxy.aclose()
         await session_store.aclose()
+        await image_cache.aclose()
         logger.info("max_bridge_stopped")
 
 

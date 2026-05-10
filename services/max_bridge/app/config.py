@@ -82,6 +82,18 @@ class Settings(BaseSettings):
     backend_request_timeout_seconds: float = Field(default=60.0)
     max_api_request_timeout_seconds: float = Field(default=30.0)
 
+    # ── Phase 2 v1: tour_cards rendering ──────────────────────────────
+    max_render_tour_cards: bool = Field(
+        default=True,
+        description=(
+            "Master kill-switch for photo-card rendering. Set MAX_RENDER_TOUR_CARDS=0 "
+            "in the env to instantly fall back to phase-1 behaviour (text-only)."
+        ),
+    )
+    max_tour_cards_limit: int = Field(default=3, description="How many cards to render from chat_response.tour_cards")
+    max_image_download_timeout: float = Field(default=5.0, description="seconds to wait when fetching the image from the source CDN")
+    max_image_cache_ttl_seconds: int = Field(default=604800, description="how long to remember a hotel image → MAX media token (default 7 days)")
+
     def tenant_bindings(self) -> list[TenantBinding]:
         """Return the list of currently configured tenant bots.
 

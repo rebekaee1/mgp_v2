@@ -1,0 +1,207 @@
+from app.renderers import (
+    _format_date_short,
+    _format_meal,
+    _format_pax,
+    _format_price,
+    _format_rating,
+    _format_stars,
+    _md_escape,
+    render_final_menu_keyboard,
+    render_final_menu_text,
+    render_tour_card_caption,
+    render_tour_card_keyboard,
+)
+
+
+# ── helpers ────────────────────────────────────────────────────────────
+
+
+def test_md_escape_handles_specials():
+    assert _md_escape("Hotel *5* [VIP]") == r"Hotel \*5\* \[VIP\]"
+
+
+def test_md_escape_handles_empty_and_none():
+    assert _md_escape("") == ""
+    assert _md_escape(None) == ""
+
+
+def test_format_stars_clamps():
+    assert _format_stars(5) == "⭐⭐⭐⭐⭐"
+    assert _format_stars(0) == ""
+    assert _format_stars(7) == "⭐⭐⭐⭐⭐"
+    assert _format_stars(None) == ""
+    assert _format_stars("3") == "⭐⭐⭐"
+    assert _format_stars("abc") == ""
+
+
+def test_format_rating_one_decimal():
+    assert _format_rating(9.4) == "9.4"
+    assert _format_rating(0) == ""
+    assert _format_rating(None) == ""
+    assert _format_rating(9.0) == "9"
+
+
+def test_format_price_thin_space():
+    assert _format_price(410000) == "410 000 ₽"
+    assert _format_price(0) == ""
+    assert _format_price(None) == ""
+    assert _format_price("abc") == ""
+
+
+def test_format_date_short_strips_year():
+    assert _format_date_short("18.05.2026") == "18.05"
+    assert _format_date_short("") == ""
+    assert _format_date_short(None) == ""
+    assert _format_date_short("2026-05-18") == "2026-05-18"
+
+
+def test_format_meal_uses_description_first():
+    assert _format_meal({"meal_description": "Всё включено", "food_type": "BB"}) == "Всё включено"
+    assert _format_meal({"meal_description": "", "food_type": "AI"}) == "Всё включено"
+    assert _format_meal({"meal_description": "", "food_type": "ZZ"}) == "ZZ"
+    assert _format_meal({}) == ""
+
+
+def test_format_pax_declension():
+    assert _format_pax(1) == "за одного"
+    assert _format_pax(2) == "за двоих"
+    assert _format_pax(3) == "за троих"
+    assert _format_pax(4) == "за четверых"
+    assert _format_pax(5) == "за 5 взрослых"
+    assert _format_pax(0) == ""
+    assert _format_pax(None) == ""
+
+
+# ── caption ────────────────────────────────────────────────────────────
+
+
+_HAPPY_CARD = {
+    "hotel_name": "Crystal Sunrise Queen Luxury",
+    "hotel_stars": 5,
+    "hotel_rating": 9.4,
+    "country": "Турция",
+    "resort": "Сиде",
+    "region": "Сиде",
+    "date_from": "18.05.2026",
+    "date_to": "25.05.2026",
+    "nights": 7,
+    "price": 410000,
+    "adults": 2,
+    "meal_description": "Всё включено",
+    "room_type": "Standard Double",
+    "flight_included": True,
+    "is_hotel_only": False,
+    "departure_city": "Москва",
+    "operator": "Pegas",
+    "image_url": "https://tourvisor.example/pic.jpg",
+    "hotel_link": "https://mgp.ru/tours/#tvtourid=12345",
+    "id": "12345",
+}
+
+
+def test_caption_includes_all_core_fields():
+    text = render_tour_card_caption(_HAPPY_CARD)
+    for needle in [
+        "Crystal Sunrise Queen Luxury",
+        "⭐⭐⭐⭐⭐",
+        "9.4",
+        "Турция",
+        "Сиде",
+        "18.05 → 25.05",
+        "7 ночей",
+        "Всё включено",
+        "Standard Double",
+        "✈️ Перелёт включён",
+        "Москва",
+        "Pegas",
+        "410 000 ₽",
+        "за двоих",
+    ]:
+        assert needle in text, f"missing {needle!r} in caption:\n{text}"
+
+
+def test_caption_truncated_when_pathological():
+    long_card = {"hotel_name": "X" * 9000, "country": "Турция"}
+    text = render_tour_card_caption(long_card)
+    assert len(text) <= 3901
+    assert text.endswith("…")
+
+
+def test_caption_hotel_only_swap():
+    card = {
+        "hotel_name": "Hotel Only",
+        "is_hotel_only": True,
+        "flight_included": False,
+        "country": "Турция",
+    }
+    text = render_tour_card_caption(card)
+    assert "🏨 Только отель" in text
+    assert "✈️" not in text
+
+
+def test_caption_escapes_user_markdown_specials():
+    card = {"hotel_name": "Hotel *Special* [VIP]"}
+    text = render_tour_card_caption(card)
+    # The hotel-name line still wraps the (escaped) name in *...* for bold,
+    # but the inner stars must be backslash-escaped so they don't toggle bold.
+    assert r"\*Special\*" in text
+    assert r"\[VIP\]" in text
+
+
+def test_caption_no_country_resort_dup():
+    card = {"hotel_name": "Hotel", "country": "Россия", "resort": "Россия"}
+    text = render_tour_card_caption(card)
+    # 'Россия' must not appear twice next to each other
+    assert text.count("Россия") == 1
+
+
+def test_caption_no_price_when_zero():
+    card = {"hotel_name": "Hotel", "price": 0, "adults": 2}
+    text = render_tour_card_caption(card)
+    assert "₽" not in text
+
+
+# ── keyboard ───────────────────────────────────────────────────────────
+
+
+def test_keyboard_link_button_for_valid_url():
+    kb = render_tour_card_keyboard(_HAPPY_CARD)
+    assert kb is not None
+    assert kb["type"] == "inline_keyboard"
+    btn = kb["payload"]["buttons"][0][0]
+    assert btn["type"] == "link"
+    assert btn["url"] == "https://mgp.ru/tours/#tvtourid=12345"
+    assert "Забронировать" in btn["text"]
+
+
+def test_keyboard_returns_none_for_invalid_links():
+    assert render_tour_card_keyboard({"hotel_link": ""}) is None
+    assert render_tour_card_keyboard({"hotel_link": "javascript:alert(1)"}) is None
+    assert render_tour_card_keyboard({"hotel_link": "/relative/path"}) is None
+    assert render_tour_card_keyboard({}) is None
+
+
+def test_keyboard_rejects_oversize_link():
+    overlong = "https://example.com/" + "a" * 2050
+    assert render_tour_card_keyboard({"hotel_link": overlong}) is None
+
+
+# ── final menu ─────────────────────────────────────────────────────────
+
+
+def test_final_menu_text_short():
+    text = render_final_menu_text()
+    assert text and len(text) < 100
+
+
+def test_final_menu_keyboard_only_message_type():
+    kb = render_final_menu_keyboard()
+    assert kb["type"] == "inline_keyboard"
+    rows = kb["payload"]["buttons"]
+    assert len(rows) >= 1
+    flat = [btn for row in rows for btn in row]
+    assert flat, "menu must have buttons"
+    for btn in flat:
+        assert btn["type"] == "message", f"final-menu must use message type, got {btn['type']}"
+        assert btn.get("text"), "menu button must have text"
+        assert btn.get("payload"), "menu button must have payload"

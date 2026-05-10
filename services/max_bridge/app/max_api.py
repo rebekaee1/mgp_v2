@@ -11,6 +11,7 @@ errors propagate so the caller can decide whether to retry.
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 from typing import Any, Mapping, Optional
 
@@ -35,6 +36,13 @@ class BotIdentity:
     name: str
 
 
+# Per MAX docs: a freshly-uploaded media file may not be processed yet when
+# the first /messages call arrives. We retry a couple of times with growing
+# backoff before giving up so the surrounding caller can fall back gracefully.
+_ATTACHMENT_NOT_READY_DELAYS = (0.0, 0.2, 0.5)
+_ATTACHMENT_NOT_READY_CODE = "attachment.not.ready"
+
+
 class MaxApiClient:
     """Minimal async wrapper around https://botapi.max.ru.
 
@@ -52,6 +60,7 @@ class MaxApiClient:
     ) -> None:
         self._base_url = base_url.rstrip("/")
         self._bot_token = bot_token
+        self._timeout = timeout
         # MAX rejects the standard "Bearer " prefix on /me, so we send the
         # raw token. Callers that hit other endpoints inherit the same header.
         self._client = client or httpx.AsyncClient(
@@ -86,26 +95,127 @@ class MaxApiClient:
         markdown: bool = True,
         disable_link_preview: bool = False,
     ) -> dict[str, Any]:
-        """Send a plain text message. Either chat_id or user_id is required.
+        """Send a plain text message — thin wrapper over :meth:`send_message`.
 
-        For 1-on-1 conversations the inbound webhook usually exposes a
-        ``chat_id`` — that is the value to thread back here. ``user_id`` is a
-        fallback when only the sender id is known.
+        Kept for backward compatibility with callers that don't need
+        attachments. Either chat_id or user_id is required.
+        """
+        return await self.send_message(
+            chat_id=chat_id,
+            user_id=user_id,
+            text=text,
+            attachments=None,
+            fmt="markdown" if markdown else None,
+            disable_link_preview=disable_link_preview,
+        )
+
+    async def send_message(
+        self,
+        *,
+        chat_id: Optional[int] = None,
+        user_id: Optional[int] = None,
+        text: Optional[str] = None,
+        attachments: Optional[list[dict[str, Any]]] = None,
+        fmt: Optional[str] = "markdown",
+        disable_link_preview: bool = False,
+    ) -> dict[str, Any]:
+        """Send a message with optional attachments.
+
+        On a fresh ``attachment.not.ready`` from MAX (which happens when an
+        image was uploaded a few hundred ms ago and is still being processed),
+        retries up to two more times with a small backoff before giving up.
         """
         if chat_id is None and user_id is None:
-            raise ValueError("send_text requires chat_id or user_id")
+            raise ValueError("send_message requires chat_id or user_id")
         params: dict[str, Any] = {}
         if chat_id is not None:
             params["chat_id"] = chat_id
         if user_id is not None:
             params["user_id"] = user_id
-        body: dict[str, Any] = {"text": text}
-        if markdown:
-            body["format"] = "markdown"
+        body: dict[str, Any] = {}
+        if text is not None:
+            body["text"] = text
+        if attachments:
+            body["attachments"] = attachments
+        if fmt:
+            body["format"] = fmt
         if disable_link_preview:
-            body["notify"] = True
-            body["link_preview"] = False
-        return await self._request("POST", "/messages", params=params, json=body)
+            body["disable_link_preview"] = True
+
+        last_error: Optional[MaxApiError] = None
+        for delay in _ATTACHMENT_NOT_READY_DELAYS:
+            if delay > 0:
+                await asyncio.sleep(delay)
+            try:
+                return await self._request("POST", "/messages", params=params, json=body)
+            except MaxApiError as exc:
+                if exc.code != _ATTACHMENT_NOT_READY_CODE:
+                    raise
+                last_error = exc
+        assert last_error is not None
+        raise last_error
+
+    async def upload_image_bytes(self, image_bytes: bytes) -> str:
+        """Upload an image and return the MAX media token to attach to messages.
+
+        Two-step flow per MAX docs:
+
+        1. ``POST /uploads?type=image`` returns ``{url}`` — a one-shot signed
+           CDN endpoint to receive the file body.
+        2. ``POST <url>`` with multipart ``data=<file>`` returns ``{token}``
+           which we then pass to ``/messages`` as
+           ``attachments[].payload.token``.
+
+        The upload step is performed with a fresh ``httpx.AsyncClient`` that
+        deliberately omits our bot ``Authorization`` header — the CDN URL
+        carries its own ``sig``/``expires`` query params and rejects extra
+        auth.
+        """
+        if not image_bytes:
+            raise ValueError("upload_image_bytes requires non-empty bytes")
+        prep = await self._request("POST", "/uploads", params={"type": "image"})
+        upload_url = prep.get("url")
+        if not upload_url:
+            raise MaxApiError(
+                500,
+                "upload.no_url",
+                "MAX did not return an upload URL",
+                prep,
+            )
+        async with httpx.AsyncClient(timeout=self._timeout) as cdn:
+            response = await cdn.post(
+                upload_url,
+                files={"data": ("image.jpg", image_bytes, "image/jpeg")},
+            )
+        if response.status_code >= 400:
+            try:
+                payload: Any = response.json()
+            except Exception:
+                payload = response.text
+            code = ""
+            message = ""
+            if isinstance(payload, dict):
+                code = str(payload.get("code") or "")
+                message = str(payload.get("message") or "")
+            raise MaxApiError(response.status_code, code, message, payload)
+        try:
+            data = response.json()
+        except ValueError as exc:
+            raise MaxApiError(
+                500,
+                "upload.bad_response",
+                "Upload CDN returned non-JSON response",
+                response.text,
+            ) from exc
+        token = data.get("token") if isinstance(data, dict) else None
+        if not token:
+            raise MaxApiError(
+                500,
+                "upload.no_token",
+                "Upload CDN response had no token",
+                data,
+            )
+        return str(token)
 
     async def subscribe(self, webhook_url: str, *, secret: Optional[str] = None) -> dict[str, Any]:
         """Register the public webhook URL with MAX for this bot."""
