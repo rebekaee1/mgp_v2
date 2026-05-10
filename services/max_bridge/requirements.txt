@@ -1,0 +1,22 @@
+# mgp-max-bridge runtime dependencies.
+#
+# We deliberately do not pin exact versions here — the contract this service
+# depends on (FastAPI/uvicorn lifespan, httpx async, redis-py asyncio,
+# pydantic-settings v2) is stable across recent minor releases. After the
+# first successful install run `pip freeze > requirements.lock.txt` and
+# commit that lock to keep production-reproducible builds.
+
+fastapi>=0.110
+uvicorn[standard]>=0.30
+httpx>=0.27
+redis>=5.0
+pydantic>=2.6
+pydantic-settings>=2.2
+structlog>=24.1
+python-json-logger>=2.0
+
+# Test-time only (kept here so docker-compose dev profile works out of the box).
+pytest>=8.0
+pytest-asyncio>=0.23
+respx>=0.21
+fakeredis[lua]>=2.21

@@ -99,6 +99,37 @@ services:
     networks:
       - mgp-net
 
+  max_bridge:
+    build:
+      context: .
+      dockerfile: services/max_bridge/Dockerfile
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      MAX_BACKEND_INTERNAL_URL: ${MAX_BACKEND_INTERNAL_URL:-http://backend:8080}
+      MAX_REDIS_URL: ${MAX_REDIS_URL:-redis://:${REDIS_PASSWORD:-changeme_redis}@redis:6379/1}
+      MAX_BACKEND_SERVICE_TOKEN: ${MAX_BACKEND_SERVICE_TOKEN:-${RUNTIME_SERVICE_AUTH_SECRET:-}}
+      MAX_LOG_LEVEL: ${MAX_LOG_LEVEL:-INFO}
+    ports:
+      - "${MAX_WEBHOOK_LISTEN_PORT:-8090}:8090"
+    deploy:
+      resources:
+        limits:
+          memory: 192M
+    depends_on:
+      redis:
+        condition: service_healthy
+      backend:
+        condition: service_started
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    networks:
+      - mgp-net
+
 volumes:
   pgdata:
   redisdata:
