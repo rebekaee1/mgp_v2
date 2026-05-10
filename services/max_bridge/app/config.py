@@ -18,11 +18,23 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 @dataclass(frozen=True)
 class TenantBinding:
-    """Maps an inbound MAX bot token to the matching mgp-backend tenant."""
+    """Maps an inbound MAX bot to the matching mgp-backend tenant.
+
+    Two secrets are kept per tenant:
+
+    * ``bot_token`` — the access token issued by ``@MasterBot``. Used for
+      *outbound* calls to ``botapi.max.ru`` (sending replies, managing
+      subscriptions). Never sent by MAX to us.
+    * ``webhook_secret`` — value we pass to ``POST /subscriptions`` as
+      ``secret``. MAX echoes it back in the ``X-Max-Bot-Api-Secret`` header
+      of every incoming webhook, which lets us authenticate the request
+      and pick the matching tenant when several bots share one bridge.
+    """
 
     slug: str
     assistant_id: str
     bot_token: str
+    webhook_secret: str
 
 
 class Settings(BaseSettings):
@@ -41,6 +53,14 @@ class Settings(BaseSettings):
     )
 
     max_bot_token_mgp_tour: str = Field(default="", description="Access token of the mgp-tour MAX bot")
+    max_webhook_secret_mgp_tour: str = Field(
+        default="",
+        description=(
+            "Per-tenant webhook secret. Passed to POST /subscriptions as `secret`; "
+            "MAX echoes it back in X-Max-Bot-Api-Secret. Must match the regex "
+            "^[A-Za-z0-9_-]{5,256}$ enforced by MAX."
+        ),
+    )
     max_default_assistant_id: str = Field(
         default="593471b7-42da-4ae0-8499-904dcedd6a4b",
         description="Fallback assistant_id if a tenant cannot be resolved by token",
@@ -65,27 +85,33 @@ class Settings(BaseSettings):
     def tenant_bindings(self) -> list[TenantBinding]:
         """Return the list of currently configured tenant bots.
 
-        Add new bots here when more branches are onboarded — adding a new env
-        var (e.g. `MAX_BOT_TOKEN_MGP_VYHINO`) and wiring it to the right
-        `assistant_id` is the only change required.
+        Add new bots here when more branches are onboarded — adding two new
+        env vars (``MAX_BOT_TOKEN_MGP_VYHINO`` + ``MAX_WEBHOOK_SECRET_MGP_VYHINO``)
+        and wiring them to the right ``assistant_id`` is the only change.
+
+        A tenant entry is only emitted when *both* the bot token (for outbound
+        calls) and the webhook secret (for inbound auth) are configured. A
+        partially-configured tenant would silently 401 every webhook, so we
+        skip it on purpose.
         """
         bindings: list[TenantBinding] = []
-        if self.max_bot_token_mgp_tour:
+        if self.max_bot_token_mgp_tour and self.max_webhook_secret_mgp_tour:
             bindings.append(
                 TenantBinding(
                     slug="mgp-tour",
                     assistant_id=self.max_default_assistant_id,
                     bot_token=self.max_bot_token_mgp_tour,
+                    webhook_secret=self.max_webhook_secret_mgp_tour,
                 )
             )
         return bindings
 
-    def resolve_tenant_by_token(self, token: str) -> Optional[TenantBinding]:
-        """Return the tenant binding that owns this MAX bot token, if any."""
-        if not token:
+    def resolve_tenant_by_webhook_secret(self, secret: str) -> Optional[TenantBinding]:
+        """Return the tenant binding whose webhook secret matches, if any."""
+        if not secret:
             return None
         for tenant in self.tenant_bindings():
-            if tenant.bot_token == token:
+            if tenant.webhook_secret == secret:
                 return tenant
         return None
 

@@ -13,9 +13,10 @@ from app.session_store import SessionStore
 from app.webhook import _extract_message, _resolve_tenant, router
 
 
-def _settings(token: str = "test-token") -> Settings:
+def _settings(*, token: str = "bot-token", secret: str = "hook-secret") -> Settings:
     return Settings(
         max_bot_token_mgp_tour=token,
+        max_webhook_secret_mgp_tour=secret,
         max_default_assistant_id="00000000-0000-0000-0000-000000000001",
         max_redis_url="redis://localhost/15",
         max_session_ttl_seconds=60,
@@ -23,18 +24,26 @@ def _settings(token: str = "test-token") -> Settings:
     )
 
 
-def test_resolve_tenant_matches_correct_token():
-    settings = _settings("good-token")
-    tenant = _resolve_tenant(settings, "good-token")
+def test_resolve_tenant_matches_correct_secret():
+    settings = _settings(secret="good-secret")
+    tenant = _resolve_tenant(settings, "good-secret")
     assert tenant is not None
     assert tenant.slug == "mgp-tour"
 
 
-def test_resolve_tenant_rejects_unknown_token():
-    settings = _settings("good-token")
-    assert _resolve_tenant(settings, "bad-token") is None
+def test_resolve_tenant_rejects_unknown_secret():
+    settings = _settings(secret="good-secret")
+    assert _resolve_tenant(settings, "bad-secret") is None
     assert _resolve_tenant(settings, None) is None
     assert _resolve_tenant(settings, "") is None
+
+
+def test_tenant_skipped_if_secret_missing():
+    settings = Settings(
+        max_bot_token_mgp_tour="bot-token",
+        max_webhook_secret_mgp_tour="",  # explicit empty — partial config
+    )
+    assert settings.tenant_bindings() == []
 
 
 def test_extract_message_handles_message_created():
@@ -85,7 +94,7 @@ def app_under_test(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr("app.webhook.MaxApiClient.__aenter__", _fake_aenter)
     monkeypatch.setattr("app.webhook.MaxApiClient.__aexit__", _fake_aexit)
 
-    settings = _settings("test-token")
+    settings = _settings(token="test-token")
     app = FastAPI()
     app.state.settings = settings
     app.state.chat_proxy = _StubChatProxy()
@@ -116,7 +125,7 @@ def test_webhook_accepts_valid_request_and_processes_in_background(app_under_tes
     }
     response = client.post(
         "/max/webhook",
-        headers={"Authorization": "test-token"},
+        headers={"X-Max-Bot-Api-Secret": "hook-secret"},
         json=update,
     )
     assert response.status_code == 200
@@ -132,7 +141,7 @@ def test_webhook_silently_drops_unhandled_updates(app_under_test):
     client = TestClient(app)
     response = client.post(
         "/max/webhook",
-        headers={"Authorization": "test-token"},
+        headers={"X-Max-Bot-Api-Secret": "hook-secret"},
         json={"update_type": "message_callback"},
     )
     assert response.status_code == 200

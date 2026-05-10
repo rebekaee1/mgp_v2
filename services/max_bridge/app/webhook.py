@@ -5,14 +5,21 @@ lifting (chat proxy + outbound MAX message) is done in a background task —
 MAX retries unanswered webhooks for up to 30s, so we want to take that path
 out of the critical path.
 
-Authentication strategy:
+Authentication strategy
+-----------------------
 
-* On the production side MAX sends our own ``bot_access_token`` in the
-  ``Authorization`` header (this is the documented "owner verification"
-  flow). We compare it constant-time against the configured token map.
-* If we ever set a custom ``secret`` when calling ``POST /subscriptions``,
-  MAX echoes that secret back in the same header — the comparison logic
-  works for both cases.
+Per https://dev.max.ru/docs-api/methods/POST/subscriptions, MAX echoes the
+``secret`` we pass at subscription time as the ``X-Max-Bot-Api-Secret``
+header on every webhook. We compare that header (constant-time) against
+each configured tenant's ``webhook_secret`` to:
+
+1. Authenticate the request was actually made by MAX, and
+2. Identify which tenant the bot belongs to (the MAX bot token is *not*
+   sent inbound, so we can't use it for routing).
+
+If MAX subscription was created without a secret, no auth header is sent
+and the request will be rejected here with 401. That's intentional —
+configure a webhook secret per tenant.
 """
 
 from __future__ import annotations
@@ -34,13 +41,17 @@ from .text_splitter import split_for_max
 router = APIRouter()
 logger = structlog.get_logger("max_bridge.webhook")
 
+# Headers we never log even by name, to avoid accidentally tipping off
+# what auth scheme is in use to a malicious caller.
+_SENSITIVE_HEADERS = {"authorization", "x-max-bot-api-secret", "cookie"}
 
-def _resolve_tenant(settings: Settings, authorization: Optional[str]) -> Optional[TenantBinding]:
-    if not authorization:
+
+def _resolve_tenant(settings: Settings, secret: Optional[str]) -> Optional[TenantBinding]:
+    if not secret:
         return None
-    token = authorization.strip()
+    candidate = secret.strip()
     for tenant in settings.tenant_bindings():
-        if hmac.compare_digest(tenant.bot_token, token):
+        if hmac.compare_digest(tenant.webhook_secret, candidate):
             return tenant
     return None
 
@@ -76,13 +87,24 @@ def _extract_message(update: dict[str, Any]) -> Optional[dict[str, Any]]:
 @router.post("/max/webhook", status_code=status.HTTP_200_OK)
 async def max_webhook(
     request: Request,
-    authorization: Optional[str] = Header(default=None),
+    x_max_bot_api_secret: Optional[str] = Header(default=None, alias="X-Max-Bot-Api-Secret"),
 ) -> dict[str, str]:
     settings: Settings = request.app.state.settings
-    tenant = _resolve_tenant(settings, authorization)
+    tenant = _resolve_tenant(settings, x_max_bot_api_secret)
     if tenant is None:
-        # Do not leak which token was tried — return a generic 401.
-        logger.warning("webhook_auth_failed", auth_present=bool(authorization))
+        # Surface the *names* of inbound headers (never the values) so we can
+        # diagnose subscription / proxy issues without leaking secrets.
+        safe_header_names = sorted(
+            name for name in request.headers.keys() if name.lower() not in _SENSITIVE_HEADERS
+        )
+        logger.warning(
+            "webhook_auth_failed",
+            secret_header_present=bool(x_max_bot_api_secret),
+            tenant_count=len(settings.tenant_bindings()),
+            client_ip=request.client.host if request.client else None,
+            user_agent=request.headers.get("user-agent"),
+            inbound_header_names=safe_header_names,
+        )
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED)
 
     cid = new_correlation_id()
