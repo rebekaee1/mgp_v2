@@ -1978,6 +1978,12 @@ def runtime_metadata():
                 "subtitle": (runtime.widget_config or {}).get("subtitle"),
                 "primary_color": (runtime.widget_config or {}).get("primary_color"),
                 "logo_url": (runtime.widget_config or {}).get("logo_url") or runtime.company_logo_url,
+                # Same welcome_message that the website widget shows on first
+                # contact (editable in dashboard → Widget Settings). Consumed
+                # by mgp-max-bridge to greet a MAX user on bot_started and
+                # after a /restart command. Stays in branding because it is
+                # purely a content concern, not a security/runtime one.
+                "welcome_message": (runtime.widget_config or {}).get("welcome_message"),
             },
         },
         "llm": {

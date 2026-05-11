@@ -120,7 +120,7 @@ def render_tour_card_caption(card: dict[str, Any]) -> str:
         📍 Турция · Сиде
         📅 18.05 → 25.05 · 7 ночей
         🍽 Всё включено · 🛏 Standard Double
-        ✈️ Перелёт включён · из Москвы · Pegas
+        ✈️ Перелёт включён · из Москвы
 
         *410 000 ₽* за двоих
     """
@@ -141,7 +141,6 @@ def render_tour_card_caption(card: dict[str, Any]) -> str:
     price_str = _format_price(card.get("price"))
     flight_included = bool(card.get("flight_included"))
     is_hotel_only = bool(card.get("is_hotel_only"))
-    operator = _md_escape(card.get("operator"))
     departure = _md_escape(card.get("departure_city"))
 
     header_parts: list[str] = []
@@ -182,8 +181,9 @@ def render_tour_card_caption(card: dict[str, Any]) -> str:
             travel_parts.append(f"✈️ Перелёт включён · из {departure}")
         else:
             travel_parts.append("✈️ Перелёт включён")
-    if operator and travel_parts:
-        travel_parts[0] += f" · {operator}"
+    # Operator name (Pegas, Coral, etc.) is intentionally NOT shown to the
+    # end user — it's an internal supplier detail that adds visual noise
+    # without buying decision value.
     travel_line = travel_parts[0] if travel_parts else ""
 
     price_line = ""

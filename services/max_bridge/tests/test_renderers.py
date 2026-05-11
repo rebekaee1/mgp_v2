@@ -114,11 +114,23 @@ def test_caption_includes_all_core_fields():
         "Standard Double",
         "✈️ Перелёт включён",
         "Москва",
-        "Pegas",
         "410 000 ₽",
         "за двоих",
     ]:
         assert needle in text, f"missing {needle!r} in caption:\n{text}"
+
+
+def test_caption_never_exposes_operator_name():
+    """Regression: operator/supplier names are internal — keep them out of the user-visible caption.
+
+    Renderers must not surface supplier names like Pegas / Coral / Anex etc.
+    even when present in the source tour_card dict from the backend.
+    """
+    card = dict(_HAPPY_CARD)
+    card["operator"] = "Pegas"
+    text = render_tour_card_caption(card)
+    for forbidden in ("Pegas", "Coral", "Anex", "Турплатформа", "оператор"):
+        assert forbidden not in text, f"caption leaked supplier name {forbidden!r}:\n{text}"
 
 
 def test_caption_truncated_when_pathological():

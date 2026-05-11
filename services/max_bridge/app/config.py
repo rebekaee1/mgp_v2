@@ -94,6 +94,17 @@ class Settings(BaseSettings):
     max_image_download_timeout: float = Field(default=5.0, description="seconds to wait when fetching the image from the source CDN")
     max_image_cache_ttl_seconds: int = Field(default=604800, description="how long to remember a hotel image → MAX media token (default 7 days)")
 
+    # ── Phase 2 v3: welcome message from the client dashboard ─────────
+    max_welcome_from_backend: bool = Field(
+        default=True,
+        description=(
+            "Master kill-switch for welcome-from-dashboard. Set MAX_WELCOME_FROM_BACKEND=0 "
+            "to instantly fall back to a minimal hard-coded greeting."
+        ),
+    )
+    max_welcome_cache_ttl_seconds: int = Field(default=600, description="bridge-side Redis cache for the welcome message (default 10 minutes)")
+    max_metadata_request_timeout: float = Field(default=5.0, description="HTTP timeout when bridge calls backend /api/runtime/metadata")
+
     def tenant_bindings(self) -> list[TenantBinding]:
         """Return the list of currently configured tenant bots.
 

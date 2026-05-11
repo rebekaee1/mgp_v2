@@ -51,10 +51,15 @@ from .renderers import (
     render_final_menu_text,
     render_tour_card_caption,
     render_tour_card_keyboard,
-    render_welcome_after_reset,
 )
+from .runtime_meta import RuntimeMetadataClient
 from .session_store import SessionStore
 from .text_splitter import split_for_max
+
+# Minimal hard-coded greeting we fall back to when the dashboard's
+# welcome_message is empty / the metadata fetch fails. Deliberately short
+# so it works for any branch even before they personalise the dashboard.
+_DEFAULT_WELCOME = "Здравствуйте! Я — ИИ-ассистент. Куда хотите поехать?"
 
 router = APIRouter()
 logger = structlog.get_logger("max_bridge.webhook")
@@ -117,13 +122,38 @@ def _resolve_tenant(settings: Settings, secret: Optional[str]) -> Optional[Tenan
 
 
 def _extract_message(update: dict[str, Any]) -> Optional[dict[str, Any]]:
-    """Return a normalised dict ``{chat_id, user_id, text}`` or None.
+    """Return a normalised dict describing the inbound event, or ``None``.
 
-    Handles a few shape variations seen in the docs to stay forward
-    compatible (``message_created`` is the primary update type, but the
-    sender/body shape changes slightly between API revisions).
+    Two event shapes are produced:
+
+    * ``{"event": "message", "user_id", "chat_id", "text"}`` for a normal
+      ``message_created`` (or its legacy ``message`` alias).
+    * ``{"event": "bot_started", "user_id", "chat_id"}`` for the platform
+      event MAX fires when a user opens the bot for the first time or
+      clicks the in-chat "Start" / "Старт" button. No ``text`` field —
+      the welcome is sourced from the dashboard (or a default).
+
+    Anything else returns ``None`` so the webhook handler just acks the
+    delivery and stays quiet.
     """
     update_type = update.get("update_type") or update.get("type")
+
+    if update_type == "bot_started":
+        # MAX bot_started payload (real-world capture):
+        #   { update_type, chat_id, user: {user_id, ...}, payload, timestamp }
+        # Sometimes the sender info lives under "user", sometimes under
+        # "sender" — accept both.
+        user = update.get("user") or update.get("sender") or {}
+        user_id = user.get("user_id") or user.get("id")
+        chat_id = update.get("chat_id")
+        if user_id is None:
+            return None
+        return {
+            "event": "bot_started",
+            "user_id": int(user_id),
+            "chat_id": int(chat_id) if chat_id is not None else None,
+        }
+
     if update_type not in {"message_created", "message"}:
         return None
     message = update.get("message") or {}
@@ -138,6 +168,7 @@ def _extract_message(update: dict[str, Any]) -> Optional[dict[str, Any]]:
     if user_id is None:
         return None
     return {
+        "event": "message",
         "user_id": int(user_id),
         "chat_id": int(chat_id) if chat_id is not None else None,
         "text": text,
@@ -186,19 +217,133 @@ async def max_webhook(
         return {"ok": "true"}
 
     asyncio.create_task(
-        _process_message(
+        _process_event(
             tenant=tenant,
             settings=settings,
             session_store=request.app.state.session_store,
             chat_proxy=request.app.state.chat_proxy,
             image_cache=request.app.state.image_cache,
-            user_id=parsed["user_id"],
-            chat_id=parsed["chat_id"],
-            text=parsed["text"],
+            runtime_meta=request.app.state.runtime_meta,
+            event=parsed,
             correlation_id=cid,
         )
     )
     return {"ok": "true"}
+
+
+async def _process_event(
+    *,
+    tenant: TenantBinding,
+    settings: Settings,
+    session_store: SessionStore,
+    chat_proxy: ChatProxy,
+    image_cache: ImageCache,
+    runtime_meta: RuntimeMetadataClient,
+    event: dict[str, Any],
+    correlation_id: str,
+) -> None:
+    """Dispatch by event type. bot_started → welcome; message → chat flow."""
+    kind = event.get("event")
+    user_id = event["user_id"]
+    chat_id = event.get("chat_id")
+    log = logger.bind(correlation_id=correlation_id, tenant=tenant.slug, user_id=user_id)
+
+    if kind == "bot_started":
+        log.info("bot_started_received")
+        try:
+            await _send_welcome(
+                tenant=tenant,
+                settings=settings,
+                runtime_meta=runtime_meta,
+                chat_id=chat_id,
+                user_id=user_id,
+                log=log,
+                trigger="bot_started",
+            )
+        except Exception:
+            log.exception("bot_started_failed")
+        return
+
+    if kind == "message":
+        await _process_message(
+            tenant=tenant,
+            settings=settings,
+            session_store=session_store,
+            chat_proxy=chat_proxy,
+            image_cache=image_cache,
+            runtime_meta=runtime_meta,
+            user_id=user_id,
+            chat_id=chat_id,
+            text=event["text"],
+            correlation_id=correlation_id,
+        )
+        return
+
+    log.info("unknown_event_dropped", kind=kind)
+
+
+async def _resolve_welcome_text(
+    *,
+    settings: Settings,
+    runtime_meta: RuntimeMetadataClient,
+    assistant_id: str,
+    log: structlog.stdlib.BoundLogger,
+) -> str:
+    """Fetch welcome from the dashboard (cached), falling back gracefully.
+
+    Order:
+    1. If MAX_WELCOME_FROM_BACKEND is off → minimal default immediately.
+    2. Ask RuntimeMetadataClient (Redis-cached). On any failure → default.
+    """
+    if not settings.max_welcome_from_backend:
+        return _DEFAULT_WELCOME
+    try:
+        welcome = await runtime_meta.get_welcome_message(assistant_id)
+    except Exception:
+        log.exception("welcome_resolve_failed")
+        welcome = None
+    if welcome:
+        return welcome
+    return _DEFAULT_WELCOME
+
+
+async def _send_welcome(
+    *,
+    tenant: TenantBinding,
+    settings: Settings,
+    runtime_meta: RuntimeMetadataClient,
+    chat_id: Optional[int],
+    user_id: int,
+    log: structlog.stdlib.BoundLogger,
+    trigger: str,
+) -> None:
+    """Send the dashboard-sourced welcome message via a fresh MAX client."""
+    text = await _resolve_welcome_text(
+        settings=settings,
+        runtime_meta=runtime_meta,
+        assistant_id=tenant.assistant_id,
+        log=log,
+    )
+    try:
+        async with MaxApiClient(
+            base_url=settings.max_api_base_url,
+            bot_token=tenant.bot_token,
+            timeout=settings.max_api_request_timeout_seconds,
+        ) as client:
+            await client.send_text(
+                chat_id=chat_id,
+                user_id=user_id if chat_id is None else None,
+                text=text,
+            )
+        log.info("welcome_sent", trigger=trigger, source="dashboard" if text != _DEFAULT_WELCOME else "default")
+    except MaxApiError as exc:
+        log.error(
+            "welcome_send_failed",
+            trigger=trigger,
+            status=exc.status_code,
+            code=exc.code,
+            message=exc.message,
+        )
 
 
 async def _process_message(
@@ -208,6 +353,7 @@ async def _process_message(
     session_store: SessionStore,
     chat_proxy: ChatProxy,
     image_cache: ImageCache,
+    runtime_meta: RuntimeMetadataClient,
     user_id: int,
     chat_id: Optional[int],
     text: str,
@@ -229,24 +375,21 @@ async def _process_message(
         if _is_reset_command(text):
             await session_store.reset_session(user_id)
             log.info("session_reset_by_user", trigger=text[:50])
+            # Use the dashboard-sourced welcome so /restart and bot_started
+            # show the same client-facing greeting. Falls back to a minimal
+            # default if the dashboard text is empty or backend is down.
             try:
-                async with MaxApiClient(
-                    base_url=settings.max_api_base_url,
-                    bot_token=tenant.bot_token,
-                    timeout=settings.max_api_request_timeout_seconds,
-                ) as reset_client:
-                    await reset_client.send_text(
-                        chat_id=chat_id,
-                        user_id=user_id if chat_id is None else None,
-                        text=render_welcome_after_reset(),
-                    )
-            except MaxApiError as exc:
-                log.error(
-                    "reset_welcome_send_failed",
-                    status=exc.status_code,
-                    code=exc.code,
-                    message=exc.message,
+                await _send_welcome(
+                    tenant=tenant,
+                    settings=settings,
+                    runtime_meta=runtime_meta,
+                    chat_id=chat_id,
+                    user_id=user_id,
+                    log=log,
+                    trigger="reset_command",
                 )
+            except Exception:
+                log.exception("reset_welcome_failed")
             return
 
         session_id, created = await session_store.get_or_create_session(user_id)

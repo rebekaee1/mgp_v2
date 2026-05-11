@@ -14,6 +14,25 @@ from app.session_store import SessionStore
 from app.webhook import _extract_message, _is_reset_command, _resolve_tenant, router
 
 
+class _FakeRuntimeMeta:
+    """Minimal in-memory stand-in for RuntimeMetadataClient.
+
+    Tests control what welcome to return via ``welcome``; ``calls`` counts
+    fetches so tests can assert cache hits / single fetch per event.
+    """
+
+    def __init__(self, welcome: str | None = None) -> None:
+        self.welcome = welcome
+        self.calls = 0
+
+    async def get_welcome_message(self, assistant_id: str):
+        self.calls += 1
+        return self.welcome
+
+    async def aclose(self) -> None:
+        pass
+
+
 def _settings(*, token: str = "bot-token", secret: str = "hook-secret",
               render_tour_cards: bool = True, tour_cards_limit: int = 3) -> Settings:
     return Settings(
@@ -63,13 +82,40 @@ def test_extract_message_handles_message_created():
         },
     }
     parsed = _extract_message(update)
-    assert parsed == {"user_id": 12345, "chat_id": 999, "text": "Турция в июне"}
+    assert parsed == {"event": "message", "user_id": 12345, "chat_id": 999, "text": "Турция в июне"}
 
 
 def test_extract_message_returns_none_for_other_updates():
     assert _extract_message({"update_type": "message_callback"}) is None
     assert _extract_message({"update_type": "message_created", "message": {}}) is None
     assert _extract_message({"update_type": "message_created", "message": {"body": {"text": "  "}}}) is None
+
+
+def test_extract_message_handles_bot_started_user_shape():
+    """MAX sends bot_started with `user` block (real payload from prod)."""
+    update = {
+        "update_type": "bot_started",
+        "chat_id": 555,
+        "user": {"user_id": 12345, "name": "Иван"},
+        "timestamp": 1778411500000,
+    }
+    parsed = _extract_message(update)
+    assert parsed == {"event": "bot_started", "user_id": 12345, "chat_id": 555}
+
+
+def test_extract_message_handles_bot_started_sender_shape():
+    """Tolerant of an alternate payload where the user lives under `sender`."""
+    update = {
+        "update_type": "bot_started",
+        "chat_id": 1,
+        "sender": {"user_id": 42},
+    }
+    parsed = _extract_message(update)
+    assert parsed == {"event": "bot_started", "user_id": 42, "chat_id": 1}
+
+
+def test_extract_message_bot_started_without_user_returns_none():
+    assert _extract_message({"update_type": "bot_started", "chat_id": 1}) is None
 
 
 # ── fixtures ───────────────────────────────────────────────────────────
@@ -104,7 +150,8 @@ def _sample_cards(n: int = 5) -> list[dict[str, Any]]:
 
 
 def _build_app(*, settings: Settings, tour_cards: list[dict[str, Any]],
-               sent_messages: list[dict[str, Any]]) -> FastAPI:
+               sent_messages: list[dict[str, Any]],
+               welcome: str | None = None) -> FastAPI:
     class _StubChatProxy:
         async def chat(self, *, message: str, session_id: str, assistant_id: str):
             return ChatResponse(
@@ -125,6 +172,7 @@ def _build_app(*, settings: Settings, tour_cards: list[dict[str, Any]],
     app.state.image_cache = ImageCache(
         fake_aioredis.FakeRedis(decode_responses=True), ttl_seconds=60
     )
+    app.state.runtime_meta = _FakeRuntimeMeta(welcome=welcome)
     app.include_router(router)
     return app
 
@@ -403,7 +451,11 @@ def test_is_reset_command_rejects_non_reset_messages(text):
 
 
 def test_webhook_reset_command_wipes_session_and_replies_welcome(monkeypatch):
-    """End-to-end: pre-seed a session, send /restart → session erased, welcome sent, chat_proxy NOT called."""
+    """End-to-end: pre-seed a session, send /restart → session erased, welcome sent, chat_proxy NOT called.
+
+    The welcome text comes from the dashboard (RuntimeMetadataClient). When
+    the stub returns None — the default greeting is used.
+    """
     sent_messages: list[dict[str, Any]] = []
     _patch_max_client(monkeypatch, sent_messages)
 
@@ -423,10 +475,10 @@ def test_webhook_reset_command_wipes_session_and_replies_welcome(monkeypatch):
     redis = fake_aioredis.FakeRedis(decode_responses=True)
     app.state.session_store = SessionStore(redis, ttl_seconds=60)
     app.state.image_cache = ImageCache(fake_aioredis.FakeRedis(decode_responses=True), ttl_seconds=60)
+    app.state.runtime_meta = _FakeRuntimeMeta(welcome=None)  # → fallback default
     app.include_router(router)
 
     user_id = 4242
-    # Pre-seed a session so we can verify it actually gets wiped.
     loop = asyncio.get_event_loop()
     loop.run_until_complete(app.state.session_store.get_or_create_session(user_id))
     assert loop.run_until_complete(app.state.session_store.get_session(user_id)) is not None
@@ -440,15 +492,131 @@ def test_webhook_reset_command_wipes_session_and_replies_welcome(monkeypatch):
     assert response.status_code == 200
     loop.run_until_complete(asyncio.sleep(0.1))
 
-    # session is gone in Redis
     assert loop.run_until_complete(app.state.session_store.get_session(user_id)) is None
-    # chat_proxy was NOT invoked
     assert chat_proxy_calls[0] == 0
-    # exactly one outbound welcome message was sent, attachments absent
     assert len(sent_messages) == 1
     welcome = sent_messages[0]
-    assert "чистого листа" in welcome["text"] or "заново" in welcome["text"]
+    # Fallback greeting (welcome=None from dashboard).
+    assert "ИИ-ассистент" in welcome["text"] or "Куда хотите" in welcome["text"]
     assert not welcome.get("attachments")
+
+
+def test_webhook_reset_command_uses_dashboard_welcome_when_set(monkeypatch):
+    """If the dashboard has a welcome_message, /restart uses it verbatim."""
+    sent_messages: list[dict[str, Any]] = []
+    _patch_max_client(monkeypatch, sent_messages)
+
+    chat_proxy_calls = [0]
+
+    class _CountingChatProxy:
+        async def chat(self, *, message, session_id, assistant_id):
+            chat_proxy_calls[0] += 1
+            return ChatResponse(reply="x", tour_cards=[], conversation_id=session_id)
+
+        async def aclose(self): pass
+
+    custom_welcome = "Привет! Я Анна из МГП Тур. Куда едем?"
+    app = FastAPI()
+    app.state.settings = _settings(token="test-token")
+    app.state.chat_proxy = _CountingChatProxy()
+    app.state.session_store = SessionStore(fake_aioredis.FakeRedis(decode_responses=True), ttl_seconds=60)
+    app.state.image_cache = ImageCache(fake_aioredis.FakeRedis(decode_responses=True), ttl_seconds=60)
+    app.state.runtime_meta = _FakeRuntimeMeta(welcome=custom_welcome)
+    app.include_router(router)
+
+    client = TestClient(app)
+    response = client.post(
+        "/max/webhook",
+        headers={"X-Max-Bot-Api-Secret": "hook-secret"},
+        json=_send_message_event("/restart"),
+    )
+    assert response.status_code == 200
+    asyncio.get_event_loop().run_until_complete(asyncio.sleep(0.1))
+    assert chat_proxy_calls[0] == 0
+    assert len(sent_messages) == 1
+    assert sent_messages[0]["text"] == custom_welcome
+    assert app.state.runtime_meta.calls == 1
+
+
+def _bot_started_event(user_id: int = 7, chat_id: int = 7) -> dict[str, Any]:
+    return {
+        "update_type": "bot_started",
+        "chat_id": chat_id,
+        "user": {"user_id": user_id, "name": "Test"},
+        "timestamp": 1778411500000,
+    }
+
+
+def test_webhook_bot_started_sends_dashboard_welcome(monkeypatch):
+    sent_messages: list[dict[str, Any]] = []
+    _patch_max_client(monkeypatch, sent_messages)
+
+    custom_welcome = "Здравствуйте! Чем помочь?"
+    app = _build_app(
+        settings=_settings(token="test-token"),
+        tour_cards=[],
+        sent_messages=sent_messages,
+        welcome=custom_welcome,
+    )
+    client = TestClient(app)
+    response = client.post(
+        "/max/webhook",
+        headers={"X-Max-Bot-Api-Secret": "hook-secret"},
+        json=_bot_started_event(),
+    )
+    assert response.status_code == 200
+    asyncio.get_event_loop().run_until_complete(asyncio.sleep(0.1))
+    assert len(sent_messages) == 1
+    assert sent_messages[0]["text"] == custom_welcome
+    assert not sent_messages[0].get("attachments")
+
+
+def test_webhook_bot_started_falls_back_to_default_when_dashboard_empty(monkeypatch):
+    sent_messages: list[dict[str, Any]] = []
+    _patch_max_client(monkeypatch, sent_messages)
+    app = _build_app(
+        settings=_settings(token="test-token"),
+        tour_cards=[],
+        sent_messages=sent_messages,
+        welcome=None,
+    )
+    client = TestClient(app)
+    response = client.post(
+        "/max/webhook",
+        headers={"X-Max-Bot-Api-Secret": "hook-secret"},
+        json=_bot_started_event(),
+    )
+    assert response.status_code == 200
+    asyncio.get_event_loop().run_until_complete(asyncio.sleep(0.1))
+    assert len(sent_messages) == 1
+    assert "ИИ-ассистент" in sent_messages[0]["text"]
+
+
+def test_webhook_welcome_kill_switch_skips_dashboard_call(monkeypatch):
+    """MAX_WELCOME_FROM_BACKEND=0 → bridge does not even try to fetch dashboard."""
+    sent_messages: list[dict[str, Any]] = []
+    _patch_max_client(monkeypatch, sent_messages)
+
+    settings = _settings(token="test-token")
+    settings.max_welcome_from_backend = False  # type: ignore[attr-defined]
+
+    app = _build_app(
+        settings=settings,
+        tour_cards=[],
+        sent_messages=sent_messages,
+        welcome="should-not-be-used",
+    )
+    client = TestClient(app)
+    response = client.post(
+        "/max/webhook",
+        headers={"X-Max-Bot-Api-Secret": "hook-secret"},
+        json=_bot_started_event(),
+    )
+    assert response.status_code == 200
+    asyncio.get_event_loop().run_until_complete(asyncio.sleep(0.1))
+    assert app.state.runtime_meta.calls == 0, "kill-switch must short-circuit the fetch"
+    assert len(sent_messages) == 1
+    assert "ИИ-ассистент" in sent_messages[0]["text"]
 
 
 @pytest.mark.parametrize("trigger", [
@@ -479,6 +647,7 @@ def test_webhook_reset_triggers_for_multiple_phrasings(monkeypatch, trigger):
     app.state.image_cache = ImageCache(
         fake_aioredis.FakeRedis(decode_responses=True), ttl_seconds=60
     )
+    app.state.runtime_meta = _FakeRuntimeMeta(welcome=None)
     app.include_router(router)
 
     client = TestClient(app)
@@ -492,7 +661,8 @@ def test_webhook_reset_triggers_for_multiple_phrasings(monkeypatch, trigger):
 
     assert chat_proxy_calls[0] == 0, f"chat_proxy must NOT be called for trigger={trigger!r}"
     assert len(sent_messages) == 1
-    assert "чистого листа" in sent_messages[0]["text"] or "заново" in sent_messages[0]["text"]
+    # With welcome=None the bridge uses the fallback default text.
+    assert "ИИ-ассистент" in sent_messages[0]["text"] or "Куда хотите" in sent_messages[0]["text"]
 
 
 def test_webhook_normal_message_still_calls_chat_proxy(monkeypatch):
