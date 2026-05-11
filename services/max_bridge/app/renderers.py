@@ -249,13 +249,34 @@ def render_final_menu_text() -> str:
     return "Что дальше? 🌴"
 
 
+def render_welcome_after_reset() -> str:
+    """One-shot reply sent after a user-triggered session reset.
+
+    Deliberately short: no inline keyboard, no quick-start suggestions. The
+    next message from the user will go through the normal pipeline with a
+    fresh ``session_id`` and create a brand-new backend handler — the
+    assistant's own greeting/slot-cascade takes over from there.
+    """
+    return "🆕 Готово, начинаем с чистого листа! Куда хотите поехать?"
+
+
 def render_final_menu_keyboard() -> dict[str, Any]:
-    """Final menu under the cards (Variant A).
+    """Final menu under the cards (v2: card-anchored).
 
     All buttons are ``message`` type so the assistant handles them via the
-    normal chat pipeline — no callback handler needed in v1. The set is
-    intentionally refine-focused: the user keeps interacting with the
-    assistant instead of bouncing straight to the manager.
+    normal chat pipeline — no callback handler needed.
+
+    Design notes:
+    * Two refine actions (details + pagination) sit in row 1; the specific
+      "Уточнить перелёт" lives in row 2 on its own to avoid label truncation
+      in narrow MAX viewports (3-up rows clip text).
+    * ``payload`` strings are intentionally short, natural Russian phrases.
+      They map onto rules in ``system_prompt.md`` (see "MAX-меню после
+      показа карточек" — same wording is matched there) so that nothing
+      magic is needed in the bridge: the assistant simply receives a normal
+      user message and replies according to the new rules. The "покажи
+      ещё" payload reuses the long-standing phrase that the prompt already
+      routes to ``continue_search``.
     """
     return {
         "type": "inline_keyboard",
@@ -264,25 +285,20 @@ def render_final_menu_keyboard() -> dict[str, Any]:
                 [
                     {
                         "type": "message",
-                        "text": "🔧 Уточнить параметры",
-                        "payload": "хочу уточнить параметры поиска",
+                        "text": "🔍 Уточнить детали",
+                        "payload": "уточнить детали по варианту",
                     },
                     {
                         "type": "message",
-                        "text": "💸 Подешевле",
-                        "payload": "найди подешевле",
+                        "text": "📋 Показать ещё",
+                        "payload": "покажи ещё",
                     },
                 ],
                 [
                     {
                         "type": "message",
-                        "text": "⭐ Получше звёзды",
-                        "payload": "найди отели с более высокой звёздностью",
-                    },
-                    {
-                        "type": "message",
                         "text": "✈️ Уточнить перелёт",
-                        "payload": "расскажи про перелёт по этим турам",
+                        "payload": "уточнить перелёт по варианту",
                     },
                 ],
             ]

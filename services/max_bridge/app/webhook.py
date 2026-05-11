@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import asyncio
 import hmac
+import re
 from typing import Any, Optional
 
 import httpx
@@ -50,6 +51,7 @@ from .renderers import (
     render_final_menu_text,
     render_tour_card_caption,
     render_tour_card_keyboard,
+    render_welcome_after_reset,
 )
 from .session_store import SessionStore
 from .text_splitter import split_for_max
@@ -60,6 +62,48 @@ logger = structlog.get_logger("max_bridge.webhook")
 # Headers we never log even by name, to avoid accidentally tipping off
 # what auth scheme is in use to a malicious caller.
 _SENSITIVE_HEADERS = {"authorization", "x-max-bot-api-secret", "cookie"}
+
+# Slash-commands and full-text phrases that wipe the session and start over.
+# The match is intentionally STRICT (whole message after lower-casing /
+# trimming / normalising ``ё→е``) so accidental wording in the middle of a
+# real query (e.g. "забудь всё что я говорил и подбери Турцию") does NOT
+# trigger a reset. See system_prompt.md §17.2 for the surrounding context.
+_RESET_SLASH = frozenset({"/restart", "/new", "/start", "/reset"})
+_RESET_PHRASE_RE = re.compile(
+    r"^(?:"
+    r"начать заново"
+    r"|начнем заново"
+    r"|начнем сначала"
+    r"|новый диалог|новый чат"
+    r"|сброс|сбросить диалог|сбрось диалог|сбрось чат"
+    r"|обнули контекст|обнулить контекст|обнули диалог|обнулить диалог"
+    r"|забудь все"
+    r"|reset|restart"
+    r")[.!\s]*$"
+)
+
+
+def _is_reset_command(text: str) -> bool:
+    """Return True if the inbound message is a *reset whole session* request.
+
+    Matches:
+    * whole-message slash-commands ``/restart``, ``/new``, ``/start``,
+      ``/reset`` (no arguments — ``/start foo`` is treated as a deep-link,
+      not a reset).
+    * a curated list of Russian phrases; ``ё`` is normalised to ``е`` and
+      trailing ``. ! whitespace`` is trimmed so user variations like
+      ``"Начать заново."`` or ``"Забудь всё!"`` still match.
+    """
+    if not text:
+        return False
+    stripped = text.strip()
+    if not stripped:
+        return False
+    head = stripped.split(None, 1)[0].lower()
+    if head in _RESET_SLASH:
+        return len(stripped.split()) == 1
+    normalised = stripped.lower().replace("ё", "е")
+    return _RESET_PHRASE_RE.match(normalised) is not None
 
 
 def _resolve_tenant(settings: Settings, secret: Optional[str]) -> Optional[TenantBinding]:
@@ -177,6 +221,34 @@ async def _process_message(
     """
     log = logger.bind(correlation_id=correlation_id, tenant=tenant.slug, user_id=user_id)
     try:
+        # ── Reset command short-circuit ───────────────────────────────────
+        # User can type /restart, /new, /start, /reset or a Russian phrase
+        # ("начать заново", "забудь всё", …). We wipe the Redis session
+        # mapping so the very next user message gets a fresh session_id and
+        # a brand-new backend handler — no need to call the chat proxy here.
+        if _is_reset_command(text):
+            await session_store.reset_session(user_id)
+            log.info("session_reset_by_user", trigger=text[:50])
+            try:
+                async with MaxApiClient(
+                    base_url=settings.max_api_base_url,
+                    bot_token=tenant.bot_token,
+                    timeout=settings.max_api_request_timeout_seconds,
+                ) as reset_client:
+                    await reset_client.send_text(
+                        chat_id=chat_id,
+                        user_id=user_id if chat_id is None else None,
+                        text=render_welcome_after_reset(),
+                    )
+            except MaxApiError as exc:
+                log.error(
+                    "reset_welcome_send_failed",
+                    status=exc.status_code,
+                    code=exc.code,
+                    message=exc.message,
+                )
+            return
+
         session_id, created = await session_store.get_or_create_session(user_id)
         log.info("session_resolved", session_id=session_id[:18], created=created)
         chat_response = await chat_proxy.chat(

@@ -11,7 +11,7 @@ from app.config import Settings
 from app.image_cache import ImageCache
 from app.max_api import MaxApiError
 from app.session_store import SessionStore
-from app.webhook import _extract_message, _resolve_tenant, router
+from app.webhook import _extract_message, _is_reset_command, _resolve_tenant, router
 
 
 def _settings(*, token: str = "bot-token", secret: str = "hook-secret",
@@ -335,3 +335,178 @@ def test_webhook_falls_back_to_text_only_card_when_image_upload_fails(monkeypatc
         assert "image" not in types, f"card #{i} unexpectedly has an image: {msg}"
         # The booking-link keyboard must still be present.
         assert "inline_keyboard" in types, f"card #{i} missing keyboard: {msg}"
+
+
+# ── _is_reset_command unit tests ───────────────────────────────────────
+
+
+@pytest.mark.parametrize("text", [
+    "/restart", "/new", "/start", "/reset",
+    "/Restart", "/RESET", " /restart ",
+])
+def test_is_reset_command_slash_commands_match(text):
+    assert _is_reset_command(text) is True
+
+
+@pytest.mark.parametrize("text", [
+    "/start 12345",     # deep-link with arg
+    "/restart please",  # extra wording
+    "/foo", "/bar",     # unrelated commands
+])
+def test_is_reset_command_slash_with_args_rejected(text):
+    assert _is_reset_command(text) is False
+
+
+@pytest.mark.parametrize("text", [
+    "начать заново",
+    "Начать заново",
+    "Начать заново.",
+    "начать заново!",
+    "новый диалог",
+    "новый чат",
+    "сброс",
+    "сбросить диалог",
+    "сбрось диалог",
+    "сбрось чат",
+    "обнули контекст",
+    "обнулить диалог",
+    "забудь всё",
+    "Забудь всё.",
+    "забудь все",      # without ё
+    "ЗАБУДЬ ВСЁ!",
+    "reset",
+    "Restart",
+    "начнём сначала",
+    "начнем заново",
+])
+def test_is_reset_command_russian_phrases_match(text):
+    assert _is_reset_command(text) is True, f"should match: {text!r}"
+
+
+@pytest.mark.parametrize("text", [
+    "",
+    "   ",
+    "забудь всё что я говорил и подбери Турцию",  # partial — NOT a full match
+    "хочу начать заново планирование",
+    "сбрось мне варианты подешевле",
+    "новый диалог про Египет",
+    "Турция, май, до 200к",
+    "/start с балкона",
+    "покажи ещё",
+    "уточнить детали по варианту",
+])
+def test_is_reset_command_rejects_non_reset_messages(text):
+    assert _is_reset_command(text) is False, f"should NOT match: {text!r}"
+
+
+# ── reset flow integration ─────────────────────────────────────────────
+
+
+def test_webhook_reset_command_wipes_session_and_replies_welcome(monkeypatch):
+    """End-to-end: pre-seed a session, send /restart → session erased, welcome sent, chat_proxy NOT called."""
+    sent_messages: list[dict[str, Any]] = []
+    _patch_max_client(monkeypatch, sent_messages)
+
+    chat_proxy_calls = [0]
+
+    class _CountingChatProxy:
+        async def chat(self, *, message, session_id, assistant_id):
+            chat_proxy_calls[0] += 1
+            return ChatResponse(reply="should not be called", tour_cards=[], conversation_id=session_id)
+
+        async def aclose(self):
+            pass
+
+    app = FastAPI()
+    app.state.settings = _settings(token="test-token")
+    app.state.chat_proxy = _CountingChatProxy()
+    redis = fake_aioredis.FakeRedis(decode_responses=True)
+    app.state.session_store = SessionStore(redis, ttl_seconds=60)
+    app.state.image_cache = ImageCache(fake_aioredis.FakeRedis(decode_responses=True), ttl_seconds=60)
+    app.include_router(router)
+
+    user_id = 4242
+    # Pre-seed a session so we can verify it actually gets wiped.
+    loop = asyncio.get_event_loop()
+    loop.run_until_complete(app.state.session_store.get_or_create_session(user_id))
+    assert loop.run_until_complete(app.state.session_store.get_session(user_id)) is not None
+
+    client = TestClient(app)
+    response = client.post(
+        "/max/webhook",
+        headers={"X-Max-Bot-Api-Secret": "hook-secret"},
+        json=_send_message_event("/restart", user_id=user_id),
+    )
+    assert response.status_code == 200
+    loop.run_until_complete(asyncio.sleep(0.1))
+
+    # session is gone in Redis
+    assert loop.run_until_complete(app.state.session_store.get_session(user_id)) is None
+    # chat_proxy was NOT invoked
+    assert chat_proxy_calls[0] == 0
+    # exactly one outbound welcome message was sent, attachments absent
+    assert len(sent_messages) == 1
+    welcome = sent_messages[0]
+    assert "чистого листа" in welcome["text"] or "заново" in welcome["text"]
+    assert not welcome.get("attachments")
+
+
+@pytest.mark.parametrize("trigger", [
+    "забудь всё",
+    "Начать заново.",
+    "новый диалог",
+    "/new",
+])
+def test_webhook_reset_triggers_for_multiple_phrasings(monkeypatch, trigger):
+    sent_messages: list[dict[str, Any]] = []
+    _patch_max_client(monkeypatch, sent_messages)
+    chat_proxy_calls = [0]
+
+    class _CountingChatProxy:
+        async def chat(self, *, message, session_id, assistant_id):
+            chat_proxy_calls[0] += 1
+            return ChatResponse(reply="x", tour_cards=[], conversation_id=session_id)
+
+        async def aclose(self):
+            pass
+
+    app = FastAPI()
+    app.state.settings = _settings(token="test-token")
+    app.state.chat_proxy = _CountingChatProxy()
+    app.state.session_store = SessionStore(
+        fake_aioredis.FakeRedis(decode_responses=True), ttl_seconds=60
+    )
+    app.state.image_cache = ImageCache(
+        fake_aioredis.FakeRedis(decode_responses=True), ttl_seconds=60
+    )
+    app.include_router(router)
+
+    client = TestClient(app)
+    response = client.post(
+        "/max/webhook",
+        headers={"X-Max-Bot-Api-Secret": "hook-secret"},
+        json=_send_message_event(trigger),
+    )
+    assert response.status_code == 200
+    asyncio.get_event_loop().run_until_complete(asyncio.sleep(0.05))
+
+    assert chat_proxy_calls[0] == 0, f"chat_proxy must NOT be called for trigger={trigger!r}"
+    assert len(sent_messages) == 1
+    assert "чистого листа" in sent_messages[0]["text"] or "заново" in sent_messages[0]["text"]
+
+
+def test_webhook_normal_message_still_calls_chat_proxy(monkeypatch):
+    """Sanity guard: free-form text routes to the backend (no false reset)."""
+    sent_messages: list[dict[str, Any]] = []
+    _patch_max_client(monkeypatch, sent_messages)
+    app = _build_app(settings=_settings(token="test-token"), tour_cards=[],
+                     sent_messages=sent_messages)
+    client = TestClient(app)
+    response = client.post(
+        "/max/webhook",
+        headers={"X-Max-Bot-Api-Secret": "hook-secret"},
+        json=_send_message_event("Турция, май"),
+    )
+    assert response.status_code == 200
+    asyncio.get_event_loop().run_until_complete(asyncio.sleep(0.1))
+    assert any(m["text"].startswith("reply:") for m in sent_messages)

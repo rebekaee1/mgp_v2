@@ -10,6 +10,7 @@ from app.renderers import (
     render_final_menu_text,
     render_tour_card_caption,
     render_tour_card_keyboard,
+    render_welcome_after_reset,
 )
 
 
@@ -205,3 +206,59 @@ def test_final_menu_keyboard_only_message_type():
         assert btn["type"] == "message", f"final-menu must use message type, got {btn['type']}"
         assert btn.get("text"), "menu button must have text"
         assert btn.get("payload"), "menu button must have payload"
+
+
+def test_final_menu_layout_two_plus_one():
+    """Two refine buttons in row 1, the per-flight specialisation alone in row 2.
+
+    Lets MAX render full button labels on a narrow viewport (3-up rows
+    truncate text on mobile).
+    """
+    kb = render_final_menu_keyboard()
+    rows = kb["payload"]["buttons"]
+    assert len(rows) == 2
+    assert len(rows[0]) == 2
+    assert len(rows[1]) == 1
+
+
+def test_final_menu_has_three_card_anchored_actions():
+    """v2 menu: details + show-more + flight; no shopping cues (Cheaper/Better)."""
+    kb = render_final_menu_keyboard()
+    flat = [btn for row in kb["payload"]["buttons"] for btn in row]
+    texts = {btn["text"] for btn in flat}
+    payloads = {btn["payload"] for btn in flat}
+
+    # Exact set — guards against accidental future additions/removals.
+    assert texts == {"🔍 Уточнить детали", "📋 Показать ещё", "✈️ Уточнить перелёт"}
+
+    # Payloads must match the wording learnt by system_prompt.md so the
+    # assistant routes them to the correct behaviour without magic.
+    assert payloads == {
+        "уточнить детали по варианту",
+        "покажи ещё",
+        "уточнить перелёт по варианту",
+    }
+
+
+def test_final_menu_dropped_legacy_shopping_buttons():
+    """Регрессия: «Подешевле» / «Получше звёзды» из v1 не должны вернуться."""
+    kb = render_final_menu_keyboard()
+    flat = [btn for row in kb["payload"]["buttons"] for btn in row]
+    texts = " | ".join(b["text"] for b in flat)
+    payloads = " | ".join(b["payload"] for b in flat)
+    for forbidden in ("Подешевле", "Получше", "подешевле", "звёздностью"):
+        assert forbidden not in texts, f"legacy button text returned: {forbidden}"
+        assert forbidden not in payloads, f"legacy payload returned: {forbidden}"
+
+
+# ── welcome after reset ────────────────────────────────────────────────
+
+
+def test_welcome_after_reset_short_and_meaningful():
+    text = render_welcome_after_reset()
+    assert text
+    assert len(text) < 200
+    # Must explicitly signal a fresh start to the user.
+    assert "чистого листа" in text or "заново" in text
+    # Must prompt the user for the next step (avoid a dead-end message).
+    assert "?" in text
