@@ -1,0 +1,49 @@
+{
+  "scenario": {
+    "sid": "S01_turkey_100k",
+    "description": "Турция, июнь 2026, 7 ночей, 2 взр, бюджет до 100к",
+    "budget_phrase": "до 100 000 рублей",
+    "direction": "Турцию",
+    "departure": "Москва",
+    "dates": "03.06.2026",
+    "nights": 7,
+    "composition": "2 взрослых",
+    "qc": "4 звезды, всё включено",
+    "expected_pricefrom": 70000,
+    "expected_priceto": 100000,
+    "expects_floor_applied": true,
+    "expects_auto_retry": false,
+    "note": ""
+  },
+  "runtime": {
+    "elapsed_s": 88.05,
+    "steps": 4,
+    "conv_id": "bfcedeef-aff3-49b4-a297-cda52638c0e2"
+  },
+  "messages_sent": [
+    "Привет! Подбери тур из Москва в Турцию для 2 взрослых, вылет 03.06.2026, на 7 ночей. Бюджет до 100 000 рублей. 4 звезды, всё включено.",
+    "4 звезды, всё включено.",
+    "4 звезды, всё включено.",
+    "4 звезды, всё включено."
+  ],
+  "final_payload": {
+    "conversation_id": "bfcedeef-aff3-49b4-a297-cda52638c0e2",
+    "crm_submitted": false,
+    "reply": "Понял — остаёмся на 4★ и всё включено. Чтобы продолжить поиск, выберите один из вариантов расширения (введите цифру): 1) расширить даты; 2) убрать фильтр «всё включено»; 3) рассмотреть другие звёздности; 4) попробовать другой город вылета. Какой вариант выбираете?",
+    "tour_cards": []
+  },
+  "tour_searches": [],
+  "marker_lines": {
+    "BUDGET-FLOOR": [
+      "10:32:04.171 INFO [mgp_bot] 💰 AUTO-RETRY BUDGET-FLOOR: tours_found=0 (floor=65000, top=100000) → retrying without floor",
+      "10:32:04.506 INFO [mgp_bot] 💰 AUTO-RETRY BUDGET-FLOOR: new request_id=12409937843, polling up to 60s",
+      "10:32:37.126 INFO [mgp_bot] 💰 AUTO-RETRY BUDGET-FLOOR: still 0 tours — fall through to standard 0-result handling"
+    ],
+    "AUTO-RETRY BUDGET-FLOOR": [
+      "10:32:04.171 INFO [mgp_bot] 💰 AUTO-RETRY BUDGET-FLOOR: tours_found=0 (floor=65000, top=100000) → retrying without floor",
+      "10:32:04.506 INFO [mgp_bot] 💰 AUTO-RETRY BUDGET-FLOOR: new request_id=12409937843, polling up to 60s",
+      "10:32:37.126 INFO [mgp_bot] 💰 AUTO-RETRY BUDGET-FLOOR: still 0 tours — fall through to standard 0-result handling"
+    ],
+    "SAFETY-NET P7": []
+  }
+}

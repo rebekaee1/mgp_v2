@@ -1511,7 +1511,13 @@ class YandexGPTHandler:
         self._ideal_nightsfrom: Optional[int] = None
         self._ideal_nightsto: Optional[int] = None
         self._has_budget: bool = False                 # True если pricefrom/priceto заданы
-        
+
+        # ── BUDGET-FLOOR: метаданные применённой нижней границы 65 % для «до X» ──
+        # См. блок Safety-net BUDGET-FLOOR в _normalize_search_args и AUTO-RETRY BUDGET-FLOOR
+        # в polling-цикле get_search_status.
+        self._budget_floor_meta: Optional[Dict] = None
+        self._budget_floor_retry_done: bool = False
+
         # ── P1/P13: Кэш requestid и tourid для валидации ──
         # Предотвращает placeholder hallucination (requestid_egypt, tourid_третьего_варианта)
         self._last_requestid: Optional[str] = None  # Последний реальный requestid из search_tours
@@ -2130,6 +2136,10 @@ class YandexGPTHandler:
             }
         
         elif name == "search_tours":
+            # ── Reset BUDGET-FLOOR per-call state (каждый новый search_tours = новая мета) ──
+            self._budget_floor_meta = None
+            self._budget_floor_retry_done = False
+
             # ── Fix P4 + H1 + H2: Валидация departure code ──
             # Проверяем, что модель передала правильный ID города вылета
             # Fix H1: Исключаем результаты функций из текста для валидации
@@ -2823,19 +2833,48 @@ class YandexGPTHandler:
             # [REMOVED] C2 days→nights conversion — доверяем LLM.
             # Промпт §3.4 описывает правило: «X дней = nightsfrom=X-1, nightsto=X».
             
-            # ── Fix P7: Safety-net для "около N тыс" → диапазон ±20% ──
+            # ── Safety-net бюджета: «около N» (диапазон ±20%) и «до X» (нижняя граница 65%) ──
             if args.get("priceto") and not args.get("pricefrom"):
                 _price_user_text = " ".join([
                     msg.get("content", "") for msg in self.full_history[-20:]
                     if msg.get("role") == "user" and msg.get("content")
                 ]).lower()
                 if re.search(r'(?:около|примерно|порядка|в\s+район[еу]|плюс.?минус)', _price_user_text):
+                    # ── Fix P7: «около N» → диапазон ±20% ──
                     _original_price = args["priceto"]
                     args["priceto"] = int(_original_price * 1.2)
                     args["pricefrom"] = int(_original_price * 0.8)
                     logger.info(
                         "💰 SAFETY-NET P7: 'около %s' → pricefrom=%s, priceto=%s",
                         _original_price, args["pricefrom"], args["priceto"]
+                    )
+                elif re.search(
+                    r"(?:до\s+\d|не\s+(?:более|выше|дороже|больше)\s*\d|"
+                    r"максимум\s*\d|в\s+пределах\s*\d|бюджет\s+до\s+\d)",
+                    _price_user_text,
+                ):
+                    # ── NEW: BUDGET-FLOOR для «до X» / «не более X» / «максимум X» ──
+                    # Нижняя граница = 65% от верхней (с минимальной шириной окна 30 000 ₽).
+                    # Это исключает показ туров значительно дешевле заявленного потолка.
+                    # Если результатов окажется < 3 — сработает AUTO-RETRY BUDGET-FLOOR ниже,
+                    # который повторит поиск без pricefrom и положит _warning для клиента.
+                    UPPER_BOUND_FLOOR_RATIO = 0.65
+                    MIN_WINDOW_RUB = 30_000
+                    _orig_priceto = args["priceto"]
+                    _floor = int(_orig_priceto * UPPER_BOUND_FLOOR_RATIO)
+                    if _orig_priceto - _floor < MIN_WINDOW_RUB:
+                        _floor = max(_orig_priceto - MIN_WINDOW_RUB, 0)
+                    args["pricefrom"] = _floor
+                    self._budget_floor_meta = {
+                        "original_priceto": _orig_priceto,
+                        "applied_pricefrom": _floor,
+                        "ratio": UPPER_BOUND_FLOOR_RATIO,
+                        "retry_triggered": False,
+                        "retry_succeeded": False,
+                    }
+                    logger.info(
+                        "💰 BUDGET-FLOOR: 'до %s' → pricefrom=%s, priceto=%s (ratio=%.2f)",
+                        _orig_priceto, _floor, _orig_priceto, UPPER_BOUND_FLOOR_RATIO,
                     )
             
             # ── Safety-net: bare "N-M" misinterpreted as dates when it's nights ──
@@ -3080,6 +3119,7 @@ class YandexGPTHandler:
             }
             self._last_full_search_args = dict(_tv_kwargs)
             self._gds_retry_done = False  # сбрасываем флаг: каждый новый search_tours имеет право на 1 retry
+            self._budget_floor_retry_done = False  # каждый новый search_tours имеет право на 1 retry BUDGET-FLOOR
 
             request_id = await self.tourvisor.search_tours(**_tv_kwargs)
             
@@ -3274,6 +3314,79 @@ class YandexGPTHandler:
                                 logger.warning("✈️ AUTO-RETRY GDS failed: %s", _re, exc_info=True)
                     # ════════════════════════════════════════════════════════════
                     # END AUTO-RETRY GDS
+                    # ════════════════════════════════════════════════════════════
+
+                    # ════════════════════════════════════════════════════════════
+                    # AUTO-RETRY BUDGET-FLOOR: если применили pricefrom=65% × priceto
+                    # и результатов < 3 — повторяем поиск БЕЗ pricefrom, добавляем
+                    # _warning чтобы LLM честно сообщил клиенту о расширении поиска.
+                    # ════════════════════════════════════════════════════════════
+                    if (
+                        tours_found < 3
+                        and not getattr(self, "_budget_floor_retry_done", False)
+                        and getattr(self, "_budget_floor_meta", None)
+                    ):
+                        self._budget_floor_retry_done = True
+                        self._budget_floor_meta["retry_triggered"] = True
+                        _orig_floor = self._budget_floor_meta["applied_pricefrom"]
+                        _orig_top = self._budget_floor_meta["original_priceto"]
+                        logger.info(
+                            "💰 AUTO-RETRY BUDGET-FLOOR: tours_found=%d (floor=%s, top=%s) → retrying without floor",
+                            tours_found, _orig_floor, _orig_top,
+                        )
+                        try:
+                            _retry_kwargs = dict(getattr(self, "_last_full_search_args", {}))
+                            _retry_kwargs.pop("pricefrom", None)
+
+                            _new_request_id = await self.tourvisor.search_tours(**_retry_kwargs)
+                            if _new_request_id:
+                                logger.info(
+                                    "💰 AUTO-RETRY BUDGET-FLOOR: new request_id=%s, polling up to 60s",
+                                    _new_request_id,
+                                )
+                                if not hasattr(self, "_budget_floor_remap"):
+                                    self._budget_floor_remap = {}
+                                self._budget_floor_remap[str(request_id)] = str(_new_request_id)
+                                self._last_requestid = str(_new_request_id)
+                                self._last_search_params.pop("pricefrom", None)
+                                request_id = str(_new_request_id)
+
+                                _retry_status = {}
+                                for _ in range(20):
+                                    await asyncio.sleep(3)
+                                    _retry_status = await self.tourvisor.get_search_status(_new_request_id)
+                                    _retry_state = _retry_status.get("state")
+                                    _retry_hf = _retry_status.get("hotelsfound", 0)
+                                    if _retry_state == "finished":
+                                        break
+                                    if _retry_hf >= 3:
+                                        break
+
+                                last_status = _retry_status
+                                hotels_found = _retry_status.get("hotelsfound", 0)
+                                tours_found = _retry_status.get("toursfound", 0)
+
+                                if tours_found >= 1:
+                                    self._budget_floor_meta["retry_succeeded"] = True
+                                    _orig_floor_str = f"{_orig_floor:,}".replace(",", " ")
+                                    _orig_top_str = f"{_orig_top:,}".replace(",", " ")
+                                    last_status["_warning"] = (
+                                        f"По верхней части бюджета (от {_orig_floor_str} до {_orig_top_str} ₽) "
+                                        f"вариантов мало, показываю все туры в пределах бюджета (до {_orig_top_str} ₽). "
+                                        f"В карточках могут быть туры значительно дешевле."
+                                    )
+                                    logger.info(
+                                        "💰 AUTO-RETRY BUDGET-FLOOR: SUCCESS — %d hotels, %d tours",
+                                        hotels_found, tours_found,
+                                    )
+                                else:
+                                    logger.info(
+                                        "💰 AUTO-RETRY BUDGET-FLOOR: still 0 tours — fall through to standard 0-result handling"
+                                    )
+                        except Exception as _re:
+                            logger.warning("💰 AUTO-RETRY BUDGET-FLOOR failed: %s", _re, exc_info=True)
+                    # ════════════════════════════════════════════════════════════
+                    # END AUTO-RETRY BUDGET-FLOOR
                     # ════════════════════════════════════════════════════════════
 
                     if hotels_found == 0 or tours_found == 0:

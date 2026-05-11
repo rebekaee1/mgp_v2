@@ -1,0 +1,52 @@
+{
+  "scenario": {
+    "sid": "S15_turkey_60k_retry_success",
+    "description": "Турция, июнь, 7 ночей, 2 взр, до 60к — узкий бюджет, в слоте 30-60k мало; ожидается AUTO-RETRY + _warning",
+    "budget_phrase": "до 60к",
+    "direction": "Турцию",
+    "departure": "Москва",
+    "dates": "08.06.2026",
+    "nights": 7,
+    "composition": "2 взрослых",
+    "qc": "3 звезды, завтрак",
+    "expected_pricefrom": 30000,
+    "expected_priceto": 60000,
+    "expects_floor_applied": true,
+    "expects_auto_retry": true,
+    "note": "Дешёвый бюджет: в слоте 30-60k обычно пусто, но без floor от 50-80k найдётся"
+  },
+  "runtime": {
+    "elapsed_s": 75.36,
+    "steps": 4,
+    "conv_id": "d4f159d3-504e-4511-bffb-927f645788c8"
+  },
+  "messages_sent": [
+    "Привет! Подбери тур из Москва в Турцию для 2 взрослых, вылет 08.06.2026, на 7 ночей. Бюджет до 60к. 3 звезды, завтрак.",
+    "3 звезды, завтрак.",
+    "3 звезды, завтрак.",
+    "3 звезды, завтрак."
+  ],
+  "final_payload": {
+    "conversation_id": "d4f159d3-504e-4511-bffb-927f645788c8",
+    "crm_submitted": false,
+    "reply": "Понял — 3★ и завтрак остаются. Какой вариант расширения поиска вам выбрать? 1) Расширить диапазон дат; 2) Убрать ограничение по питанию; 3) Рассмотреть другие категории отелей; 4) Попробовать другой город вылета. Выберите цифру (1–4), пожалуйста.",
+    "tour_cards": []
+  },
+  "tour_searches": [],
+  "marker_lines": {
+    "BUDGET-FLOOR": [
+      "10:45:56.920 INFO [mgp_bot] 💰 AUTO-RETRY BUDGET-FLOOR: tours_found=0 (floor=30000, top=60000) → retrying without floor",
+      "10:45:57.108 INFO [mgp_bot] 💰 AUTO-RETRY BUDGET-FLOOR: new request_id=12410055176, polling up to 60s",
+      "10:46:06.654 INFO [mgp_bot] 💰 AUTO-RETRY BUDGET-FLOOR: still 0 tours — fall through to standard 0-result handling"
+    ],
+    "AUTO-RETRY BUDGET-FLOOR": [
+      "10:44:13.408 INFO [mgp_bot] 💰 AUTO-RETRY BUDGET-FLOOR: tours_found=0 (floor=78000, top=120000) → retrying without floor",
+      "10:44:13.604 INFO [mgp_bot] 💰 AUTO-RETRY BUDGET-FLOOR: new request_id=12410040686, polling up to 60s",
+      "10:44:23.198 INFO [mgp_bot] 💰 AUTO-RETRY BUDGET-FLOOR: still 0 tours — fall through to standard 0-result handling",
+      "10:45:56.920 INFO [mgp_bot] 💰 AUTO-RETRY BUDGET-FLOOR: tours_found=0 (floor=30000, top=60000) → retrying without floor",
+      "10:45:57.108 INFO [mgp_bot] 💰 AUTO-RETRY BUDGET-FLOOR: new request_id=12410055176, polling up to 60s",
+      "10:46:06.654 INFO [mgp_bot] 💰 AUTO-RETRY BUDGET-FLOOR: still 0 tours — fall through to standard 0-result handling"
+    ],
+    "SAFETY-NET P7": []
+  }
+}
