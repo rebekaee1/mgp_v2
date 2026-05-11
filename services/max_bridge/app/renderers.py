@@ -148,7 +148,7 @@ def render_tour_card_caption(card: dict[str, Any]) -> str:
     if stars:
         header_parts.append(stars)
     if rating:
-        header_parts.append(f"*{rating}*")
+        header_parts.append(f"**{rating}**")
     header = "  ".join(header_parts)
 
     location_parts: list[str] = []
@@ -188,14 +188,14 @@ def render_tour_card_caption(card: dict[str, Any]) -> str:
 
     price_line = ""
     if price_str:
-        price_line = f"*{price_str}*"
+        price_line = f"**{price_str}**"
         if pax_label:
             price_line += f" {pax_label}"
 
     lines: list[str] = []
     if header:
         lines.append(header)
-    lines.append(f"*{name}*")
+    lines.append(f"**{name}**")
     lines.append("")
     if location_line:
         lines.append(location_line)
@@ -250,9 +250,13 @@ def render_final_menu_text() -> str:
 
 
 def render_final_menu_keyboard() -> dict[str, Any]:
-    """Final menu under the cards. All buttons are ``message`` type so the
-    existing assistant handles them via the normal chat pipeline — no callback
-    handler needed in v1."""
+    """Final menu under the cards (Variant A).
+
+    All buttons are ``message`` type so the assistant handles them via the
+    normal chat pipeline — no callback handler needed in v1. The set is
+    intentionally refine-focused: the user keeps interacting with the
+    assistant instead of bouncing straight to the manager.
+    """
     return {
         "type": "inline_keyboard",
         "payload": {
@@ -260,8 +264,8 @@ def render_final_menu_keyboard() -> dict[str, Any]:
                 [
                     {
                         "type": "message",
-                        "text": "🔧 Изменить параметры",
-                        "payload": "хочу изменить параметры поиска",
+                        "text": "🔧 Уточнить параметры",
+                        "payload": "хочу уточнить параметры поиска",
                     },
                     {
                         "type": "message",
@@ -272,13 +276,13 @@ def render_final_menu_keyboard() -> dict[str, Any]:
                 [
                     {
                         "type": "message",
-                        "text": "⭐ Получше",
-                        "payload": "найди получше",
+                        "text": "⭐ Получше звёзды",
+                        "payload": "найди отели с более высокой звёздностью",
                     },
                     {
                         "type": "message",
-                        "text": "💼 К менеджеру",
-                        "payload": "хочу связаться с менеджером",
+                        "text": "✈️ Уточнить перелёт",
+                        "payload": "расскажи про перелёт по этим турам",
                     },
                 ],
             ]

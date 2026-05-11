@@ -187,6 +187,10 @@ class MaxApiClient:
                 upload_url,
                 files={"data": ("image.jpg", image_bytes, "image/jpeg")},
             )
+        # MAX CDN always replies HTTP 200, signalling errors via the body. We
+        # therefore parse the body first and check both shape variants:
+        # success → {"photos": {"<id>": {"token": "..."}}}
+        # failure → {"error_code": "503", "error_data": "IMAGE_INVALID_FORMAT"}
         if response.status_code >= 400:
             try:
                 payload: Any = response.json()
@@ -207,7 +211,27 @@ class MaxApiClient:
                 "Upload CDN returned non-JSON response",
                 response.text,
             ) from exc
-        token = data.get("token") if isinstance(data, dict) else None
+        if not isinstance(data, dict):
+            raise MaxApiError(500, "upload.bad_response", "Upload CDN returned non-object", data)
+        if data.get("error_code"):
+            raise MaxApiError(
+                response.status_code,
+                f"upload.cdn_{data['error_code']}",
+                str(data.get("error_data") or "unknown CDN error"),
+                data,
+            )
+        # Real success shape, captured from prod on 2026-05-11:
+        #   {"photos": {"<id>": {"token": "<media_token>"}}}
+        # We also tolerate the legacy / documented shape {"token": "..."} just in
+        # case a future MAX release inlines it back.
+        token: Optional[str] = None
+        photos = data.get("photos")
+        if isinstance(photos, dict) and photos:
+            first_entry = next(iter(photos.values()))
+            if isinstance(first_entry, dict):
+                token = first_entry.get("token")
+        if not token:
+            token = data.get("token")
         if not token:
             raise MaxApiError(
                 500,

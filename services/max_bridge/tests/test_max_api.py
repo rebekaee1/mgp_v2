@@ -112,20 +112,72 @@ async def test_send_text_still_works_as_thin_wrapper():
 
 @pytest.mark.asyncio
 async def test_upload_image_bytes_two_step_returns_token():
+    """Real shape captured from prod on 2026-05-11:
+    {"photos": {"<id>": {"token": "..."}}}"""
     upload_url = "https://upload.cdn.max.test/upload?sig=abc&expires=1"
     async with respx.mock(assert_all_called=False) as mock:
         mock.post("https://botapi.test/uploads").respond(
             200, json={"url": upload_url}
         )
-        cdn_route = mock.post(upload_url).respond(200, json={"token": "MEDIA_TOK"})
+        cdn_route = mock.post(upload_url).respond(
+            200,
+            json={"photos": {"abc123==": {"token": "U1xMZmMqp"}}},
+        )
         async with MaxApiClient("https://botapi.test", "BOT_TOKEN") as c:
             token = await c.upload_image_bytes(b"\xff\xd8\xff\xe0fake-jpeg-bytes")
-        assert token == "MEDIA_TOK"
-        # The CDN POST must NOT carry our bot Authorization header — the upload
-        # URL is signed via query params and rejects extra auth.
+        assert token == "U1xMZmMqp"
         cdn_call = cdn_route.calls.last
         assert "authorization" not in {k.lower() for k in cdn_call.request.headers.keys()} or \
                cdn_call.request.headers.get("authorization") != "BOT_TOKEN"
+
+
+@pytest.mark.asyncio
+async def test_upload_image_bytes_legacy_inline_token_shape():
+    """Backward compatibility: if MAX ever inlines the token at top level
+    (the shape we originally coded for), still works."""
+    upload_url = "https://upload.cdn.max.test/upload?sig=abc"
+    async with respx.mock(assert_all_called=False) as mock:
+        mock.post("https://botapi.test/uploads").respond(
+            200, json={"url": upload_url}
+        )
+        mock.post(upload_url).respond(200, json={"token": "LEGACY_TOK"})
+        async with MaxApiClient("https://botapi.test", "BOT_TOKEN") as c:
+            token = await c.upload_image_bytes(b"jpeg")
+        assert token == "LEGACY_TOK"
+
+
+@pytest.mark.asyncio
+async def test_upload_image_bytes_raises_on_cdn_error_envelope():
+    """CDN returns HTTP 200 but with {"error_code", "error_data"} on bad input."""
+    upload_url = "https://upload.cdn.max.test/upload?sig=abc"
+    async with respx.mock(assert_all_called=False) as mock:
+        mock.post("https://botapi.test/uploads").respond(
+            200, json={"url": upload_url}
+        )
+        mock.post(upload_url).respond(
+            200,
+            json={"error_code": "503", "error_data": "IMAGE_INVALID_FORMAT"},
+        )
+        async with MaxApiClient("https://botapi.test", "BOT_TOKEN") as c:
+            with pytest.raises(MaxApiError) as ei:
+                await c.upload_image_bytes(b"jpeg")
+        assert ei.value.code == "upload.cdn_503"
+        assert "IMAGE_INVALID_FORMAT" in ei.value.message
+
+
+@pytest.mark.asyncio
+async def test_upload_image_bytes_raises_when_photos_empty():
+    """If MAX returns photos:{} or photos:null we must surface no_token."""
+    upload_url = "https://upload.cdn.max.test/upload?sig=abc"
+    async with respx.mock(assert_all_called=False) as mock:
+        mock.post("https://botapi.test/uploads").respond(
+            200, json={"url": upload_url}
+        )
+        mock.post(upload_url).respond(200, json={"photos": {}})
+        async with MaxApiClient("https://botapi.test", "BOT_TOKEN") as c:
+            with pytest.raises(MaxApiError) as ei:
+                await c.upload_image_bytes(b"jpeg")
+        assert ei.value.code == "upload.no_token"
 
 
 @pytest.mark.asyncio
