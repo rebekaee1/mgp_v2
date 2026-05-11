@@ -1952,6 +1952,7 @@ def runtime_metadata():
 
     from config import settings
     from runtime_config import resolve_runtime_config
+    from widget_defaults import WIDGET_DEFAULTS
 
     assistant_id = request.args.get("assistant_id") or request.headers.get("X-Assistant-Id")
     runtime = resolve_runtime_config(assistant_id=assistant_id)
@@ -1981,9 +1982,13 @@ def runtime_metadata():
                 # Same welcome_message that the website widget shows on first
                 # contact (editable in dashboard → Widget Settings). Consumed
                 # by mgp-max-bridge to greet a MAX user on bot_started and
-                # after a /restart command. Stays in branding because it is
-                # purely a content concern, not a security/runtime one.
-                "welcome_message": (runtime.widget_config or {}).get("welcome_message"),
+                # after a /restart command. We fall back to the shared
+                # WIDGET_DEFAULTS so the MAX channel and the website show the
+                # SAME default greeting when a tenant has not customised it.
+                "welcome_message": (
+                    (runtime.widget_config or {}).get("welcome_message")
+                    or WIDGET_DEFAULTS.get("welcome_message")
+                ),
             },
         },
         "llm": {

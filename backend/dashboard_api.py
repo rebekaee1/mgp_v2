@@ -1529,14 +1529,37 @@ def analytics_activity():
 
 # ── Widget ────────────────────────────────────────────────────────────────────
 
-_WIDGET_DEFAULTS = {
-    "welcome_message": "\U0001f44b Здравствуйте! Я — ИИ-ассистент туристического агентства.\n\nЯ помогу вам:\n• \U0001f50d Подобрать тур по вашим параметрам\n• \U0001f525 Найти горящие предложения\n• \u2753 Ответить на вопросы о визах, оплате, документах\n\nКуда бы вы хотели поехать?",
-    "primary_color": "#E30613",
-    "position": "bottom-right",
-    "title": "AI Ассистент",
-    "subtitle": "Турагентство",
-    "logo_url": None,
-}
+# Single source of truth lives in widget_defaults.py so the website widget
+# (dashboard editor preview) and the MAX bridge (runtime metadata endpoint)
+# stay in lock-step on what "default" actually means.
+from widget_defaults import WIDGET_DEFAULTS as _WIDGET_DEFAULTS
+
+
+def _invalidate_bridge_welcome_cache(assistant_id: str) -> None:
+    """Drop the MAX-bridge welcome cache key for ``assistant_id``.
+
+    The bridge keeps a 10-minute Redis cache of welcome messages it has
+    pulled from ``/api/runtime/metadata``. When a tenant saves a new text
+    in the dashboard we want it to take effect immediately, not after a
+    TTL expires. This helper opens its own short-lived connection so a
+    Redis blip can never deadlock the dashboard save flow.
+    """
+    if not assistant_id:
+        return
+    # Same Redis URL the bridge itself uses (docker-compose env). Fall back
+    # to the default in case the env var is missing — that just means we
+    # silently skip invalidation, which is harmless (TTL eventually wins).
+    redis_url = os.getenv("MAX_REDIS_URL") or "redis://redis:6379/1"
+    try:
+        # Lazy import so dashboards without redis-py installed do not break.
+        from redis import Redis as _SyncRedis  # type: ignore[import-not-found]
+    except Exception:
+        return
+    try:
+        client = _SyncRedis.from_url(redis_url, decode_responses=True, socket_timeout=2.0)
+        client.delete(f"max:welcome:{assistant_id}")
+    except Exception:
+        logger.exception("MAX bridge welcome cache invalidation failed for %s", assistant_id)
 
 _LOGO_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static", "logos")
 _ALLOWED_LOGO_EXT = {"png", "jpg", "jpeg", "webp"}
@@ -1603,6 +1626,16 @@ def widget_config_update():
         from cache import cache_delete
         cache_delete(f"widget:config:{assistant.id}")
         cache_delete(f"widget:fa:{assistant.id}")
+
+        # Also drop the MAX bridge welcome cache so a /restart or bot_started
+        # right after this PUT picks up the fresh text without waiting for
+        # the 10-minute TTL. Best-effort: failure here must not block the
+        # save itself — the cache will simply expire on schedule instead.
+        if "welcome_message" in data:
+            try:
+                _invalidate_bridge_welcome_cache(str(assistant.id))
+            except Exception:
+                logger.exception("Failed to invalidate MAX bridge welcome cache for %s", assistant.id)
 
         return jsonify({"status": "ok"})
 
