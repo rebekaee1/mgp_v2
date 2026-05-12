@@ -48,12 +48,23 @@ class ChatProxy:
         message: str,
         session_id: str,
         assistant_id: str,
+        external_user_id: Optional[str] = None,
     ) -> ChatResponse:
         url = f"{self._base_url}/api/v1/chat"
         headers: dict[str, str] = {
             "Content-Type": "application/json",
             "X-Assistant-Id": assistant_id,
+            # mgp-backend tags every conversation with the source channel on
+            # the FIRST insert; the website widget never sets this header so
+            # backend defaults to 'widget'. Keep this enum value in sync with
+            # the LK side ``conversations.channel`` allowed list.
+            "X-Channel": "max",
         }
+        if external_user_id:
+            # MAX user_id forwarded as a string so the backend can store it
+            # without making assumptions about numeric range. Optional —
+            # internal/test paths may omit a real user id.
+            headers["X-External-User-Id"] = str(external_user_id)
         if self._service_token:
             headers["X-MGP-Service-Token"] = self._service_token
         body: dict[str, Any] = {

@@ -153,7 +153,7 @@ def _build_app(*, settings: Settings, tour_cards: list[dict[str, Any]],
                sent_messages: list[dict[str, Any]],
                welcome: str | None = None) -> FastAPI:
     class _StubChatProxy:
-        async def chat(self, *, message: str, session_id: str, assistant_id: str):
+        async def chat(self, *, message: str, session_id: str, assistant_id: str, **kwargs):
             return ChatResponse(
                 reply=f"reply: {message}",
                 tour_cards=list(tour_cards),
@@ -462,7 +462,7 @@ def test_webhook_reset_command_wipes_session_and_replies_welcome(monkeypatch):
     chat_proxy_calls = [0]
 
     class _CountingChatProxy:
-        async def chat(self, *, message, session_id, assistant_id):
+        async def chat(self, *, message, session_id, assistant_id, **kwargs):
             chat_proxy_calls[0] += 1
             return ChatResponse(reply="should not be called", tour_cards=[], conversation_id=session_id)
 
@@ -509,7 +509,7 @@ def test_webhook_reset_command_uses_dashboard_welcome_when_set(monkeypatch):
     chat_proxy_calls = [0]
 
     class _CountingChatProxy:
-        async def chat(self, *, message, session_id, assistant_id):
+        async def chat(self, *, message, session_id, assistant_id, **kwargs):
             chat_proxy_calls[0] += 1
             return ChatResponse(reply="x", tour_cards=[], conversation_id=session_id)
 
@@ -631,7 +631,7 @@ def test_webhook_reset_triggers_for_multiple_phrasings(monkeypatch, trigger):
     chat_proxy_calls = [0]
 
     class _CountingChatProxy:
-        async def chat(self, *, message, session_id, assistant_id):
+        async def chat(self, *, message, session_id, assistant_id, **kwargs):
             chat_proxy_calls[0] += 1
             return ChatResponse(reply="x", tour_cards=[], conversation_id=session_id)
 

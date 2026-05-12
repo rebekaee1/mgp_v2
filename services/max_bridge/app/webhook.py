@@ -394,10 +394,15 @@ async def _process_message(
 
         session_id, created = await session_store.get_or_create_session(user_id)
         log.info("session_resolved", session_id=session_id[:18], created=created)
+        # ``external_user_id`` lets the backend store the MAX user_id alongside
+        # the conversation so the LK can later deep-link back into the MAX
+        # chat. The backend honours this header only on the FIRST insert of
+        # the conversation row.
         chat_response = await chat_proxy.chat(
             message=text,
             session_id=session_id,
             assistant_id=tenant.assistant_id,
+            external_user_id=str(user_id),
         )
         log.info(
             "chat_reply_received",
