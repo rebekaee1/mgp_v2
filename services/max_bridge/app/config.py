@@ -82,6 +82,23 @@ class Settings(BaseSettings):
     backend_request_timeout_seconds: float = Field(default=60.0)
     max_api_request_timeout_seconds: float = Field(default=30.0)
 
+    # ── Phase 3: dynamic multi-tenant routing ─────────────────────────
+    # The bridge pulls active tenant bindings from
+    # ``GET /api/runtime/channels/max/bindings`` so a new client can be
+    # onboarded with a single SQL update + ./deploy/provision_clients.sh —
+    # no env vars on the bridge, no redeploy. The legacy env-var path
+    # (``max_bot_token_mgp_tour`` / ``max_webhook_secret_mgp_tour``) is kept
+    # as a fallback for local dev and as a safety net during the initial
+    # rollout if the backend is briefly unreachable.
+    max_tenant_refresh_interval_seconds: int = Field(
+        default=60,
+        description="How often the bridge refreshes the tenant directory from backend.",
+    )
+    max_tenant_directory_request_timeout: float = Field(
+        default=5.0,
+        description="HTTP timeout for /api/runtime/channels/max/bindings.",
+    )
+
     # ── Phase 2 v1: tour_cards rendering ──────────────────────────────
     max_render_tour_cards: bool = Field(
         default=True,

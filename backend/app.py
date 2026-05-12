@@ -2127,6 +2127,71 @@ def runtime_status():
     return jsonify(checks), 200 if all_ok else 503
 
 
+@app.route('/api/runtime/channels/max/bindings')
+def runtime_max_channel_bindings():
+    """Return active MAX-channel bindings for the mgp-max-bridge.
+
+    The bridge calls this endpoint at startup and on a periodic refresh to
+    learn which webhook secrets / bot tokens to use without needing a code
+    deploy when a new tenant is onboarded. Only assistants whose
+    ``runtime_metadata.channels.max.enabled = true`` are returned, and only
+    when both ``bot_token`` and ``webhook_secret`` are present (a half-
+    configured tenant would silently 401 every webhook, so we skip it).
+
+    Authentication: shares the existing "internal request" gate with
+    ``/api/status`` / ``/api/metrics``. Inside the production docker network
+    that is enough — the bridge sidecar is the only intended caller.
+    """
+    if not _is_internal_request():
+        return jsonify({"error": "Forbidden"}), 403
+
+    from database import get_db, is_db_available
+    if not is_db_available():
+        return jsonify({"bindings": [], "available": False}), 503
+
+    from models import Assistant, Company
+
+    bindings = []
+    try:
+        with get_db() as db:
+            if db is None:
+                return jsonify({"bindings": [], "available": False}), 503
+            rows = (
+                db.query(Assistant, Company)
+                .join(Company, Assistant.company_id == Company.id)
+                .filter(Assistant.is_active == True)  # noqa: E712
+                .filter(Assistant.runtime_metadata.isnot(None))
+                .all()
+            )
+            for assistant, company in rows:
+                rm = assistant.runtime_metadata or {}
+                channels = rm.get("channels") if isinstance(rm, dict) else None
+                if not isinstance(channels, dict):
+                    continue
+                max_cfg = channels.get("max") if isinstance(channels, dict) else None
+                if not isinstance(max_cfg, dict):
+                    continue
+                if not max_cfg.get("enabled"):
+                    continue
+                bot_token = (max_cfg.get("bot_token") or "").strip()
+                webhook_secret = (max_cfg.get("webhook_secret") or "").strip()
+                if not bot_token or not webhook_secret:
+                    continue
+                bindings.append({
+                    "slug": company.slug,
+                    "assistant_id": str(assistant.id),
+                    "bot_token": bot_token,
+                    "webhook_secret": webhook_secret,
+                    "bot_username": (max_cfg.get("bot_username") or "").strip() or None,
+                    "subscribed_at": max_cfg.get("subscribed_at") or None,
+                })
+    except Exception as exc:
+        logger.exception("Failed to load MAX channel bindings: %s", exc)
+        return jsonify({"error": "internal_error"}), 500
+
+    return jsonify({"bindings": bindings, "available": True})
+
+
 @app.route('/api/status')
 def status():
     """Статус сервера (только внутренние IP)."""

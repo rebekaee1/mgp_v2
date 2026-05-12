@@ -111,10 +111,35 @@ def _is_reset_command(text: str) -> bool:
     return _RESET_PHRASE_RE.match(normalised) is not None
 
 
-def _resolve_tenant(settings: Settings, secret: Optional[str]) -> Optional[TenantBinding]:
+def _resolve_tenant(
+    secret: Optional[str],
+    *,
+    tenant_directory=None,
+    settings: Optional[Settings] = None,
+) -> Optional[TenantBinding]:
+    """Resolve a tenant by the ``X-Max-Bot-Api-Secret`` header value.
+
+    Lookup order:
+
+    1. ``tenant_directory.resolve_by_secret`` — backend-sourced, refreshed
+       every ~60s. This is the production path (see Phase 3).
+    2. ``settings.tenant_bindings()`` — env-var fallback. Used in unit tests
+       and as a safety net during the initial rollout.
+
+    A non-matching secret returns ``None`` (caller responds 401).
+    """
     if not secret:
         return None
     candidate = secret.strip()
+    if tenant_directory is not None:
+        # ``resolve_by_secret`` is an O(1) dict lookup, but it does not run
+        # constant-time comparison — the directory is loaded from a trusted
+        # internal endpoint so timing-side-channels are not a concern here.
+        match = tenant_directory.resolve_by_secret(candidate)
+        if match is not None:
+            return match
+    if settings is None:
+        return None
     for tenant in settings.tenant_bindings():
         if hmac.compare_digest(tenant.webhook_secret, candidate):
             return tenant
@@ -181,7 +206,12 @@ async def max_webhook(
     x_max_bot_api_secret: Optional[str] = Header(default=None, alias="X-Max-Bot-Api-Secret"),
 ) -> dict[str, str]:
     settings: Settings = request.app.state.settings
-    tenant = _resolve_tenant(settings, x_max_bot_api_secret)
+    tenant_directory = getattr(request.app.state, "tenant_directory", None)
+    tenant = _resolve_tenant(
+        x_max_bot_api_secret,
+        tenant_directory=tenant_directory,
+        settings=settings,
+    )
     if tenant is None:
         # Surface the *names* of inbound headers (never the values) so we can
         # diagnose subscription / proxy issues without leaking secrets.
@@ -191,7 +221,11 @@ async def max_webhook(
         logger.warning(
             "webhook_auth_failed",
             secret_header_present=bool(x_max_bot_api_secret),
-            tenant_count=len(settings.tenant_bindings()),
+            tenant_count=(
+                tenant_directory.known_count
+                if tenant_directory is not None
+                else len(settings.tenant_bindings())
+            ),
             client_ip=request.client.host if request.client else None,
             user_agent=request.headers.get("user-agent"),
             inbound_header_names=safe_header_names,

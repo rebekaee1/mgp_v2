@@ -18,6 +18,7 @@ from .image_cache import ImageCache
 from .observability import configure_logging
 from .runtime_meta import RuntimeMetadataClient
 from .session_store import SessionStore
+from .tenant_directory import TenantDirectory
 from .webhook import router as webhook_router
 
 
@@ -45,6 +46,15 @@ async def lifespan(app: FastAPI):
         cache_ttl_seconds=settings.max_welcome_cache_ttl_seconds,
         request_timeout=settings.max_metadata_request_timeout,
     )
+    # Phase 3: dynamic tenant directory. The env fallback (settings.tenant_bindings)
+    # is seeded so a fresh bridge still serves the legacy tenant when the
+    # backend has not been migrated yet.
+    tenant_directory = TenantDirectory.from_settings(
+        settings,
+        request_timeout=settings.max_tenant_directory_request_timeout,
+        refresh_interval_seconds=settings.max_tenant_refresh_interval_seconds,
+    )
+    await tenant_directory.start()
 
     redis_ok = False
     try:
@@ -59,13 +69,14 @@ async def lifespan(app: FastAPI):
     app.state.chat_proxy = chat_proxy
     app.state.image_cache = image_cache
     app.state.runtime_meta = runtime_meta
+    app.state.tenant_directory = tenant_directory
     app.state.redis_ok_on_start = redis_ok
 
-    tenant_count = len(settings.tenant_bindings())
     logger.info(
         "max_bridge_started",
         backend=settings.max_backend_internal_url,
-        tenant_count=tenant_count,
+        tenant_count=tenant_directory.known_count,
+        tenant_refresh_ok=tenant_directory.last_refresh_ok,
         webhook=settings.max_webhook_public_url or "<not_set>",
         redis_ok=redis_ok,
         render_tour_cards=settings.max_render_tour_cards,
@@ -75,6 +86,7 @@ async def lifespan(app: FastAPI):
     try:
         yield
     finally:
+        await tenant_directory.stop()
         await chat_proxy.aclose()
         await session_store.aclose()
         await image_cache.aclose()
@@ -95,10 +107,12 @@ async def health() -> dict[str, Any]:
     except Exception:
         redis_ok = False
 
+    tenant_directory: TenantDirectory = app.state.tenant_directory
     return {
         "status": "ok" if redis_ok else "degraded",
         "redis": "ok" if redis_ok else "down",
-        "tenants": len(settings.tenant_bindings()),
+        "tenants": tenant_directory.known_count,
+        "tenant_directory_last_refresh_ok": tenant_directory.last_refresh_ok,
         "backend_url": settings.max_backend_internal_url,
         "webhook_public_url": settings.max_webhook_public_url or None,
     }
