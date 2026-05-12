@@ -147,6 +147,59 @@ EOSQL
     log "Reporting configured for ${slug} (source: ${source_marker}, endpoint: ${REPORTING_ENDPOINT_URL})"
 }
 
+# ── MAX channel (idempotent) ──────────────────────────────────────────────────
+#
+# Onboarding rule of thumb (kept symmetrical with ``setup_reporting``):
+#   1) Caller exports ``MAX_BOT_TOKEN_<UPPER_SLUG>`` and (optionally)
+#      ``MAX_WEBHOOK_SECRET_<UPPER_SLUG>`` before running this script.
+#      If the secret is not provided, ``cli.py max-channel enable`` will
+#      generate one and print it for the operator.
+#   2) If neither env var is set, this function is a no-op — the company has
+#      not signed up for the MAX channel yet.
+#   3) The bridge ``TenantDirectory`` (Phase 3) picks the binding up within
+#      ~60s without a redeploy.
+#
+# The CLI command refuses an unknown ``slug`` and rejects a malformed
+# ``webhook_secret``, so we forward both verbatim. ``--skip-validate`` is
+# **not** passed by default — we *want* the MAX ``/me`` round-trip so a
+# typo in the bot_token fails the provisioning step loudly.
+setup_max_channel() {
+    local assistant_id="$1"
+    local slug="$2"
+    local upper_slug
+    upper_slug=$(echo "$slug" | tr '[:lower:]-' '[:upper:]_')
+    local token_var="MAX_BOT_TOKEN_${upper_slug}"
+    local secret_var="MAX_WEBHOOK_SECRET_${upper_slug}"
+    local env_token="${!token_var:-}"
+    local env_secret="${!secret_var:-}"
+
+    if [ -z "$env_token" ] && [ -z "$env_secret" ]; then
+        log "MAX channel skipped for ${slug} (no ${token_var} / ${secret_var} in env)"
+        return 0
+    fi
+
+    if [ -z "$env_token" ]; then
+        log "⚠️  ${secret_var} is set but ${token_var} is missing — refuse to half-configure MAX channel"
+        return 0
+    fi
+
+    local args=(max-channel enable --slug "${slug}" --bot-token "${env_token}")
+    if [ -n "$env_secret" ]; then
+        args+=(--webhook-secret "${env_secret}")
+    fi
+
+    if [ "${MGP_MAX_SKIP_VALIDATE:-}" = "1" ]; then
+        args+=(--skip-validate)
+    fi
+
+    log "MAX channel: enabling for ${slug} (token from ${token_var}, secret from ${secret_var:-auto})"
+    if run_cli "${args[@]}"; then
+        log "MAX channel: enabled for ${slug} (assistant ${assistant_id})"
+    else
+        log "⚠️  MAX channel: enable failed for ${slug} — check token / network / bridge logs"
+    fi
+}
+
 # ── Shelkovo ──────────────────────────────────────────────────────────────────
 
 provision_shelkovo() {
@@ -212,6 +265,7 @@ provision_shelkovo() {
 
     log "Configuring runtime_metadata.reporting (PUSH → LK)..."
     setup_reporting "$ASSISTANT_ID" "mgp-shelkovo"
+    setup_max_channel "$ASSISTANT_ID" "mgp-shelkovo"
 
     log ""
     log "⚠️  U-ON API KEY: not set yet"
@@ -296,6 +350,7 @@ provision_krasnogorsk() {
 
     log "Configuring runtime_metadata.reporting (PUSH → LK)..."
     setup_reporting "$ASSISTANT_ID" "mgp-krasnogorsk"
+    setup_max_channel "$ASSISTANT_ID" "mgp-krasnogorsk"
 
     log ""
     log "✅ МГП Красногорск — provisioned (assistant: ${ASSISTANT_ID})"
@@ -369,6 +424,7 @@ provision_vyhino() {
 
     log "Configuring runtime_metadata.reporting (PUSH → LK)..."
     setup_reporting "$ASSISTANT_ID" "mgp-vyhino"
+    setup_max_channel "$ASSISTANT_ID" "mgp-vyhino"
 
     log ""
     log "✅ МГП Выхино — provisioned (assistant: ${ASSISTANT_ID})"
@@ -442,6 +498,7 @@ provision_belgorod() {
 
     log "Configuring runtime_metadata.reporting (PUSH → LK)..."
     setup_reporting "$ASSISTANT_ID" "mgp-belgorod"
+    setup_max_channel "$ASSISTANT_ID" "mgp-belgorod"
 
     log ""
     log "✅ МГП Белгород — provisioned (assistant: ${ASSISTANT_ID})"

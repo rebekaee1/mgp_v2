@@ -4841,6 +4841,18 @@ class YandexGPTHandler:
         # but silently dropped — see fix/crm-comment-from-llm).
         comment = (args.get("comment") or "").strip()[:1500]
 
+        # Phase E: prepend the source channel so the manager opening the U-ON
+        # request sees at-a-glance whether the lead came from the website
+        # widget or from a MAX-Messenger bot. The channel attribute is set on
+        # the handler at session-creation time by ``get_handler``.
+        channel = (getattr(self, "_channel", None) or "widget").strip().lower()
+        channel_label = "MAX Messenger" if channel == "max" else "Виджет"
+        comment_prefix = f"[Канал: {channel_label}]"
+        if comment:
+            comment = f"{comment_prefix} {comment}"[:1500]
+        else:
+            comment = comment_prefix
+
         if not client_name or not client_phone:
             return {
                 "status": "error",

@@ -571,8 +571,14 @@ def _build_handler(assistant_id: str = None):
     return handler_cls(runtime_config=runtime_config), runtime_config, provider
 
 
-def get_handler(session_id: str, assistant_id: str = None):
-    """Получить или создать handler для сессии (thread-safe, assistant-aware)."""
+def get_handler(session_id: str, assistant_id: str = None, *, channel: str = "widget"):
+    """Получить или создать handler для сессии (thread-safe, assistant-aware).
+
+    ``channel`` сохраняется на handler первой сессии и используется в
+    ``_handle_submit_client_request`` для пометки лида/заявки (см. фаза E).
+    На повторных вызовах внутри той же сессии channel НЕ перетирается —
+    канал диалога считается immutable атрибутом.
+    """
     cache_key = _session_cache_key(session_id, assistant_id)
     with _handlers_lock:
         if cache_key in _handlers:
@@ -581,6 +587,11 @@ def get_handler(session_id: str, assistant_id: str = None):
         handler, runtime_config, provider = _build_handler(assistant_id=assistant_id)
         # Подключаем диалоговый лог
         handler._dialogue_log_callback = lambda direction, content: _write_dialogue_log(session_id, direction, content)
+        # Channel attribution (Phase E): used to mark CRM lead/email body.
+        _norm_channel = (channel or "widget").strip().lower()
+        if _norm_channel not in {"widget", "max"}:
+            _norm_channel = "widget"
+        handler._channel = _norm_channel
         restored = _restore_handler_from_db(handler, session_id, assistant_id=assistant_id)
         _handlers[cache_key] = {
             "handler": handler,
@@ -1668,7 +1679,7 @@ def chat_v1():
 
     _write_dialogue_log(session_id, "USER", message)
 
-    handler = get_handler(session_id, assistant_id=assistant_id)
+    handler = get_handler(session_id, assistant_id=assistant_id, channel=channel_hdr)
 
     if lead_info and lead_info.get('name'):
         handler._lead_info = lead_info

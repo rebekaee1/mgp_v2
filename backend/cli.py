@@ -329,13 +329,82 @@ def main() -> None:
     ro.add_argument("--limit", type=int, default=500)
     ro.add_argument("--deliver-now", action="store_true", help="Immediately run sender after queueing replay events")
 
+    mc = sub.add_parser("max-channel", help="Manage MAX Messenger channel for a tenant")
+    mc_sub = mc.add_subparsers(dest="max_channel_cmd")
+
+    mc_enable = mc_sub.add_parser("enable", help="Enable / refresh MAX channel for a tenant")
+    mc_enable.add_argument("--slug", required=True, help="Company slug (e.g. mgp-tour)")
+    mc_enable.add_argument("--bot-token", required=True, help="Access token issued by @MasterBot")
+    mc_enable.add_argument("--webhook-secret", default=None,
+                           help="Webhook secret (regex ^[A-Za-z0-9_-]{5,256}$); auto-generated if omitted")
+    mc_enable.add_argument("--bot-username", default=None, help="Optional cosmetic bot @username")
+    mc_enable.add_argument("--skip-validate", action="store_true",
+                           help="Skip MAX /me probe (only when network is unavailable)")
+    mc_enable.add_argument("--bot-api-base-url", default="https://botapi.max.ru")
+
+    mc_disable = mc_sub.add_parser("disable", help="Disable MAX channel for a tenant (kept in DB, enabled=false)")
+    mc_disable.add_argument("--slug", required=True)
+
+    mc_status = mc_sub.add_parser("status", help="Show MAX channel status for one or all tenants")
+    mc_status.add_argument("--slug", default=None, help="Restrict to a single tenant")
+
+    mc_list = mc_sub.add_parser("list", help="Alias for status without --slug")
+
     args = parser.parse_args()
     if args.command in {"create-user", "provision-tenant"}:
         create_user(args)
     elif args.command == "replay-outbox":
         replay_outbox(args)
+    elif args.command == "max-channel":
+        max_channel_command(args)
     else:
         parser.print_help()
+
+
+def max_channel_command(args: argparse.Namespace) -> None:
+    """Dispatch ``max-channel <enable|disable|status|list>`` subcommands."""
+    from max_admin import (
+        enable_max_channel,
+        disable_max_channel,
+        get_max_channel_status,
+    )
+
+    if not init_db(settings.database_url):
+        print("ERROR: Cannot connect to PostgreSQL")
+        sys.exit(1)
+
+    sub_cmd = getattr(args, "max_channel_cmd", None)
+    if sub_cmd is None:
+        print("ERROR: specify a sub-command (enable | disable | status | list)")
+        sys.exit(1)
+
+    with get_db() as db:
+        if db is None:
+            print("ERROR: DB session unavailable")
+            sys.exit(1)
+
+        if sub_cmd == "enable":
+            result = enable_max_channel(
+                db,
+                slug=args.slug,
+                bot_token=args.bot_token,
+                webhook_secret=args.webhook_secret,
+                bot_username=args.bot_username,
+                skip_validate=bool(args.skip_validate),
+                bot_api_base_url=args.bot_api_base_url,
+            )
+        elif sub_cmd == "disable":
+            result = disable_max_channel(db, slug=args.slug)
+        elif sub_cmd in {"status", "list"}:
+            rows = get_max_channel_status(db, slug=getattr(args, "slug", None))
+            result = {"tenants": rows, "count": len(rows)}
+        else:
+            print(f"ERROR: unknown max-channel sub-command: {sub_cmd}")
+            sys.exit(1)
+
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    if not result.get("ok", True):
+        sys.exit(2)
 
 
 if __name__ == "__main__":
