@@ -157,6 +157,15 @@ class Conversation(Base):
         Boolean, default=False, nullable=False, server_default="0"
     )
     status: Mapped[str] = mapped_column(String(16), default="active")
+    # Channel that originated the conversation: 'widget' (web) or 'max' (MAX
+    # Messenger). Set on the FIRST insert and never overwritten; the runtime
+    # treats the channel as immutable for the lifetime of a session.
+    channel: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="widget", server_default="widget"
+    )
+    # User identifier inside the source channel (e.g. MAX user_id). NULL for
+    # widget sessions since the web widget does not expose a stable user id.
+    external_user_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
     started_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow
     )
