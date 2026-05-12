@@ -343,6 +343,13 @@ def _build_snapshot_payload(
             "status": conversation.status,
             "started_at": _iso(conversation.started_at),
             "last_active_at": _iso(conversation.last_active_at),
+            # Channel attribution (added 2026-05-12). Receivers on the LK side
+            # that predate this change will ignore unknown fields. ``channel``
+            # is one of {'widget', 'max'}; ``external_user_id`` is the user
+            # identifier inside the source channel (e.g. MAX user_id) or NULL
+            # for widget sessions.
+            "channel": getattr(conversation, "channel", "widget") or "widget",
+            "external_user_id": getattr(conversation, "external_user_id", None),
         },
         "messages": [_serialize_message(item) for item in messages],
         "tour_searches": [_serialize_tour_search(item) for item in tour_searches],

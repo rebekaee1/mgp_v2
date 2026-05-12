@@ -788,7 +788,9 @@ def _log_chat_to_db(session_id: str, user_message: str, reply: str,
                      assistant_id: str = None,
                      search_result: dict = None,
                      api_calls_log: list = None,
-                     final_message_usage: dict = None):
+                     final_message_usage: dict = None,
+                     channel: str = "widget",
+                     external_user_id: str = None):
     """
     Записать в PostgreSQL клиентски-видимую историю:
     - все обычные записи из history_snapshot (user, assistant, tool)
@@ -796,6 +798,10 @@ def _log_chat_to_db(session_id: str, user_message: str, reply: str,
     - Последний assistant enriched с tour_cards + latency_ms
     - Safety net: если handler.chat() вернул reply без append в history,
       финальный ответ добавляется отдельно
+
+    Параметры ``channel`` и ``external_user_id`` сохраняются ТОЛЬКО при
+    первом создании Conversation. На последующие сообщения этого session_id
+    они игнорируются — канал диалога считается immutable атрибутом сессии.
     """
     try:
         from database import get_db, is_db_available
@@ -830,6 +836,15 @@ def _log_chat_to_db(session_id: str, user_message: str, reply: str,
                         ua = _client_user_agent()
                     except RuntimeError:
                         pass
+                # Channel is set on FIRST insert and never mutated afterwards.
+                # Accept 'widget' / 'max'; any other value is coerced to
+                # 'widget' to avoid bad data leaking into the LK channel filter.
+                _channel = (channel or "widget").strip().lower()
+                if _channel not in {"widget", "max"}:
+                    _channel = "widget"
+                _ext_uid = (external_user_id or "").strip() or None
+                if _ext_uid is not None and len(_ext_uid) > 64:
+                    _ext_uid = _ext_uid[:64]
                 conv = Conversation(
                     session_id=session_id,
                     llm_provider=llm_provider or _llm_provider,
@@ -837,6 +852,8 @@ def _log_chat_to_db(session_id: str, user_message: str, reply: str,
                     ip_address=ip_addr,
                     user_agent=ua,
                     assistant_id=_aid,
+                    channel=_channel,
+                    external_user_id=_ext_uid,
                 )
                 db.add(conv)
                 db.flush()
@@ -1582,6 +1599,11 @@ def chat_v1():
     conversation_id = data.get('conversation_id', str(uuid.uuid4()))
     assistant_id = data.get('assistant_id') or request.headers.get('X-Assistant-Id')
     lead_info = data.get('lead_info')
+    # Channel attribution: mgp-max-bridge sets X-Channel: max; the website widget
+    # never sets this header. We persist the channel on the FIRST insert of the
+    # Conversation row only — see _log_chat_to_db for the exact contract.
+    channel_hdr = (request.headers.get('X-Channel') or 'widget').strip().lower()
+    external_user_id_hdr = (request.headers.get('X-External-User-Id') or '').strip() or None
     auth_error = _runtime_auth_error_response(conversation_id=conversation_id)
     if auth_error:
         return auth_error
@@ -1732,7 +1754,9 @@ def chat_v1():
                         assistant_id=assistant_id,
                         search_result=getattr(handler, '_last_search_result', None),
                         api_calls_log=_api_calls_snapshot,
-                        final_message_usage=getattr(handler, '_last_message_usage', None))
+                        final_message_usage=getattr(handler, '_last_message_usage', None),
+                        channel=channel_hdr,
+                        external_user_id=external_user_id_hdr)
 
         _mark_assistant_responded(session_id)
 
