@@ -355,13 +355,158 @@ LK receiver — both with `widget` as the safe default.
 
 ---
 
+## 5.1 Diagnostic findings 2026-05-12 PM — corrections required on the LK side
+
+When the LK team reported that today's live MAX dialog (`session_id='max-213771498-9d175778'`)
+was missing from the cabinet, we ran a full audit of MAX-related assistants
+and conversations on the MGP prod DB. Three concrete findings:
+
+### Finding 1 — `mgp-tour` canonical UUID is `593471b7-…`, **not** `2b7b20bd-…`
+
+| UUID | slug (MGP) | name | is_active | reporting | MAX channel | total conv | MAX conv |
+|---|---|---|---|---|---|---|---|
+| **593471b7-42da-4ae0-8499-904dcedd6a4b** | `mgp-tour` | МГП Тур | ✅ true | ❌ NULL | ✅ enabled | **298** | **7** |
+| `2b7b20bd-d904-49bf-b43f-de3c4028ae6a` | `lk-prodlike-1773077586` | LK Prodlike Rollout 1773077586 | ✅ true | ✅ set | ❌ none | 240 | 0 |
+
+The MAX-bridge is correctly bound to `593471b7-…` (slug `mgp-tour`). The
+`MAX_DEFAULT_ASSISTANT_ID` in `.env` and `runtime_metadata.channels.max`
+both live on `593471b7-…`, where 100 % of real MAX traffic is recorded.
+
+`2b7b20bd-…` is the `lk-prodlike-1773077586` rollout tenant that the LK
+side itself created; it has zero MAX dialogs and is not (and should not
+be) the canonical mgp-tour.
+
+**Action on the LK side:**
+
+1. Reverse the "deactivation" of `593471b7-…` in the LK control plane
+   (it was deactivated by LK on 2026-04-16, but the MGP runtime never
+   stopped writing real customer traffic into it — it is the live
+   production assistant).
+2. Map `mgp-tour` tenant in LK to UUID `593471b7-42da-4ae0-8499-904dcedd6a4b`.
+3. Generate the reporting `shared_secret` against the same UUID
+   `593471b7-…` and send it to MGP for mirroring (see Finding 3).
+4. UUID `2b7b20bd-…` should keep its real role: the test
+   `lk-prodlike-1773077586` tenant.
+
+No DB migration is required on the MGP side — the canonical mapping is
+already correct here.
+
+### Finding 2 — historical MAX dialogs with `channel='widget'` have been backfilled
+
+Five historical MAX dialogs (created on prod between 2026-05-10 09:03 and
+2026-05-11 15:23 UTC, i.e. before the channel-attribution migration was
+deployed on 2026-05-12 ~10:11 UTC) were stuck with `channel='widget'` and
+`external_user_id=NULL` because `channel` is intentionally set only on
+the first insert. We backfilled them in a single transaction on prod:
+
+```sql
+BEGIN;
+UPDATE conversations
+   SET channel = 'max',
+       external_user_id = split_part(session_id, '-', 2)
+ WHERE session_id LIKE 'max-%' AND channel = 'widget';
+-- UPDATE 5
+COMMIT;
+```
+
+After the backfill, all seven prod MAX dialogs (including the live
+`max-213771498-9d175778` reported by the LK team) carry the correct
+`channel='max'` + `external_user_id=<numeric user_id>`. The next
+`conversation_snapshot` event (either triggered by a new message or by
+calling `dialog_sender.replay_conversation_snapshots`) will carry the
+corrected attribution to LK automatically — once the reporting endpoint
+is enabled (see Finding 3).
+
+This is a one-shot, idempotent backfill; running it again will affect
+zero rows. New MAX dialogs after 2026-05-12 10:11 UTC are already
+recorded correctly by the bridge + `_log_chat_to_db` code path.
+
+### Finding 3 — `runtime_metadata.reporting` is now configured on `mgp-tour` (resolved 2026-05-12 13:47 MSK)
+
+LK sent secret `h1k767JymMefJSFFwg_cZD6cIGnWWWOl-wFSZr6BhgU` for UUID
+`593471b7-…`. Applied on prod via `jsonb_set('{reporting}', …)` so the
+existing `channels.max` and `lead_email_counter` keys were preserved:
+
+```sql
+UPDATE assistants
+SET runtime_metadata = jsonb_set(
+    COALESCE(runtime_metadata::jsonb, '{}'::jsonb),
+    '{reporting}',
+    jsonb_build_object(
+        'mode', 'batch_snapshot',
+        'contract_version', '2026-03-09',
+        'endpoint_url', 'https://lk.navilet.ru/api/control-plane/runtime/events',
+        'accepted_event_types', jsonb_build_array('conversation_snapshot'),
+        'auth', jsonb_build_object(
+            'type', 'shared_secret',
+            'header_name', 'X-MGP-Service-Token',
+            'secret', 'h1k767JymMefJSFFwg_cZD6cIGnWWWOl-wFSZr6BhgU'
+        )
+    ),
+    true
+)::json
+WHERE id = '593471b7-42da-4ae0-8499-904dcedd6a4b';
+```
+
+Immediately after the UPDATE we kicked a one-shot replay for the
+backfilled MAX dialogs so LK receives the corrected
+`channel` + `external_user_id` via PUSH (not only via its 5-min PULL
+fallback):
+
+```bash
+sudo docker exec mgp-backend-1 python /app/backend/cli.py replay-outbox \
+    --assistant-id 593471b7-42da-4ae0-8499-904dcedd6a4b \
+    --from 2026-05-01T00:00:00Z \
+    --limit 50 \
+    --deliver-now
+# matched=13 queued=13 delivered_now=13 skipped=0
+```
+
+Verification on the `runtime_event_outbox` table:
+
+```
+ status | count |              min              |              max              | last_http
+--------+-------+-------------------------------+-------------------------------+-----------
+ sent   |    13 | 2026-05-12 10:47:34.400021+00 | 2026-05-12 10:47:34.585431+00 |       200
+```
+
+All 13 events accepted by LK with HTTP 200 on the first attempt — the
+shared_secret, endpoint URL, contract_version and header_name are
+mutually consistent between MGP and LK. PUSH path is alive.
+
+### Finding 4 — `mgp-tour` is now a two-assistant company (intentional)
+
+LK's audit also confirmed that the production widget on `mgp.ru` shipped
+with `data-assistant-id="2b7b20bd-…"`, i.e. it targets the assistant
+that lives on MGP under slug `lk-prodlike-1773077586`. We are **not**
+touching this — it's the live revenue assistant, swapping its UUID
+would break the embed script on the site overnight.
+
+The end state is that the `mgp-tour` company in LK is now bound to two
+MGP assistants, each owning a separate channel:
+
+| MGP UUID | MGP slug | LK display name | Channel | Real-time |
+|---|---|---|---|---|
+| `2b7b20bd-…` | `lk-prodlike-1773077586` | МГП Тур AI Assistant | widget on mgp.ru | PUSH already wired by LK |
+| `593471b7-…` | `mgp-tour` | МГП Тур (MAX-канал) | MAX Messenger + legacy widget pre-2026-04-16 | PUSH wired today |
+
+If/when we decide to consolidate slugs on the MGP side (rename
+`lk-prodlike-1773077586` → `mgp-tour-widget` or similar) that's a
+cosmetic follow-up; it does not change UUIDs, embed scripts or LK
+mappings.
+
+---
+
 ## 6. Open items intentionally left for LK side
 
 * UI badge styling (colors / icon).
 * Filter / facet in the conversations list.
 * Per-tenant channel pie chart on the analytics dashboard (if any).
-* Decision whether to back-fill historical `max-*` rows or leave them
-  tagged `widget` (section 2.1 has the one-liner if you want).
+* ~~Decision whether to back-fill historical `max-*` rows or leave them
+  tagged `widget` (section 2.1 has the one-liner if you want).~~ **Done
+  on 2026-05-12 — see section 5.1, Finding 2. All 7 historical MAX
+  dialogs are now `channel='max'` with `external_user_id` extracted from
+  the session id.**
 * Decision whether the LK UI should hide `bot_token` / `webhook_secret`
   in the assistant settings page (today only the operator sees them via
   CLI; if LK later renders them, mask in UI).
