@@ -431,7 +431,7 @@ async def _process_message(
         # mapping so the very next user message gets a fresh session_id and
         # a brand-new backend handler — no need to call the chat proxy here.
         if _is_reset_command(text):
-            await session_store.reset_session(user_id)
+            await session_store.reset_session(user_id, tenant.slug)
             log.info("session_reset_by_user", trigger=text[:50])
             # Use the dashboard-sourced welcome so /restart and bot_started
             # show the same client-facing greeting. Falls back to a minimal
@@ -450,7 +450,7 @@ async def _process_message(
                 log.exception("reset_welcome_failed")
             return
 
-        session_id, created = await session_store.get_or_create_session(user_id)
+        session_id, created = await session_store.get_or_create_session(user_id, tenant.slug)
         log.info("session_resolved", session_id=session_id[:18], created=created)
         # ``external_user_id`` lets the backend store the MAX user_id alongside
         # the conversation so the LK can later deep-link back into the MAX
