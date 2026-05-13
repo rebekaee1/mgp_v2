@@ -1640,12 +1640,29 @@ def chat_v1():
     external_user_id_hdr = (request.headers.get('X-External-User-Id') or '').strip() or None
     # External profile headers — only meaningful when X-Channel is set by a
     # bridge (e.g. mgp-max-bridge sets these from the MAX webhook payload).
-    # Trim & length-bound here so the DB column constraints can't be busted
-    # by a misbehaving bridge sending a 5 KB display name.
-    external_first_name_hdr = (request.headers.get('X-External-User-First-Name') or '').strip()[:64] or None
-    external_last_name_hdr = (request.headers.get('X-External-User-Last-Name') or '').strip()[:64] or None
-    external_user_name_hdr = (request.headers.get('X-External-User-Name') or '').strip()[:128] or None
-    external_chat_id_hdr = (request.headers.get('X-External-Chat-Id') or '').strip()[:64] or None
+    # The bridge percent-encodes non-ASCII bytes (RFC 7230 forbids them in
+    # header values), so we ``unquote`` here. We then trim & length-bound to
+    # match the DB columns — a misbehaving bridge sending a 5 KB display
+    # name must not be allowed to bust the column constraints.
+    from urllib.parse import unquote as _unq
+
+    def _hdr_decode(name, limit):
+        raw = (request.headers.get(name) or '').strip()
+        if not raw:
+            return None
+        try:
+            decoded = _unq(raw)
+        except Exception:
+            decoded = raw
+        decoded = decoded.strip()
+        if not decoded:
+            return None
+        return decoded[:limit]
+
+    external_first_name_hdr = _hdr_decode('X-External-User-First-Name', 64)
+    external_last_name_hdr = _hdr_decode('X-External-User-Last-Name', 64)
+    external_user_name_hdr = _hdr_decode('X-External-User-Name', 128)
+    external_chat_id_hdr = _hdr_decode('X-External-Chat-Id', 64)
     auth_error = _runtime_auth_error_response(conversation_id=conversation_id)
     if auth_error:
         return auth_error

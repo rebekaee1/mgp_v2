@@ -11,8 +11,19 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import Any, Optional
+from urllib.parse import quote
 
 import httpx
+
+
+def _ascii_safe_header(value: str) -> str:
+    """RFC 7230 forbids non-ASCII bytes in HTTP header values. We percent-encode
+    UTF-8 so a Cyrillic display name like ``"Наталия"`` can travel through
+    the headers safely; the backend mirrors this with ``urllib.parse.unquote``.
+    Without this httpx raises ``UnicodeEncodeError('ascii' codec…)`` on the
+    POST and the whole MAX message silently drops on the floor.
+    """
+    return quote(value, safe="")
 
 
 @dataclass
@@ -78,13 +89,15 @@ class ChatProxy:
         # manager reply back into MAX via this bot, but we do not call
         # ``POST /messages`` here.
         if external_first_name:
-            headers["X-External-User-First-Name"] = external_first_name
+            headers["X-External-User-First-Name"] = _ascii_safe_header(external_first_name)
         if external_last_name:
-            headers["X-External-User-Last-Name"] = external_last_name
+            headers["X-External-User-Last-Name"] = _ascii_safe_header(external_last_name)
         if external_user_name:
-            headers["X-External-User-Name"] = external_user_name
+            headers["X-External-User-Name"] = _ascii_safe_header(external_user_name)
         if external_chat_id:
-            headers["X-External-Chat-Id"] = str(external_chat_id)
+            # chat_id is always numeric in MAX so encoding is a no-op, but we
+            # apply the same path for symmetry and future-proofing.
+            headers["X-External-Chat-Id"] = _ascii_safe_header(str(external_chat_id))
         if self._service_token:
             headers["X-MGP-Service-Token"] = self._service_token
         body: dict[str, Any] = {
