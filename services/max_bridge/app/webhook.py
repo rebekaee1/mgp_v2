@@ -216,11 +216,21 @@ def _extract_message(update: dict[str, Any]) -> Optional[dict[str, Any]]:
     )
     if user_id is None:
         return None
+    # Profile fields from the MAX sender block — kept here so the rest of
+    # the pipeline can forward them to mgp-backend (which then stores them
+    # on the conversation and pushes to the LK control plane). Always
+    # strings, length-bounded to match the DB columns.
+    first_name = (root_sender.get("first_name") or "").strip()[:64] or None
+    last_name = (root_sender.get("last_name") or "").strip()[:64] or None
+    user_name = (root_sender.get("name") or "").strip()[:128] or None
     return {
         "event": "message",
         "user_id": int(user_id),
         "chat_id": int(chat_id) if chat_id is not None else None,
         "text": text,
+        "first_name": first_name,
+        "last_name": last_name,
+        "user_name": user_name,
     }
 
 
@@ -333,6 +343,9 @@ async def _process_event(
             user_id=user_id,
             chat_id=chat_id,
             text=event["text"],
+            first_name=event.get("first_name"),
+            last_name=event.get("last_name"),
+            user_name=event.get("user_name"),
             correlation_id=correlation_id,
         )
         return
@@ -415,6 +428,9 @@ async def _process_message(
     user_id: int,
     chat_id: Optional[int],
     text: str,
+    first_name: Optional[str] = None,
+    last_name: Optional[str] = None,
+    user_name: Optional[str] = None,
     correlation_id: str,
 ) -> None:
     """Background worker: chat proxy → MAX send.
@@ -461,6 +477,10 @@ async def _process_message(
             session_id=session_id,
             assistant_id=tenant.assistant_id,
             external_user_id=str(user_id),
+            external_first_name=first_name,
+            external_last_name=last_name,
+            external_user_name=user_name,
+            external_chat_id=str(chat_id) if chat_id is not None else None,
         )
         log.info(
             "chat_reply_received",

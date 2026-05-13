@@ -350,6 +350,16 @@ def _build_snapshot_payload(
             # for widget sessions.
             "channel": getattr(conversation, "channel", "widget") or "widget",
             "external_user_id": getattr(conversation, "external_user_id", None),
+            # ── External-user profile (currently MAX-only) ──
+            # The bridge captures these from the MAX webhook payload and the
+            # backend stores them on the FIRST insert. Widget conversations
+            # leave them NULL. The LK side renders a "client card" from this
+            # block (name + MAX id + chat id), so changing any key here is a
+            # contract change — coordinate via MAX_LK_INTEGRATION_HANDOFF.md.
+            "external_first_name": getattr(conversation, "external_first_name", None),
+            "external_last_name": getattr(conversation, "external_last_name", None),
+            "external_user_name": getattr(conversation, "external_user_name", None),
+            "external_chat_id": getattr(conversation, "external_chat_id", None),
         },
         "messages": [_serialize_message(item) for item in messages],
         "tour_searches": [_serialize_tour_search(item) for item in tour_searches],

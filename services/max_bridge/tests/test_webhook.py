@@ -82,7 +82,51 @@ def test_extract_message_handles_message_created():
         },
     }
     parsed = _extract_message(update)
-    assert parsed == {"event": "message", "user_id": 12345, "chat_id": 999, "text": "Турция в июне"}
+    # Legacy payload omits the sender profile fields entirely — they should
+    # propagate as None so the backend stores NULL on those columns.
+    assert parsed == {
+        "event": "message",
+        "user_id": 12345,
+        "chat_id": 999,
+        "text": "Турция в июне",
+        "first_name": None,
+        "last_name": None,
+        "user_name": None,
+    }
+
+
+def test_extract_message_handles_new_root_shape_with_profile():
+    """2026-05-13 MAX payload puts text+sender at the root and double-wraps
+    the canonical message. The parser must pick up first_name/last_name/name
+    and the recipient.chat_id so the backend can store the client card."""
+    update = {
+        "update_type": "message_created",
+        "timestamp": 1778666097990,
+        "sender": {
+            "user_id": 213771498,
+            "first_name": "Lukian",
+            "last_name": "",
+            "name": "Lukian",
+            "is_bot": False,
+        },
+        "recipient": {"chat_id": 53709255, "chat_type": "dialog", "user_id": 260992301},
+        "text": "Привет",
+        "message": {
+            "sender": {"user_id": 213771498, "first_name": "Lukian", "name": "Lukian"},
+            "recipient": {"chat_id": 53709255, "user_id": 260992301},
+            "message": {"mid": "abc", "seq": 1, "text": "Привет"},
+        },
+    }
+    parsed = _extract_message(update)
+    assert parsed == {
+        "event": "message",
+        "user_id": 213771498,
+        "chat_id": 53709255,
+        "text": "Привет",
+        "first_name": "Lukian",
+        "last_name": None,
+        "user_name": "Lukian",
+    }
 
 
 def test_extract_message_returns_none_for_other_updates():

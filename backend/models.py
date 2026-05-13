@@ -166,6 +166,18 @@ class Conversation(Base):
     # User identifier inside the source channel (e.g. MAX user_id). NULL for
     # widget sessions since the web widget does not expose a stable user id.
     external_user_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    # ── External profile fields (channel-side metadata about the human) ──
+    # Populated from the MAX webhook payload on the FIRST insert. The web
+    # widget leaves these NULL. They exist so the LK can render a "client
+    # card" (name + MAX id + chat id) next to the dialog without an extra
+    # round-trip to the bridge.
+    external_first_name: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    external_last_name: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    external_user_name: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    # ``external_chat_id`` is the bot↔user chat id inside the source
+    # channel; kept so managers can later reply to the user from the LK UI
+    # (we only persist the id, we do not pre-build a back-channel here).
+    external_chat_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
     started_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow
     )

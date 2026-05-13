@@ -497,6 +497,105 @@ mappings.
 
 ---
 
+## 5.2 Client profile fields — MAX-only, added 2026-05-13
+
+We persist (and forward to LK) four extra fields on every MAX
+conversation so the LK can render a **client card** next to the dialog
+without an extra round-trip to the MAX API:
+
+```json
+"conversation": {
+  ...existing fields...,
+  "channel": "max",
+  "external_user_id": "213771498",
+  "external_first_name": "Lukian",         // ← NEW
+  "external_last_name":  "",               // ← NEW
+  "external_user_name":  "Lukian",         // ← NEW
+  "external_chat_id":    "53709255"        // ← NEW
+}
+```
+
+| Field | DB column | Type | Origin | Notes |
+|---|---|---|---|---|
+| `external_first_name` | `conversations.external_first_name` | `varchar(64)` | `sender.first_name` from MAX webhook | NULL for widget; may be empty when the user has no first name set in their MAX profile |
+| `external_last_name` | `conversations.external_last_name` | `varchar(64)` | `sender.last_name` from MAX webhook | NULL for widget; often empty |
+| `external_user_name` | `conversations.external_user_name` | `varchar(128)` | `sender.name` from MAX webhook | Display name. Use this when first/last is empty. Almost always present for MAX |
+| `external_chat_id` | `conversations.external_chat_id` | `varchar(64)` | `recipient.chat_id` from MAX webhook | The bot↔user chat id. Stored for **future** manager-replies-from-LK feature; *not* used to send anything today |
+
+All four are populated **only on the first insert** of the conversation
+row, alongside `channel` and `external_user_id`. They are immutable
+after that, mirroring the existing channel-attribution contract.
+
+### MGP-side migration
+
+* Alembic revision `k1l2m3n4o5p_add_external_user_profile` adds the
+  four columns. All nullable, no `server_default`.
+* `services/max_bridge/app/webhook.py:_extract_message` reads
+  `sender.first_name`, `sender.last_name`, `sender.name`,
+  `recipient.chat_id` from the MAX payload (both old `message.body.*`
+  and the 2026-05-13 root layout — see §5.1 Finding 2).
+* `services/max_bridge/app/chat_proxy.py:chat()` forwards the values as
+  four extra headers on `POST /api/v1/chat`:
+  `X-External-User-First-Name`, `X-External-User-Last-Name`,
+  `X-External-User-Name`, `X-External-Chat-Id`.
+* `backend/app.py:chat_v1` reads those headers (length-bounded to 64 /
+  64 / 128 / 64 chars), passes them to `_log_chat_to_db`, which
+  persists them only on the first insert of the conversation row.
+* `backend/dialog_sender.py:_build_snapshot_payload` includes the four
+  fields in the `conversation` block of every `conversation_snapshot`
+  event going forward.
+
+### LK-side TODO
+
+1. **DB migration** (mirror of MGP):
+   ```sql
+   ALTER TABLE conversations
+       ADD COLUMN external_first_name varchar(64) NULL,
+       ADD COLUMN external_last_name  varchar(64) NULL,
+       ADD COLUMN external_user_name  varchar(128) NULL,
+       ADD COLUMN external_chat_id    varchar(64) NULL;
+   ```
+2. **Receiver** (the existing `conversation_snapshot` consumer): read
+   the four new keys from the `conversation` block. None of them are
+   required — when MGP runtime gets an old payload (back-compat) the
+   keys will simply be absent and the columns will stay NULL.
+3. **UI**: render whatever you like. Suggested minimal client card next
+   to the dialog header:
+   ```
+   ┌──────────────────────────────────────┐
+   │ 🟣 MAX                               │
+   │ 👤 {external_first_name} {external_last_name}  (or external_user_name as fallback)
+   │ MAX ID: {external_user_id}           │
+   │ chat: {external_chat_id}             │
+   └──────────────────────────────────────┘
+   ```
+4. **(Future, NOT in this iteration)** — a "reply to client" button
+   that POSTs a manager-typed text to an MGP endpoint, which then
+   forwards to MAX via `chat_id`. We deliberately did not build it now;
+   storing `external_chat_id` is the prerequisite.
+
+### Tenant isolation guarantee
+
+The four new fields live on `conversations` and are scoped by
+`assistant_id`. Each MGP MAX-bot is bound to **one** `assistant_id`
+(`runtime_metadata.channels.max`), and bridge tenant resolution
+(`tenant_directory` keyed by `webhook_secret`) cannot mix tenants. So:
+
+* MAX user 213771498 writing to `mgp-tour` → conversation row with
+  `assistant_id = 593471b7-…` and that tenant's company sees the
+  profile in their LK only.
+* The same MAX user 213771498 writing to `mgp-krasnogorsk` →
+  a **separate** conversation row with
+  `assistant_id = fedfe143-…`. The two LK companies never see each
+  other's data even though the underlying MAX user is the same.
+
+This isolation is also reflected in the Redis session store: as of
+2026-05-13 the key is
+`max:user:<user_id>:tenant:<slug>:session`, so the two bots get
+distinct backend session_ids.
+
+---
+
 ## 6. Open items intentionally left for LK side
 
 * UI badge styling (colors / icon).

@@ -801,7 +801,11 @@ def _log_chat_to_db(session_id: str, user_message: str, reply: str,
                      api_calls_log: list = None,
                      final_message_usage: dict = None,
                      channel: str = "widget",
-                     external_user_id: str = None):
+                     external_user_id: str = None,
+                     external_first_name: str = None,
+                     external_last_name: str = None,
+                     external_user_name: str = None,
+                     external_chat_id: str = None):
     """
     Записать в PostgreSQL клиентски-видимую историю:
     - все обычные записи из history_snapshot (user, assistant, tool)
@@ -856,6 +860,21 @@ def _log_chat_to_db(session_id: str, user_message: str, reply: str,
                 _ext_uid = (external_user_id or "").strip() or None
                 if _ext_uid is not None and len(_ext_uid) > 64:
                     _ext_uid = _ext_uid[:64]
+                # Profile fields (MAX-only today). Width-bounded to match
+                # the DB columns; any overflow is truncated rather than
+                # raising so a bad bridge cannot block legitimate dialogs.
+                def _trim(value, limit):
+                    if value is None:
+                        return None
+                    s = str(value).strip()
+                    if not s:
+                        return None
+                    return s[:limit]
+
+                _ext_first = _trim(external_first_name, 64)
+                _ext_last = _trim(external_last_name, 64)
+                _ext_name = _trim(external_user_name, 128)
+                _ext_chat = _trim(external_chat_id, 64)
                 conv = Conversation(
                     session_id=session_id,
                     llm_provider=llm_provider or _llm_provider,
@@ -865,6 +884,10 @@ def _log_chat_to_db(session_id: str, user_message: str, reply: str,
                     assistant_id=_aid,
                     channel=_channel,
                     external_user_id=_ext_uid,
+                    external_first_name=_ext_first,
+                    external_last_name=_ext_last,
+                    external_user_name=_ext_name,
+                    external_chat_id=_ext_chat,
                 )
                 db.add(conv)
                 db.flush()
@@ -1615,6 +1638,14 @@ def chat_v1():
     # Conversation row only — see _log_chat_to_db for the exact contract.
     channel_hdr = (request.headers.get('X-Channel') or 'widget').strip().lower()
     external_user_id_hdr = (request.headers.get('X-External-User-Id') or '').strip() or None
+    # External profile headers — only meaningful when X-Channel is set by a
+    # bridge (e.g. mgp-max-bridge sets these from the MAX webhook payload).
+    # Trim & length-bound here so the DB column constraints can't be busted
+    # by a misbehaving bridge sending a 5 KB display name.
+    external_first_name_hdr = (request.headers.get('X-External-User-First-Name') or '').strip()[:64] or None
+    external_last_name_hdr = (request.headers.get('X-External-User-Last-Name') or '').strip()[:64] or None
+    external_user_name_hdr = (request.headers.get('X-External-User-Name') or '').strip()[:128] or None
+    external_chat_id_hdr = (request.headers.get('X-External-Chat-Id') or '').strip()[:64] or None
     auth_error = _runtime_auth_error_response(conversation_id=conversation_id)
     if auth_error:
         return auth_error
@@ -1767,7 +1798,11 @@ def chat_v1():
                         api_calls_log=_api_calls_snapshot,
                         final_message_usage=getattr(handler, '_last_message_usage', None),
                         channel=channel_hdr,
-                        external_user_id=external_user_id_hdr)
+                        external_user_id=external_user_id_hdr,
+                        external_first_name=external_first_name_hdr,
+                        external_last_name=external_last_name_hdr,
+                        external_user_name=external_user_name_hdr,
+                        external_chat_id=external_chat_id_hdr)
 
         _mark_assistant_responded(session_id)
 
