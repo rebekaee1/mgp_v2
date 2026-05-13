@@ -73,12 +73,18 @@ def validate_webhook_secret(value: str) -> Optional[str]:
 def fetch_bot_info(bot_token: str, base_url: str = _DEFAULT_BOT_API_URL, timeout: float = 10.0) -> Tuple[bool, Dict[str, Any]]:
     """Call ``GET /me`` on the MAX bot API to confirm the token is alive.
 
+    Authorization is sent via the ``Authorization`` header (raw token, no
+    ``Bearer`` prefix — MAX rejects the standard scheme). The legacy
+    ``?access_token=`` query parameter was deprecated by MAX on 2026-05-13
+    and now returns HTTP 401 (verify.token).
+
     Returns ``(ok, payload)``. On error, ``payload`` contains a short reason.
     """
-    url = f"{base_url.rstrip('/')}/me?access_token={bot_token}"
+    url = f"{base_url.rstrip('/')}/me"
+    headers = {"Authorization": bot_token}
     try:
         with httpx.Client(timeout=timeout) as client:
-            response = client.get(url)
+            response = client.get(url, headers=headers)
     except httpx.HTTPError as exc:
         return False, {"error": f"transport: {exc}"}
     if response.status_code >= 400:
