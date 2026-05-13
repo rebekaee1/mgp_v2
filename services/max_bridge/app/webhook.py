@@ -181,15 +181,39 @@ def _extract_message(update: dict[str, Any]) -> Optional[dict[str, Any]]:
 
     if update_type not in {"message_created", "message"}:
         return None
-    message = update.get("message") or {}
-    body = message.get("body") or {}
-    text = (body.get("text") or "").strip()
+    # MAX has shipped two payload shapes for ``message_created`` historically:
+    #
+    # 1. Legacy (pre-2026-05): the canonical message lives at
+    #    ``update.message.body.text`` with sender/recipient siblings of
+    #    ``body`` inside ``message``.
+    # 2. Current (observed 2026-05-13): the canonical message lives at the
+    #    *root* of the update (``update.text``, ``update.sender.user_id``,
+    #    ``update.recipient.chat_id``). The ``message`` field still exists
+    #    but wraps the actual text one extra layer down at
+    #    ``update.message.message.text`` instead of ``message.body.text``.
+    #
+    # We accept both. Read from the root first (current contract) and fall
+    # back to the legacy layout so we keep working if MAX flips back.
+    root_message = update.get("message") or {}
+    nested_message = root_message.get("message") or {}
+    legacy_body = root_message.get("body") or {}
+
+    text = (
+        (update.get("text") or "").strip()
+        or (nested_message.get("text") or "").strip()
+        or (legacy_body.get("text") or "").strip()
+    )
     if not text:
         return None
-    sender = message.get("sender") or {}
-    recipient = message.get("recipient") or {}
-    user_id = sender.get("user_id") or sender.get("id")
-    chat_id = recipient.get("chat_id") or message.get("chat_id")
+
+    root_sender = update.get("sender") or root_message.get("sender") or {}
+    root_recipient = update.get("recipient") or root_message.get("recipient") or {}
+    user_id = root_sender.get("user_id") or root_sender.get("id")
+    chat_id = (
+        root_recipient.get("chat_id")
+        or root_message.get("chat_id")
+        or update.get("chat_id")
+    )
     if user_id is None:
         return None
     return {
