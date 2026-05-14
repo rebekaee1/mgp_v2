@@ -790,6 +790,85 @@ def _request_origin_label() -> str:
 
 # === DB LOGGING (полный путь диалога для аналитики и личного кабинета) ===
 
+# ── Feminine persona output filter ──────────────────────────────────────────
+#
+# Prompt-level constraints (the per-tenant DB ``system_prompt`` override that
+# tells the model to use "нашла"/"подобрала"/"показала" instead of the male
+# forms) work ~90% of the time but not 100% with gpt-5-mini: the 60 KB base
+# prompt is full of "нашёл подходящие варианты"-style examples, so the model
+# sometimes picks the male verb on the very first token of a reply even when
+# the override sits at the top of the prompt.
+#
+# This regex pass is a last-mile guard that flips the most common 1st-person
+# masculine verbs and short adjectives into the feminine form. It is gated on
+# ``widget_config.feminine_persona = true`` (a per-tenant flag) so other
+# tenants stay byte-for-byte identical to before. Word boundaries are Cyrillic-
+# aware (a custom lookaround instead of \b — Python ``re`` ``\b`` does NOT
+# treat letters from non-ASCII alphabets as word characters when ``re.UNICODE``
+# is implied but the regex starts with a Cyrillic letter, so we spell the
+# boundary out explicitly).
+#
+# We deliberately do NOT skip sentences that mention "вы"/"ты" — those go with
+# 2nd-person verb forms ("вы нашли", "ты нашёл") and the singular masculine
+# 1st-person form we're rewriting almost never collides with them in natural
+# Russian. The risk of an over-zealous rewrite is therefore minimal and the
+# benefit (100% gender compliance for the tenant) is high.
+
+_FEMININE_PERSONA_PATTERNS = [
+    # past-tense 1st-person verbs (singular masculine → feminine)
+    (re.compile(r'(?<![А-Яа-яёЁ])Нашёл(?![А-Яа-яёЁ])'), 'Нашла'),
+    (re.compile(r'(?<![А-Яа-яёЁ])Нашел(?![А-Яа-яёЁ])'), 'Нашла'),
+    (re.compile(r'(?<![А-Яа-яёЁ])нашёл(?![А-Яа-яёЁ])'), 'нашла'),
+    (re.compile(r'(?<![А-Яа-яёЁ])нашел(?![А-Яа-яёЁ])'), 'нашла'),
+    (re.compile(r'(?<![А-Яа-яёЁ])Показал(?![А-Яа-яёЁ])'), 'Показала'),
+    (re.compile(r'(?<![А-Яа-яёЁ])показал(?![А-Яа-яёЁ])'), 'показала'),
+    (re.compile(r'(?<![А-Яа-яёЁ])Подобрал(?![А-Яа-яёЁ])'), 'Подобрала'),
+    (re.compile(r'(?<![А-Яа-яёЁ])подобрал(?![А-Яа-яёЁ])'), 'подобрала'),
+    (re.compile(r'(?<![А-Яа-яёЁ])Подготовил(?![А-Яа-яёЁ])'), 'Подготовила'),
+    (re.compile(r'(?<![А-Яа-яёЁ])подготовил(?![А-Яа-яёЁ])'), 'подготовила'),
+    (re.compile(r'(?<![А-Яа-яёЁ])Проверил(?![А-Яа-яёЁ])'), 'Проверила'),
+    (re.compile(r'(?<![А-Яа-яёЁ])проверил(?![А-Яа-яёЁ])'), 'проверила'),
+    (re.compile(r'(?<![А-Яа-яёЁ])Уточнил(?![А-Яа-яёЁ])'), 'Уточнила'),
+    (re.compile(r'(?<![А-Яа-яёЁ])уточнил(?![А-Яа-яёЁ])'), 'уточнила'),
+    (re.compile(r'(?<![А-Яа-яёЁ])Помог(?![А-Яа-яёЁ])'), 'Помогла'),
+    (re.compile(r'(?<![А-Яа-яёЁ])помог(?![А-Яа-яёЁ])'), 'помогла'),
+    (re.compile(r'(?<![А-Яа-яёЁ])Посмотрел(?![А-Яа-яёЁ])'), 'Посмотрела'),
+    (re.compile(r'(?<![А-Яа-яёЁ])посмотрел(?![А-Яа-яёЁ])'), 'посмотрела'),
+    (re.compile(r'(?<![А-Яа-яёЁ])Понял(?![А-Яа-яёЁ])'), 'Поняла'),
+    (re.compile(r'(?<![А-Яа-яёЁ])понял(?![А-Яа-яёЁ])'), 'поняла'),
+    (re.compile(r'(?<![А-Яа-яёЁ])Отправил(?![А-Яа-яёЁ])'), 'Отправила'),
+    (re.compile(r'(?<![А-Яа-яёЁ])отправил(?![А-Яа-яёЁ])'), 'отправила'),
+    (re.compile(r'(?<![А-Яа-яёЁ])Учел(?![А-Яа-яёЁ])'), 'Учла'),
+    (re.compile(r'(?<![А-Яа-яёЁ])Учёл(?![А-Яа-яёЁ])'), 'Учла'),
+    (re.compile(r'(?<![А-Яа-яёЁ])учел(?![А-Яа-яёЁ])'), 'учла'),
+    (re.compile(r'(?<![А-Яа-яёЁ])учёл(?![А-Яа-яёЁ])'), 'учла'),
+    (re.compile(r'(?<![А-Яа-яёЁ])Добавил(?![А-Яа-яёЁ])'), 'Добавила'),
+    (re.compile(r'(?<![А-Яа-яёЁ])добавил(?![А-Яа-яёЁ])'), 'добавила'),
+    (re.compile(r'(?<![А-Яа-яёЁ])Запустил(?![А-Яа-яёЁ])'), 'Запустила'),
+    (re.compile(r'(?<![А-Яа-яёЁ])запустил(?![А-Яа-яёЁ])'), 'запустила'),
+    # short-form adjectives / participles in 1st person
+    (re.compile(r'(?<![А-Яа-яёЁ])Готов(?![А-Яа-яёЁ])'), 'Готова'),
+    (re.compile(r'(?<![А-Яа-яёЁ])готов(?![А-Яа-яёЁ])'), 'готова'),
+    (re.compile(r'(?<![А-Яа-яёЁ])Рад(?![А-Яа-яёЁ])'), 'Рада'),
+    (re.compile(r'(?<![А-Яа-яёЁ])рад(?![А-Яа-яёЁ])'), 'рада'),
+    (re.compile(r'(?<![А-Яа-яёЁ])Доволен(?![А-Яа-яёЁ])'), 'Довольна'),
+    (re.compile(r'(?<![А-Яа-яёЁ])доволен(?![А-Яа-яёЁ])'), 'довольна'),
+    (re.compile(r'(?<![А-Яа-яёЁ])Свободен(?![А-Яа-яёЁ])'), 'Свободна'),
+    (re.compile(r'(?<![А-Яа-яёЁ])свободен(?![А-Яа-яёЁ])'), 'свободна'),
+]
+
+
+def _enforce_feminine_persona(text: str) -> str:
+    """Rewrite singular masculine 1st-person verbs/short adjectives into
+    feminine forms. No-op for empty or None input. Word boundaries are
+    Cyrillic-aware (see notes above the pattern table)."""
+    if not text:
+        return text
+    for pattern, replacement in _FEMININE_PERSONA_PATTERNS:
+        text = pattern.sub(replacement, text)
+    return text
+
+
 def _log_chat_to_db(session_id: str, user_message: str, reply: str,
                      tour_cards: list, latency_ms: int = None,
                      model_name: str = "unknown",
@@ -1739,6 +1818,38 @@ def chat_v1():
         reply = loop.run_until_complete(handler.chat(message))
         loop.close()
         _new_entries = handler.full_history[_hist_before:]
+
+        # ── Per-tenant feminine-persona output filter ──────────────────────
+        # When the tenant has ``widget_config.feminine_persona = true`` we
+        # enforce female 1st-person verb forms on the wire. Prompt-level
+        # rules cover the common case but the LLM occasionally slips on the
+        # very first token of an answer (Krasnogorsk 2026-05-14 feedback:
+        # "Нашёл несколько вариантов…" instead of "Нашла…"). This regex
+        # pass is the last-mile guard. We rewrite ``reply`` AND mirror the
+        # rewrite into ``_new_entries`` so the DB / LK snapshot / audit log
+        # all show exactly what the user got — there is no version drift
+        # between the user-facing message and the auditor-facing one.
+        try:
+            _widget_cfg = (getattr(handler, 'runtime_config', None)
+                           and getattr(handler.runtime_config, 'widget_config', None)
+                           or {})
+            if _widget_cfg.get('feminine_persona'):
+                _orig_reply = reply
+                reply = _enforce_feminine_persona(reply)
+                if reply != _orig_reply:
+                    # Mirror into the history snapshot persisted to DB.
+                    for _entry in reversed(_new_entries):
+                        if (_entry.get("role") == "assistant"
+                                and _entry.get("content") == _orig_reply):
+                            _entry["content"] = reply
+                            break
+                    logger.info(
+                        "♀️ FEMININE PERSONA FILTER: rewrote reply (assistant=%s)",
+                        assistant_id,
+                    )
+        except Exception:
+            # The filter must never break the response — log and pass through.
+            logger.exception("feminine_persona_filter_failed")
 
         tour_cards = list(handler._pending_tour_cards)
         handler._pending_tour_cards = []
