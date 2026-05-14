@@ -1075,10 +1075,17 @@ def _build_hotel_link(tourid, fallback_link: str = "#", booking_base_url: str = 
 
     Default (mgp.ru): uses custom #tvtourid= handler on /tours/ page.
     Custom tenant: constructs tenant_url#tvtourid=XXX.
+
+    We deliberately preserve the trailing slash of ``booking_base_url``:
+    some tenant sites (e.g. mgput.ru/poisk/) issue a 301 redirect from
+    ``/poisk`` to ``/poisk/``, and the URL fragment (``#tvtourid=...``)
+    is not guaranteed to survive a 301 in every browser. Keeping the
+    slash means the Tourvisor widget gets the anchor on the very first
+    request.
     """
     base = booking_base_url or _DEFAULT_BOOKING_BASE_URL
     if tourid:
-        return f"{base.rstrip('/')}#tvtourid={tourid}"
+        return f"{base}#tvtourid={tourid}"
     if fallback_link and fallback_link != "#":
         link = fallback_link.strip()
         if link.startswith("http"):
