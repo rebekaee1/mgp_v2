@@ -1061,6 +1061,14 @@ def _pick_best_tour(tours: list, ideal_datefrom: str = None,
 
 _DEFAULT_BOOKING_BASE_URL = "https://mgp.ru/tours/"
 
+# Maximum number of tour cards the MAX-channel bridge renders per
+# ``get_search_results`` response. Mirrors ``services/max_bridge/app/config.py``
+# (``max_tour_cards_limit``). Without trimming on the backend side the LLM
+# sees 5 hotel names in its tool result, says "укажите номер (1–5)" to the
+# user, while the MAX user only sees 3 photos in the chat — a visible
+# mismatch (observed in production 2026-05-14, mgp-krasnogorsk feedback).
+_MAX_CHANNEL_CARDS_LIMIT = 3
+
 
 def _build_hotel_link(tourid, fallback_link: str = "#", booking_base_url: str = None) -> str:
     """Build booking link for a tour card.
@@ -1736,6 +1744,10 @@ class YandexGPTHandler:
                         {k: v["tourid"] for k, v in self._tourid_map.items()})
             self._start_prefetch()
 
+        # Cap visible list to the channel's render budget BEFORE building the
+        # hint so the "клиент видит N" number stays accurate.
+        ai_hotels, _visible_count = self._trim_for_channel(ai_hotels)
+
         pool_status = self._results_pool_status or {}
         _result_hint = (
             "Карточки с фото, ценами, датами, питанием, звёздами УЖЕ отображены фронтендом. "
@@ -1743,6 +1755,12 @@ class YandexGPTHandler:
             "Напиши ТОЛЬКО краткий комментарий (1-2 предложения) и спроси клиента. "
             "Добавь: «Окончательная стоимость — при оформлении тура.»"
         )
+        if _visible_count:
+            _result_hint += (
+                f" Клиент видит {_visible_count} карточек в чате (нумерация 1–{_visible_count}). "
+                f"Когда ссылаешься на конкретный тур — используй ТОЛЬКО эти номера, "
+                f"никогда не пиши «1–5» если показано меньше."
+            )
 
         return {
             "hotels_found": pool_status.get("hotelsfound", 0),
@@ -1752,6 +1770,37 @@ class YandexGPTHandler:
             "_hint": _result_hint,
             "_skip_search_status": True,
         }
+
+    def _trim_for_channel(self, ai_hotels):
+        """Cap the visible tour list to what the current channel actually renders.
+
+        Returns ``(possibly_trimmed_ai_hotels, visible_count)``. For the
+        web widget this is a no-op (returns the original list). For the
+        MAX channel we slice down to ``_MAX_CHANNEL_CARDS_LIMIT`` so the
+        LLM, ``_pending_tour_cards`` (consumed by the bridge), and
+        ``_tourid_map`` (used to resolve "третий вариант" / "тур 2") all
+        agree on the same N. Without this the assistant would say
+        "укажите номер (1–5)" while the user only sees 3 cards.
+        """
+        channel = (getattr(self, "_channel", None) or "widget").strip().lower()
+        if channel != "max":
+            return ai_hotels, len(ai_hotels)
+        limit = _MAX_CHANNEL_CARDS_LIMIT
+        if len(ai_hotels) <= limit:
+            return ai_hotels, len(ai_hotels)
+        trimmed = ai_hotels[:limit]
+        if getattr(self, "_pending_tour_cards", None):
+            self._pending_tour_cards = self._pending_tour_cards[:limit]
+        if getattr(self, "_tourid_map", None):
+            self._tourid_map = {
+                pos: entry for pos, entry in self._tourid_map.items() if pos <= limit
+            }
+        logger.info(
+            "✂️ CHANNEL TRIM: channel=max — trimmed %d → %d cards "
+            "(ai_hotels + tour_cards + tourid_map kept in sync)",
+            len(ai_hotels), limit,
+        )
+        return trimmed, limit
 
     def _start_prefetch(self):
         """Launch background thread to prefetch actdetail for top-3 displayed tours."""
@@ -2035,8 +2084,27 @@ class YandexGPTHandler:
         runtime_faq = getattr(self.runtime_config, "faq_content", None)
 
         if runtime_prompt and len(runtime_prompt) < 3000:
-            prompt = prompt + "\n\n---\n\n" + runtime_prompt
-            logger.info("📋 Appended short DB system_prompt (%d chars) as personalization", len(runtime_prompt))
+            # PREPEND (not append) the per-tenant override so the LLM
+            # encounters tenant-specific rules BEFORE the 60 KB base prompt.
+            # With gpt-5-mini-class models the top of the system prompt
+            # carries noticeably more weight than the tail: when the
+            # Krasnogorsk feminine-persona override sat at the bottom, the
+            # model regularly slipped back into male verb forms ("Показал"
+            # instead of "Показала"). Tambov has a similar critical override
+            # (forbidding ``submit_client_request``) that also benefits from
+            # being placed first. We keep a horizontal rule + a short tag
+            # so the base prompt is still clearly demarcated.
+            prompt = (
+                runtime_prompt
+                + "\n\n---\n\n"
+                + "## БАЗОВЫЙ ПРОМПТ (правила выше имеют приоритет в случае конфликта)\n\n"
+                + prompt
+            )
+            logger.info(
+                "📋 Prepended short DB system_prompt (%d chars) ahead of base prompt "
+                "(override takes precedence)",
+                len(runtime_prompt),
+            )
         elif runtime_prompt:
             logger.info(
                 "⚠️ Ignoring legacy DB system_prompt (%d chars) — using unified base file. "
@@ -3834,7 +3902,23 @@ class YandexGPTHandler:
                     ),
                 }
 
+            # Cap to channel render budget (MAX shows 3 cards even when we
+            # have 5 hotels in the pool). Must happen BEFORE the hint is
+            # composed so the visible-count interpolation matches reality.
+            ai_hotels, _visible_count = self._trim_for_channel(ai_hotels)
+            # Mirror the trim onto the "simplified" list used by the
+            # mismatch detectors below so they only complain about hotels
+            # the user can actually see.
+            if _visible_count < len(simplified):
+                simplified = simplified[:_visible_count]
+
             _result_hint = "Карточки с фото, ценами, датами, питанием, звёздами УЖЕ отображены фронтендом. НЕ перечисляй отели, цены, описания, даты, питание, звёзды в тексте! Напиши ТОЛЬКО краткий комментарий (1-2 предложения) и спроси клиента. Добавь: «Окончательная стоимость — при оформлении тура.» При оформлении возможны незначительные доплаты (мед. страховка и др.) — если клиент спрашивает о точной стоимости, используй actualize_tour."
+            if _visible_count:
+                _result_hint += (
+                    f" Клиент видит {_visible_count} карточек в чате (нумерация 1–{_visible_count}). "
+                    f"Когда ссылаешься на конкретный тур — используй ТОЛЬКО эти номера, "
+                    f"никогда не пиши «1–5» если показано меньше."
+                )
 
             _req_meal_code = _safe_int(self._original_requested_meal, None) or _safe_int(self._last_search_params.get("meal"), None)
             if _req_meal_code and simplified:
