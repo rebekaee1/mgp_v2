@@ -84,6 +84,52 @@ _STATUS_LOOKUP_ALLOWED_ASSISTANT_IDS = {
     "d1327f41-3c31-4776-9f80-f22cde9bd579",
 }
 
+# ── Feature: "Офисы сети МГП" (get_offices) ────────────────────────────────
+# Tool возвращает адреса/телефоны офисов сети из backend/data/mgp_offices.json.
+# Включён ТОЛЬКО для главного офиса (mgp-tour) — у локальных тенантов
+# (Кириши, Тамбов и т.п.) свой собственный адрес уже зашит в widget_config,
+# им чужие офисы Москвы/Подмосковья не нужны и только засоряли бы контекст.
+_OFFICES_LOOKUP_ALLOWED_SLUGS = {
+    "mgp-tour",
+    "lk-prodlike-1773077586",
+}
+_OFFICES_LOOKUP_ALLOWED_ASSISTANT_IDS = {
+    # Прод: mgp.ru live widget (LK Prodlike Rollout)
+    "2b7b20bd-d904-49bf-b43f-de3c4028ae6a",
+    # Прод: MAX-канал МГП Тур
+    "593471b7-42da-4ae0-8499-904dcedd6a4b",
+    # Локальный mgp-tour (для разработки)
+    "d1327f41-3c31-4776-9f80-f22cde9bd579",
+}
+
+_MGP_OFFICES_CACHE: Optional[List[Dict]] = None
+
+def _load_mgp_offices() -> List[Dict]:
+    """Lazy-load офисов сети МГП из backend/data/mgp_offices.json.
+
+    Кэш на уровне модуля, чтобы не перечитывать JSON на каждый вызов.
+    """
+    global _MGP_OFFICES_CACHE
+    if _MGP_OFFICES_CACHE is None:
+        path = os.path.join(os.path.dirname(__file__), "data", "mgp_offices.json")
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            _MGP_OFFICES_CACHE = list(data.get("offices", []))
+            logger.info("📍 OFFICES: loaded %d entries from %s", len(_MGP_OFFICES_CACHE), path)
+        except Exception as e:
+            logger.error("📍 OFFICES: failed to load %s — %s", path, e)
+            _MGP_OFFICES_CACHE = []
+    return _MGP_OFFICES_CACHE
+
+
+def _normalize_office_query(text: str) -> str:
+    """Нормализует строку поиска: lower, ё→е, схлопывает пробелы."""
+    s = (text or "").lower().replace("ё", "е")
+    s = re.sub(r"[^a-zа-я0-9\-\s]+", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
 # Финальные негативные/закрытые статусы — клиенту НЕ показываем,
 # отдаём общий redirect к менеджеру. Слова сравниваются нечувствительно к регистру.
 _STATUS_LOOKUP_CLOSED_NAMES = {
@@ -1926,6 +1972,13 @@ class YandexGPTHandler:
         
         # Загружаем custom functions
         custom_tools = data.get("tools", [])
+
+        # ── Per-tenant filter: get_offices только для главного офиса ──
+        # Локальные тенанты (Кириши, Тамбов и т.п.) не должны видеть этот tool —
+        # иначе LLM попробует вызвать его на «адрес вашего офиса» и подсунет
+        # клиенту чужой адрес из Москвы вместо своего из widget_config.
+        if not self._offices_lookup_allowed():
+            custom_tools = [t for t in custom_tools if t.get("name") != "get_offices"]
         
         # Добавляем встроенный web_search инструмент
         web_search_tool = {
@@ -1934,6 +1987,15 @@ class YandexGPTHandler:
         }
         
         return custom_tools + [web_search_tool]
+
+    def _offices_lookup_allowed(self) -> bool:
+        """Возвращает True если у тенанта включён tool get_offices."""
+        slug = (getattr(self.runtime_config, "company_slug", None) or "").strip().lower()
+        assistant_id = (getattr(self.runtime_config, "assistant_id", None) or "").strip().lower()
+        return (
+            slug in _OFFICES_LOOKUP_ALLOWED_SLUGS
+            or assistant_id in _OFFICES_LOOKUP_ALLOWED_ASSISTANT_IDS
+        )
     
     def _apply_tenant_search_filters(self, args: dict) -> None:
         """Inject per-tenant operator/GDS filters from widget_config into search args.
@@ -4916,9 +4978,135 @@ class YandexGPTHandler:
         elif name == "get_client_request_status":
             return await self._handle_get_client_request_status(args)
 
+        elif name == "get_offices":
+            return self._handle_get_offices(args)
+
         else:
             return {"error": f"Неизвестная функция: {name}"}
-    
+
+    # ── MGP offices handler ──────────────────────────────────────────────
+    def _handle_get_offices(self, args: Dict) -> Dict:
+        """Поиск офисов сети МГП по городу/району/метро/ключу.
+
+        Возвращает топ-N офисов с адресами и телефонами. Если для тенанта
+        tool не разрешён (защитный второй уровень — first level это
+        _load_tools который вообще не отдаёт схему), возвращает redirect.
+        """
+        if not self._offices_lookup_allowed():
+            slug = (getattr(self.runtime_config, "company_slug", None) or "<unknown>")
+            logger.info("📍 OFFICES: tenant blocked slug='%s' — redirect_to_manager", slug)
+            return {
+                "status": "not_allowed",
+                "message": (
+                    "Передай клиенту: уточнить адреса других офисов сети можно у "
+                    "менеджера или на сайте mgp.ru. Здесь представлен только наш офис."
+                ),
+            }
+
+        raw_query = args.get("query") or ""
+        try:
+            limit_raw = args.get("limit", 3)
+            limit = int(limit_raw) if limit_raw is not None else 3
+        except (TypeError, ValueError):
+            limit = 3
+        limit = max(1, min(limit, 7))
+
+        normalized = _normalize_office_query(raw_query)
+        if not normalized:
+            return {
+                "status": "bad_query",
+                "message": "Уточни у клиента город или район, в котором нужен офис.",
+            }
+
+        tokens = [t for t in normalized.split() if len(t) >= 2]
+        if not tokens:
+            return {
+                "status": "bad_query",
+                "message": "Запрос слишком короткий — уточни у клиента город или район.",
+            }
+
+        offices = _load_mgp_offices()
+        if not offices:
+            return {
+                "status": "data_unavailable",
+                "message": (
+                    "Не удалось загрузить базу офисов. Предложи клиенту написать "
+                    "на online@mgp.ru или позвонить менеджеру."
+                ),
+            }
+
+        # Weighted scoring (per token):
+        #   точное равенство city / metro / district   +5
+        #   токен в составе city/metro/district         +3
+        #   токен в search_keys                          +2
+        #   токен в region / address (fuzzy)            +1
+        # Этот порядок гарантирует, что при запросе "Краснодар" сначала
+        # вернётся реальный Краснодар, а не Анапа (у которой
+        # "краснодарский край" в search_keys).
+        scored: List[Tuple[int, Dict]] = []
+        for office in offices:
+            city = _normalize_office_query(str(office.get("city") or ""))
+            metro = _normalize_office_query(str(office.get("metro") or ""))
+            district = _normalize_office_query(str(office.get("district") or ""))
+            region = _normalize_office_query(str(office.get("region") or ""))
+            address = _normalize_office_query(str(office.get("address") or ""))
+            keys = _normalize_office_query(" ".join(office.get("search_keys", []) or []))
+
+            score = 0
+            for tok in tokens:
+                if tok == city or tok == metro or tok == district:
+                    score += 5
+                elif tok in city or tok in metro or tok in district:
+                    score += 3
+                elif tok in keys.split():
+                    score += 2
+                elif tok in keys:
+                    score += 2
+                elif tok in region:
+                    score += 1
+                elif tok in address:
+                    score += 1
+            if score > 0:
+                scored.append((score, office))
+
+        if not scored:
+            return {
+                "status": "not_found",
+                "query": raw_query,
+                "message": (
+                    f"По запросу «{raw_query}» офис не найден. Сообщи клиенту, что в этом "
+                    f"городе/районе офиса сети МГП может не быть, но мы работаем онлайн "
+                    f"по всей России — оформим тур дистанционно с доставкой документов. "
+                    f"Предложи написать на online@mgp.ru или позвонить менеджеру."
+                ),
+            }
+
+        scored.sort(key=lambda x: -x[0])
+        top = []
+        for _, office in scored[:limit]:
+            entry = {k: v for k, v in office.items() if k != "search_keys"}
+            top.append(entry)
+
+        logger.info(
+            "📍 OFFICES: query='%s' tokens=%s found=%d returned=%d",
+            raw_query, tokens, len(scored), len(top),
+        )
+
+        return {
+            "status": "ok",
+            "query": raw_query,
+            "found": len(scored),
+            "returned": len(top),
+            "offices": top,
+            "schedule_default": "Пн–Пт 10:00–19:00, Сб 10:00–17:00, Вс — выходной",
+            "hint": (
+                "Передай клиенту адрес и телефон найденных офисов кратко (не более 3–4 строк). "
+                "НИКОГДА не выдумывай адреса или телефоны — выдавай только то, что вернул tool. "
+                "Если найдено несколько — спроси, какой удобнее. "
+                "Режим работы добавляй только если клиент спросил."
+            ),
+        }
+
     # ── U-ON CRM handlers ────────────────────────────────────────────────
 
     async def _handle_submit_client_request(self, args: Dict) -> Dict:
@@ -5725,7 +5913,30 @@ class YandexGPTHandler:
                 
                 if "429" in error_str or "Too Many" in error_str:
                     return "Секундочку, сейчас много обращений — повторите через пару секунд!"
-                
+
+                # HTTP 402 — Prompt tokens limit exceeded (OpenRouter context limit).
+                # Это значит: наш статический prompt + history превышает effective
+                # context window. Повтор НЕ поможет — лимит каждый раз будет тот же.
+                # Честно говорим клиенту "оставь контакт", без иллюзии "повторите".
+                if (
+                    "402" in error_str
+                    or "Prompt tokens limit exceeded" in error_str
+                    or "context_length_exceeded" in error_str
+                    or "context length" in error_str.lower()
+                ):
+                    logger.critical(
+                        "🚨 CONTEXT-OVERFLOW (402/context_length): history=%d msgs — falling back to contact-capture mode. Error: %s",
+                        len(self.full_history), error_str[:300]
+                    )
+                    self.previous_response_id = None
+                    _phone = self._get_manager_phone()
+                    return (
+                        "Сейчас не получается обработать запрос автоматически. "
+                        "Оставьте, пожалуйста, имя и телефон — менеджер перезвонит "
+                        "и поможет подобрать тур лично. "
+                        f"Или позвоните сами: {_phone}, либо напишите на online@mgp.ru."
+                    )
+
                 # Если previous response failed → fallback к full_history
                 if "status failed" in error_str:
                     logger.warning("🔄 FALLBACK to full_history (%d items) after 'status failed'",
@@ -6142,6 +6353,27 @@ class YandexGPTHandler:
                 # 429 Too Many Requests — rate limiting
                 if "429" in error_str or "Too Many" in error_str:
                     return "Секундочку, сейчас много обращений — повторите через пару секунд!"
+
+                # HTTP 402 / context_length_exceeded — prompt вышел за лимит контекста.
+                # Не повторяемся (лимит каждый раз тот же) — сразу контакт-сбор.
+                if (
+                    "402" in error_str
+                    or "Prompt tokens limit exceeded" in error_str
+                    or "context_length_exceeded" in error_str
+                    or "context length" in error_str.lower()
+                ):
+                    logger.critical(
+                        "🚨 STREAM CONTEXT-OVERFLOW (402/context_length): history=%d msgs — contact-capture fallback. Error: %s",
+                        len(self.full_history), error_str[:300]
+                    )
+                    self.previous_response_id = None
+                    _phone = self._get_manager_phone()
+                    return (
+                        "Сейчас не получается обработать запрос автоматически. "
+                        "Оставьте, пожалуйста, имя и телефон — менеджер перезвонит "
+                        "и поможет подобрать тур лично. "
+                        f"Или позвоните сами: {_phone}, либо напишите на online@mgp.ru."
+                    )
                 
                 # Если response ещё in_progress — подождать и попробовать снова
                 if "in_progress" in error_str:

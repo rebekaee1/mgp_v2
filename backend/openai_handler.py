@@ -157,18 +157,32 @@ class OpenAIHandler(YandexGPTHandler):
         with open(schema_path, "r", encoding="utf-8") as f:
             data = json.load(f)
 
-        openai_tools = []
-        for tool in data.get("tools", []):
-            if tool.get("type") == "function":
-                openai_tools.append({
-                    "type": "function",
-                    "function": {
-                        "name": tool["name"],
-                        "description": tool.get("description", ""),
-                        "parameters": tool.get("parameters", {}),
-                    }
-                })
+        # Per-tenant filter: get_offices только для главного офиса.
+        offices_allowed = self._offices_lookup_allowed()
 
+        openai_tools = []
+        skipped = []
+        for tool in data.get("tools", []):
+            if tool.get("type") != "function":
+                continue
+            name = tool["name"]
+            if name == "get_offices" and not offices_allowed:
+                skipped.append(name)
+                continue
+            openai_tools.append({
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "description": tool.get("description", ""),
+                    "parameters": tool.get("parameters", {}),
+                }
+            })
+
+        if skipped:
+            logger.info(
+                "🔧 Tools filtered for tenant: skipped=%s (offices_allowed=%s)",
+                skipped, offices_allowed,
+            )
         logger.info("🔧 Loaded %d OpenAI tools from function_schemas.json", len(openai_tools))
         return openai_tools
 
@@ -614,6 +628,32 @@ class OpenAIHandler(YandexGPTHandler):
                     return (
                         "Секундочку, сейчас много обращений — "
                         "повторите через пару секунд!"
+                    )
+
+                # ── HTTP 402 / OpenRouter "Prompt tokens limit exceeded" ──
+                # Это значит наш статический prompt + tools + history превышает
+                # effective context window модели. Повторять БЕСПОЛЕЗНО — лимит
+                # тот же. Сразу честно говорим клиенту "оставь контакт".
+                # Проверяем ДО ветки 400, потому что тело 402-ошибки часто
+                # содержит подстроку "400" внутри числа (например "111400 > 107741")
+                # и попадает в неверную ветку invalid-request.
+                if (
+                    "Prompt tokens limit exceeded" in error_str
+                    or "context_length_exceeded" in error_str
+                    or re.search(r"\bError code:\s*402\b", error_str)
+                    or re.search(r"['\"]code['\"]\s*:\s*402\b", error_str)
+                ):
+                    logger.critical(
+                        "🚨 CONTEXT-OVERFLOW (402): history=%d msgs — "
+                        "contact-capture fallback. Error: %s",
+                        len(self.full_history), error_str[:300]
+                    )
+                    _phone = getattr(self, "_get_manager_phone", lambda: "+7 (499) 685-25-57")()
+                    return (
+                        "Сейчас не получается обработать запрос автоматически. "
+                        "Оставьте, пожалуйста, имя и телефон — менеджер перезвонит "
+                        "и поможет подобрать тур лично. "
+                        f"Или позвоните сами: {_phone}, либо напишите на online@mgp.ru."
                     )
 
                 # Token limit exceeded
