@@ -502,14 +502,27 @@ class OpenAIHandler(YandexGPTHandler):
         """
         Synchronous OpenAI API call.
         Run in thread via asyncio.to_thread() to avoid blocking the event loop.
+
+        provider.order=["openai"] + allow_fallbacks=False — заставляем
+        OpenRouter маршрутить НАПРЯМУЮ в OpenAI (а не в дешёвых
+        проксирующих провайдеров, у которых per-account context limit
+        искусственно занижен до 107k tokens). У нативного OpenAI gpt-5-mini
+        контекст 400k токенов.
         """
+        extra = {
+            "reasoning_effort": "low",
+            "provider": {
+                "order": ["openai"],
+                "allow_fallbacks": False,
+            },
+        }
         return self.openai_client.chat.completions.create(
             model=self.model,
             messages=messages,
             tools=self.openai_tools,
             temperature=0.2,
             max_tokens=4096,
-            extra_body={"reasoning_effort": "low"},
+            extra_body=extra,
             timeout=60.0,
         )
 
