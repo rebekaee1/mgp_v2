@@ -100,6 +100,7 @@ class OpenAIHandler(YandexGPTHandler):
             logger.info("🌐 OpenAI proxy: %s", base_url)
 
         self.openai_client = OpenAI(timeout=120.0, **client_kwargs)
+
         self.model = getattr(runtime_config, "llm_model", None) or os.getenv("OPENAI_MODEL", "gpt-5-mini")
 
         # Pinned context survives history trimming (tour cards summary)
