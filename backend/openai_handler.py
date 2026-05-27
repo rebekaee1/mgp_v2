@@ -513,8 +513,8 @@ class OpenAIHandler(YandexGPTHandler):
         extra = {
             "reasoning_effort": "low",
             "provider": {
-                "order": ["openai"],
-                "allow_fallbacks": False,
+                "order": os.getenv("OPENROUTER_PROVIDER_ORDER", "openai").split(","),
+                "allow_fallbacks": os.getenv("OPENROUTER_ALLOW_FALLBACKS", "false").lower() == "true",
             },
         }
         return self.openai_client.chat.completions.create(

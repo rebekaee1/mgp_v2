@@ -152,6 +152,41 @@ _STATUS_LOOKUP_MAX_CALLS = 3
 # Лимит неуспешных попыток верификации; после этого — soft-fail к менеджеру.
 _STATUS_LOOKUP_MAX_VERIFY_ATTEMPTS = 2
 
+# ════════════════════════════════════════════════════════════════════════════
+# BUDGET-FLOOR v2 (default-on, fix/budget-upper-floor-v2)
+# Откат: верни _BUDGET_FLOOR_DEFAULT_ON=False и старые значения коэффициента.
+# Полный откат: убери блок «BUDGET-FLOOR v2» из _normalize_search_args
+# и блок «AUTO-RETRY BUDGET-FLOOR v2» из get_search_status.
+# ════════════════════════════════════════════════════════════════════════════
+# Базовый коэффициент нижней границы (default-on): pricefrom = priceto × ratio.
+_BUDGET_FLOOR_RATIO = 0.80
+# Коэффициент для AUTO-RETRY stage=2 (если на 0.80 туров < 3).
+_BUDGET_FLOOR_RATIO_RETRY = 0.60
+# Минимальная ширина окна [pricefrom; priceto]: если разница меньше — приподнимаем pricefrom.
+_BUDGET_FLOOR_MIN_WINDOW_RUB = 40_000
+# При priceto ниже этого порога floor не применяется (дешёвый сегмент — даём всё что есть).
+_BUDGET_FLOOR_MIN_PRICETO_RUB = 30_000
+# Глобальный feature-flag (быстрый откат: поставить False).
+_BUDGET_FLOOR_DEFAULT_ON = True
+
+# Skip-фразы: «без ограничения / любой / не важен / на ваше усмотрение / сколько угодно».
+# Если найдено в последних user-сообщениях — floor НЕ применяется.
+# Поддерживаем оба порядка: «любой бюджет» и «бюджет любой».
+_BUDGET_FLOOR_SKIP_RE = re.compile(
+    r"(?:люб(?:ой|ая|ое|ые)\s+бюджет|бюджет\s+люб(?:ой|ая|ое|ые)|"
+    r"не\s+важен|не\s+важна|без\s+разниц[ыи]|"
+    r"не\s+огранич(?:ен|ив)|без\s+огранич(?:ени|ен)|"
+    r"как\s+получится|"
+    r"на\s+ваше\s+усмотрен|на\s+твое\s+усмотрен|"
+    r"сколько\s+угодно|без\s+бюджет)",
+    re.IGNORECASE,
+)
+# Фразы «около / примерно / порядка / в районе / плюс-минус» — обрабатываются P7 (±20%).
+_BUDGET_ABOUT_RE = re.compile(
+    r"(?:около|примерно|порядка|в\s+район[еу]|плюс.?минус)",
+    re.IGNORECASE,
+)
+
 # Поля U-ON, которые tool ВОЗВРАЩАЕТ LLM. Любые PII (паспорт, email, ДР, адрес,
 # номер карты, заметки менеджера) НИКОГДА не должны попадать в LLM-контекст.
 _STATUS_LOOKUP_ALLOWED_REQUEST_FIELDS = {
@@ -1643,6 +1678,80 @@ class YandexGPTHandler:
             getattr(runtime_config, "source", "env-default"),
         )
     
+    def _apply_budget_floor_v2(self, args: Dict) -> None:
+        """BUDGET-FLOOR v2 (fix/budget-upper-floor-v2) — default-on safety-net.
+
+        Если LLM передала только верхнюю границу (`priceto` без `pricefrom`),
+        по умолчанию ставим pricefrom = priceto × _BUDGET_FLOOR_RATIO,
+        чтобы поиск выдавал туры в верхней половине бюджета, а не самые дешёвые.
+
+        Порядок проверки (важен!):
+          1) Нет priceto или уже задан pricefrom → ничего не делаем (LLM сама знает).
+          2) «около / примерно / порядка / в районе / ±» → P7 (диапазон ±20%).
+          3) Feature-flag _BUDGET_FLOOR_DEFAULT_ON выключен → лог и выход.
+          4) Skip-фраза («любой / не важен / без ограничения») → лог и выход.
+          5) priceto < _BUDGET_FLOOR_MIN_PRICETO_RUB → дешёвый сегмент, лог и выход.
+          6) DEFAULT-ON: ставим pricefrom = priceto × _BUDGET_FLOOR_RATIO
+             (с минимальной шириной окна _BUDGET_FLOOR_MIN_WINDOW_RUB).
+
+        Мутирует ``args`` in-place. Сохраняет мету в ``self._budget_floor_meta``
+        для последующего AUTO-RETRY каскада (stage 2/3) в get_search_status.
+        """
+        if not args.get("priceto") or args.get("pricefrom"):
+            return
+
+        _price_user_text = " ".join([
+            msg.get("content", "") for msg in self.full_history[-20:]
+            if msg.get("role") == "user" and msg.get("content")
+        ]).lower()
+
+        _orig_priceto = int(args["priceto"])
+
+        if _BUDGET_ABOUT_RE.search(_price_user_text):
+            args["priceto"] = int(_orig_priceto * 1.2)
+            args["pricefrom"] = int(_orig_priceto * 0.8)
+            logger.info(
+                "💰 SAFETY-NET P7 'около': pricefrom=%s, priceto=%s (orig=%s)",
+                args["pricefrom"], args["priceto"], _orig_priceto,
+            )
+            return
+
+        if not _BUDGET_FLOOR_DEFAULT_ON:
+            logger.info("💰 BUDGET-FLOOR v2: disabled by feature-flag")
+            return
+
+        if _BUDGET_FLOOR_SKIP_RE.search(_price_user_text):
+            logger.info(
+                "💰 BUDGET-FLOOR v2: skip-фраза в диалоге → не применяем floor (priceto=%s)",
+                _orig_priceto,
+            )
+            return
+
+        if _orig_priceto < _BUDGET_FLOOR_MIN_PRICETO_RUB:
+            logger.info(
+                "💰 BUDGET-FLOOR v2: priceto=%s < %s — дешёвый сегмент, floor не применяем",
+                _orig_priceto, _BUDGET_FLOOR_MIN_PRICETO_RUB,
+            )
+            return
+
+        _floor = int(_orig_priceto * _BUDGET_FLOOR_RATIO)
+        if _orig_priceto - _floor < _BUDGET_FLOOR_MIN_WINDOW_RUB:
+            _floor = max(_orig_priceto - _BUDGET_FLOOR_MIN_WINDOW_RUB, 0)
+        args["pricefrom"] = _floor
+        self._budget_floor_meta = {
+            "original_priceto": _orig_priceto,
+            "applied_pricefrom": _floor,
+            "ratio": _BUDGET_FLOOR_RATIO,
+            "stage": 1,
+            "retry_triggered": False,
+            "retry_succeeded": False,
+            "retry_final_stage": None,
+        }
+        logger.info(
+            "💰 BUDGET-FLOOR v2 stage=1: pricefrom=%s, priceto=%s (ratio=%.2f, window=%s)",
+            _floor, _orig_priceto, _BUDGET_FLOOR_RATIO, _orig_priceto - _floor,
+        )
+
     def _get_manager_phone(self) -> str:
         """Return the tenant-specific manager phone number.
 
@@ -2970,49 +3079,10 @@ class YandexGPTHandler:
             # [REMOVED] C2 days→nights conversion — доверяем LLM.
             # Промпт §3.4 описывает правило: «X дней = nightsfrom=X-1, nightsto=X».
             
-            # ── Safety-net бюджета: «около N» (диапазон ±20%) и «до X» (нижняя граница 65%) ──
-            if args.get("priceto") and not args.get("pricefrom"):
-                _price_user_text = " ".join([
-                    msg.get("content", "") for msg in self.full_history[-20:]
-                    if msg.get("role") == "user" and msg.get("content")
-                ]).lower()
-                if re.search(r'(?:около|примерно|порядка|в\s+район[еу]|плюс.?минус)', _price_user_text):
-                    # ── Fix P7: «около N» → диапазон ±20% ──
-                    _original_price = args["priceto"]
-                    args["priceto"] = int(_original_price * 1.2)
-                    args["pricefrom"] = int(_original_price * 0.8)
-                    logger.info(
-                        "💰 SAFETY-NET P7: 'около %s' → pricefrom=%s, priceto=%s",
-                        _original_price, args["pricefrom"], args["priceto"]
-                    )
-                elif re.search(
-                    r"(?:до\s+\d|не\s+(?:более|выше|дороже|больше)\s*\d|"
-                    r"максимум\s*\d|в\s+пределах\s*\d|бюджет\s+до\s+\d)",
-                    _price_user_text,
-                ):
-                    # ── NEW: BUDGET-FLOOR для «до X» / «не более X» / «максимум X» ──
-                    # Нижняя граница = 65% от верхней (с минимальной шириной окна 30 000 ₽).
-                    # Это исключает показ туров значительно дешевле заявленного потолка.
-                    # Если результатов окажется < 3 — сработает AUTO-RETRY BUDGET-FLOOR ниже,
-                    # который повторит поиск без pricefrom и положит _warning для клиента.
-                    UPPER_BOUND_FLOOR_RATIO = 0.65
-                    MIN_WINDOW_RUB = 30_000
-                    _orig_priceto = args["priceto"]
-                    _floor = int(_orig_priceto * UPPER_BOUND_FLOOR_RATIO)
-                    if _orig_priceto - _floor < MIN_WINDOW_RUB:
-                        _floor = max(_orig_priceto - MIN_WINDOW_RUB, 0)
-                    args["pricefrom"] = _floor
-                    self._budget_floor_meta = {
-                        "original_priceto": _orig_priceto,
-                        "applied_pricefrom": _floor,
-                        "ratio": UPPER_BOUND_FLOOR_RATIO,
-                        "retry_triggered": False,
-                        "retry_succeeded": False,
-                    }
-                    logger.info(
-                        "💰 BUDGET-FLOOR: 'до %s' → pricefrom=%s, priceto=%s (ratio=%.2f)",
-                        _orig_priceto, _floor, _orig_priceto, UPPER_BOUND_FLOOR_RATIO,
-                    )
+            # BUDGET-FLOOR v2 (default-on, fix/budget-upper-floor-v2):
+            # Полная логика вынесена в метод _apply_budget_floor_v2 для тестируемости.
+            # Откат: верни _BUDGET_FLOOR_DEFAULT_ON=False (module-level).
+            self._apply_budget_floor_v2(args)
             
             # ── Safety-net: bare "N-M" misinterpreted as dates when it's nights ──
             _df_raw = args.get("datefrom", "")
@@ -3454,9 +3524,11 @@ class YandexGPTHandler:
                     # ════════════════════════════════════════════════════════════
 
                     # ════════════════════════════════════════════════════════════
-                    # AUTO-RETRY BUDGET-FLOOR: если применили pricefrom=65% × priceto
-                    # и результатов < 3 — повторяем поиск БЕЗ pricefrom, добавляем
-                    # _warning чтобы LLM честно сообщил клиенту о расширении поиска.
+                    # AUTO-RETRY BUDGET-FLOOR v2 — двухступенчатый каскад
+                    # (fix/budget-upper-floor-v2)
+                    # stage=1 (применили на этапе normalize_search_args) — floor 0.80
+                    # stage=2 (если tours_found < 3) — опускаем floor до 0.60 и повторяем
+                    # stage=3 (если stage=2 тоже <3) — убираем pricefrom полностью
                     # ════════════════════════════════════════════════════════════
                     if (
                         tours_found < 3
@@ -3467,25 +3539,27 @@ class YandexGPTHandler:
                         self._budget_floor_meta["retry_triggered"] = True
                         _orig_floor = self._budget_floor_meta["applied_pricefrom"]
                         _orig_top = self._budget_floor_meta["original_priceto"]
+
+                        # ── STAGE 2: floor 0.60 ─────────────────────────────
+                        _stage2_floor = int(_orig_top * _BUDGET_FLOOR_RATIO_RETRY)
+                        if _orig_top - _stage2_floor < _BUDGET_FLOOR_MIN_WINDOW_RUB:
+                            _stage2_floor = max(_orig_top - _BUDGET_FLOOR_MIN_WINDOW_RUB, 0)
                         logger.info(
-                            "💰 AUTO-RETRY BUDGET-FLOOR: tours_found=%d (floor=%s, top=%s) → retrying without floor",
-                            tours_found, _orig_floor, _orig_top,
+                            "💰 AUTO-RETRY BUDGET-FLOOR v2 stage=2: tours_found=%d → retry с floor=%s (был %s, top=%s)",
+                            tours_found, _stage2_floor, _orig_floor, _orig_top,
                         )
+
                         try:
                             _retry_kwargs = dict(getattr(self, "_last_full_search_args", {}))
-                            _retry_kwargs.pop("pricefrom", None)
+                            _retry_kwargs["pricefrom"] = _stage2_floor
 
                             _new_request_id = await self.tourvisor.search_tours(**_retry_kwargs)
                             if _new_request_id:
-                                logger.info(
-                                    "💰 AUTO-RETRY BUDGET-FLOOR: new request_id=%s, polling up to 60s",
-                                    _new_request_id,
-                                )
                                 if not hasattr(self, "_budget_floor_remap"):
                                     self._budget_floor_remap = {}
                                 self._budget_floor_remap[str(request_id)] = str(_new_request_id)
                                 self._last_requestid = str(_new_request_id)
-                                self._last_search_params.pop("pricefrom", None)
+                                self._last_search_params["pricefrom"] = _stage2_floor
                                 request_id = str(_new_request_id)
 
                                 _retry_status = {}
@@ -3503,27 +3577,68 @@ class YandexGPTHandler:
                                 hotels_found = _retry_status.get("hotelsfound", 0)
                                 tours_found = _retry_status.get("toursfound", 0)
 
-                                if tours_found >= 1:
+                                if tours_found >= 3:
                                     self._budget_floor_meta["retry_succeeded"] = True
-                                    _orig_floor_str = f"{_orig_floor:,}".replace(",", " ")
-                                    _orig_top_str = f"{_orig_top:,}".replace(",", " ")
+                                    self._budget_floor_meta["stage"] = 2
+                                    self._budget_floor_meta["applied_pricefrom"] = _stage2_floor
+                                    self._budget_floor_meta["retry_final_stage"] = 2
                                     last_status["_warning"] = (
-                                        f"По верхней части бюджета (от {_orig_floor_str} до {_orig_top_str} ₽) "
-                                        f"вариантов мало, показываю все туры в пределах бюджета (до {_orig_top_str} ₽). "
-                                        f"В карточках могут быть туры значительно дешевле."
+                                        "Расширил поиск чуть ниже верхней части бюджета, чтобы было больше вариантов."
                                     )
                                     logger.info(
-                                        "💰 AUTO-RETRY BUDGET-FLOOR: SUCCESS — %d hotels, %d tours",
+                                        "💰 AUTO-RETRY BUDGET-FLOOR v2 stage=2 SUCCESS — %d hotels, %d tours",
                                         hotels_found, tours_found,
                                     )
                                 else:
+                                    # ── STAGE 3: убираем pricefrom полностью ────
                                     logger.info(
-                                        "💰 AUTO-RETRY BUDGET-FLOOR: still 0 tours — fall through to standard 0-result handling"
+                                        "💰 AUTO-RETRY BUDGET-FLOOR v2 stage=3: всё ещё tours_found=%d → drop pricefrom",
+                                        tours_found,
                                     )
+                                    _retry_kwargs3 = dict(_retry_kwargs)
+                                    _retry_kwargs3.pop("pricefrom", None)
+                                    _new_rid3 = await self.tourvisor.search_tours(**_retry_kwargs3)
+                                    if _new_rid3:
+                                        self._budget_floor_remap[str(request_id)] = str(_new_rid3)
+                                        self._last_requestid = str(_new_rid3)
+                                        self._last_search_params.pop("pricefrom", None)
+                                        request_id = str(_new_rid3)
+
+                                        _retry_status3 = {}
+                                        for _ in range(20):
+                                            await asyncio.sleep(3)
+                                            _retry_status3 = await self.tourvisor.get_search_status(_new_rid3)
+                                            _retry_state3 = _retry_status3.get("state")
+                                            _retry_hf3 = _retry_status3.get("hotelsfound", 0)
+                                            if _retry_state3 == "finished":
+                                                break
+                                            if _retry_hf3 >= 3:
+                                                break
+
+                                        last_status = _retry_status3
+                                        hotels_found = _retry_status3.get("hotelsfound", 0)
+                                        tours_found = _retry_status3.get("toursfound", 0)
+
+                                        if tours_found >= 1:
+                                            self._budget_floor_meta["retry_succeeded"] = True
+                                            self._budget_floor_meta["stage"] = 3
+                                            self._budget_floor_meta["retry_final_stage"] = 3
+                                            last_status["_warning"] = (
+                                                "Посмотрел варианты ближе к вашему бюджету — их немного. "
+                                                "Показываю всё, что есть в пределах вашего бюджета."
+                                            )
+                                            logger.info(
+                                                "💰 AUTO-RETRY BUDGET-FLOOR v2 stage=3 SUCCESS — %d hotels, %d tours",
+                                                hotels_found, tours_found,
+                                            )
+                                        else:
+                                            logger.info(
+                                                "💰 AUTO-RETRY BUDGET-FLOOR v2: still 0 tours — fall through"
+                                            )
                         except Exception as _re:
-                            logger.warning("💰 AUTO-RETRY BUDGET-FLOOR failed: %s", _re, exc_info=True)
+                            logger.warning("💰 AUTO-RETRY BUDGET-FLOOR v2 failed: %s", _re, exc_info=True)
                     # ════════════════════════════════════════════════════════════
-                    # END AUTO-RETRY BUDGET-FLOOR
+                    # END AUTO-RETRY BUDGET-FLOOR v2
                     # ════════════════════════════════════════════════════════════
 
                     if hotels_found == 0 or tours_found == 0:
