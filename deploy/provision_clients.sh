@@ -11,7 +11,7 @@ set -euo pipefail
 #   - Containers rebuilt (docker compose up -d --build)
 #
 # Usage:
-#   ./deploy/provision_clients.sh [shelkovo|krasnogorsk|vyhino|belgorod|all]
+#   ./deploy/provision_clients.sh [shelkovo|krasnogorsk|vyhino|belgorod|arbat|traveltime|all]
 #
 # What it does for each company:
 #   1. Runs Alembic migration (adds uon_api_key/uon_source columns if missing)
@@ -507,6 +507,164 @@ provision_belgorod() {
     echo ""
 }
 
+# ── Арбат ───────────────────────────────────────────────────────────────────
+
+provision_arbat() {
+    log "════════════════════════════════════════════════"
+    log "  Provisioning: МГП Арбат"
+    log "════════════════════════════════════════════════"
+
+    local EXISTING_AID
+    EXISTING_AID=$(get_assistant_id "mgp-arbat" 2>/dev/null || true)
+
+    if [ -n "$EXISTING_AID" ]; then
+        log "Company mgp-arbat already exists (assistant: $EXISTING_AID) — updating config"
+    else
+        local PASSWORD
+        PASSWORD=$(openssl rand -base64 12)
+
+        log "Creating company + user + assistant..."
+        run_cli create-user \
+            --email "arbat@mgp-arbat.ru" \
+            --password "${PASSWORD}" \
+            --company "МГП Арбат" \
+            --slug "mgp-arbat" \
+            --name "МГП Арбат" \
+            --assistant-name "МГП Арбат AI Assistant" \
+            --widget-title "МГП Арбат" \
+            --widget-subtitle "Турагентство" \
+            --widget-primary-color "#E30613" \
+            --uon-api-key "i9wK2vY67W4iSzS71aCK1779984432" \
+            --uon-source "AI-Ассистент" \
+            --role admin
+
+        log "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        log "📋 CREDENTIALS (save now!):"
+        log "   Email:    arbat@mgp-arbat.ru"
+        log "   Password: ${PASSWORD}"
+        log "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    fi
+
+    local ASSISTANT_ID
+    ASSISTANT_ID=$(get_assistant_id "mgp-arbat")
+    [ -n "$ASSISTANT_ID" ] || err "Failed to find assistant for mgp-arbat"
+    log "Assistant ID: ${ASSISTANT_ID}"
+
+    log "Setting widget_config personalization..."
+    update_widget_config "$ASSISTANT_ID" '{
+        "title": "МГП Арбат",
+        "subtitle": "Турагентство",
+        "primary_color": "#E30613",
+        "welcome_message": "👋 Здравствуйте! Я — ИИ-ассистент туристического агентства.\n\nЯ помогу вам:\n• 🔎 Подобрать тур по вашим параметрам\n• 🔥 Найти горящие предложения\n• ❓ Ответить на вопросы о визах, оплате, документах\n\nКуда бы вы хотели поехать?",
+        "company_name": "Магазин Горящих Путёвок Арбат",
+        "website": "https://mgp-arbat.ru/",
+        "booking_base_url": "https://mgp-arbat.ru/",
+        "contact_phone": "+7 926 321-64-69",
+        "office_address": "г. Москва, Троилинский пер., д. 3, оф. 603. Режим работы: ежедневно 09:00–20:00"
+    }'
+
+    log "Setting allowed_domains..."
+    run_sql "UPDATE assistants SET allowed_domains = 'mgp-arbat.ru,www.mgp-arbat.ru' WHERE id = '${ASSISTANT_ID}';"
+
+    log "Ensuring U-ON CRM credentials (per-tenant Arbat key)..."
+    run_sql "UPDATE assistants SET uon_api_key = 'i9wK2vY67W4iSzS71aCK1779984432', uon_source = 'AI-Ассистент' WHERE id = '${ASSISTANT_ID}';"
+
+    log "Note: Arbat uses common faq.md (no per-tenant FAQ override) — like Vyhino/Belgorod"
+
+    log "Configuring runtime_metadata.reporting (PUSH → LK)..."
+    setup_reporting "$ASSISTANT_ID" "mgp-arbat"
+    setup_max_channel "$ASSISTANT_ID" "mgp-arbat"
+
+    log ""
+    log "✅ МГП Арбат — provisioned (assistant: ${ASSISTANT_ID})"
+    log "   U-ON API key: i9wK2vY67W4iSzS71aCK1779984432 (set, per-tenant)"
+    log "   ⚠️  Client must ACTIVATE U-ON API + whitelist 72.56.88.193 (POST+GET) in their U-ON cabinet"
+    echo ""
+}
+
+# ── Travel Time ───────────────────────────────────────────────────────────────
+#
+# CRM NOTE: Travel Time uses МоиДокументы-Туристам (cabinet trevel-time.moidokumenti.ru),
+# NOT U-ON. There is no native client for МДТ in this codebase and its inbound API is
+# not publicly documented (spec lives inside the cabinet, often disabled by default).
+# CRM is therefore intentionally left unconfigured (deferred). Everything else (widget,
+# branding, booking URL, office facts, reporting) is provisioned.
+
+provision_traveltime() {
+    log "════════════════════════════════════════════════"
+    log "  Provisioning: Travel Time"
+    log "════════════════════════════════════════════════"
+
+    local EXISTING_AID
+    EXISTING_AID=$(get_assistant_id "travel-time" 2>/dev/null || true)
+
+    if [ -n "$EXISTING_AID" ]; then
+        log "Company travel-time already exists (assistant: $EXISTING_AID) — updating config"
+    else
+        local PASSWORD
+        PASSWORD=$(openssl rand -base64 12)
+
+        log "Creating company + user + assistant..."
+        run_cli create-user \
+            --email "info@traveltime2020.ru" \
+            --password "${PASSWORD}" \
+            --company "Travel Time" \
+            --slug "travel-time" \
+            --name "Travel Time" \
+            --assistant-name "Travel Time AI Assistant" \
+            --widget-title "Travel Time" \
+            --widget-subtitle "Туристическое агентство" \
+            --widget-primary-color "#1F3D2E" \
+            --role admin
+
+        log "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        log "📋 CREDENTIALS (save now!):"
+        log "   Email:    info@traveltime2020.ru"
+        log "   Password: ${PASSWORD}"
+        log "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    fi
+
+    local ASSISTANT_ID
+    ASSISTANT_ID=$(get_assistant_id "travel-time")
+    [ -n "$ASSISTANT_ID" ] || err "Failed to find assistant for travel-time"
+    log "Assistant ID: ${ASSISTANT_ID}"
+
+    log "Setting widget_config personalization..."
+    update_widget_config "$ASSISTANT_ID" '{
+        "title": "Travel Time",
+        "subtitle": "Туристическое агентство",
+        "primary_color": "#1F3D2E",
+        "welcome_message": "Добрый день! Планируете отпуск?\nВы обратились точно по адресу!\nМы найдем подходящий вариант как для искушенных путешественников, так и для тех, кто только начинает ставить отметки на своей личной карте мира",
+        "company_name": "Travel Time",
+        "website": "https://traveltime2020.ru",
+        "booking_base_url": "https://traveltime2020.ru/podbor-tura",
+        "contact_phone": "+7 902 198-64-87",
+        "office_address": "Архангельская обл., г. Северодвинск, ул. Адмирала Нахимова, д. 6. Режим работы: Пн–Пт 11:00–19:00, Сб–Вс по договорённости"
+    }'
+
+    log "Setting allowed_domains..."
+    run_sql "UPDATE assistants SET allowed_domains = 'traveltime2020.ru,www.traveltime2020.ru' WHERE id = '${ASSISTANT_ID}';"
+
+    log "Setting per-tenant system_prompt override (office-specific facts)..."
+    run_sql "UPDATE assistants SET system_prompt = '## TRAVEL TIME — ОСОБЫЕ УСЛОВИЯ ОФИСА
+- Турагентство Travel Time (г. Северодвинск, Архангельская обл.). Работаем со ВСЕМИ регионами России — дистанционно, полностью онлайн.
+- Онлайн-бронирование с заключением официального договора.
+- Принимаем любые способы оплаты: по банковским реквизитам, банковскими картами, по QR-коду, по ссылке для оплаты, наличными в офисе.
+- Если клиент спрашивает про оплату, договор или регионы работы — отвечай этими фактами.' WHERE id = '${ASSISTANT_ID}';"
+
+    log "⚠️  CRM: Travel Time uses МоиДокументы-Туристам (trevel-time.moidokumenti.ru) — NOT U-ON."
+    log "    No native client yet; CRM deferred until МДТ inbound API spec is provided."
+
+    log "Configuring runtime_metadata.reporting (PUSH → LK)..."
+    setup_reporting "$ASSISTANT_ID" "travel-time"
+    # Website-only per client request — MAX channel not enabled.
+
+    log ""
+    log "✅ Travel Time — provisioned (assistant: ${ASSISTANT_ID})"
+    log "   CRM: deferred (МоиДокументы-Туристам, no inbound API spec yet)"
+    echo ""
+}
+
 # ── Alembic migration ─────────────────────────────────────────────────────────
 
 run_migration() {
@@ -538,12 +696,22 @@ case "${1:-all}" in
         run_migration
         provision_belgorod
         ;;
+    arbat)
+        run_migration
+        provision_arbat
+        ;;
+    traveltime|travel-time)
+        run_migration
+        provision_traveltime
+        ;;
     all)
         run_migration
         provision_shelkovo
         provision_krasnogorsk
         provision_vyhino
         provision_belgorod
+        provision_arbat
+        provision_traveltime
         echo ""
         log "════════════════════════════════════════════════"
         log "  ALL CLIENTS PROVISIONED"
@@ -593,14 +761,16 @@ case "${1:-all}" in
         log "   - CRM lead created in correct U-ON instance"
         ;;
     *)
-        echo "Usage: $0 [shelkovo|krasnogorsk|vyhino|belgorod|all]"
+        echo "Usage: $0 [shelkovo|krasnogorsk|vyhino|belgorod|arbat|traveltime|all]"
         echo ""
         echo "Options:"
         echo "  shelkovo     — provision МГП Щёлково only"
         echo "  krasnogorsk  — provision МГП Красногорск only"
         echo "  vyhino       — provision МГП Выхино only"
         echo "  belgorod     — provision МГП Белгород only"
-        echo "  all          — provision all four (default)"
+        echo "  arbat        — provision МГП Арбат only (U-ON)"
+        echo "  traveltime   — provision Travel Time only (CRM deferred: МоиДокументы-Туристам)"
+        echo "  all          — provision all (default)"
         exit 1
         ;;
 esac

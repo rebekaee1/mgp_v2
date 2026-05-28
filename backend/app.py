@@ -12,7 +12,7 @@ import re
 import time
 import uuid
 import logging
-from flask import Flask, request, Response, jsonify, stream_with_context, g, send_from_directory
+from flask import Flask, request, Response, jsonify, stream_with_context, g, send_from_directory, redirect, abort
 from flask_cors import CORS
 from werkzeug.exceptions import HTTPException
 def _import_handler_class():
@@ -1610,6 +1610,91 @@ def _handle_unexpected_error(e: Exception):
     return "Internal Server Error", 500
 
 
+def _booking_redirect_cfg():
+    """(base_url, secret) для booking-redirect или (None, None) если выключено."""
+    base = (os.getenv("BOOKING_REDIRECT_BASE_URL") or "").strip()
+    secret = (os.getenv("BOOKING_REDIRECT_SECRET") or "").strip()
+    if base and secret:
+        return base, secret
+    return None, None
+
+
+def _maybe_wrap_booking_links(tour_cards, session_id, handler):
+    """Обернуть ссылки карточек в подписанный /go-redirect (трекинг переходов).
+
+    Тройной гейт: (1) глобально заданы base+secret, (2) у тенанта в
+    widget_config выставлен track_booking_clicks=true. Любая ошибка не должна
+    ломать ответ — карточки отдаются как есть.
+    """
+    if not tour_cards:
+        return
+    base, secret = _booking_redirect_cfg()
+    if not base:
+        return
+    try:
+        wc = (getattr(handler, "runtime_config", None)
+              and getattr(handler.runtime_config, "widget_config", None) or {})
+        if not (isinstance(wc, dict) and wc.get("track_booking_clicks")):
+            return
+        import booking_redirect
+        n = booking_redirect.wrap_cards(tour_cards, session_id, base, secret)
+        if n:
+            logger.info("🔖 BOOKING-LINKS wrapped %d card(s) for session=%s", n, session_id[:8])
+    except Exception:
+        logger.exception("booking link wrapping failed (non-blocking)")
+
+
+def _mark_booking_click(session_id: str, tourid: str, dest: str) -> None:
+    """Отметить переход по «Забронировать»: has_booking_intent=True для диалога."""
+    try:
+        from database import get_db, is_db_available
+        if not is_db_available():
+            return
+        from models import Conversation
+        with get_db() as db:
+            if db is None:
+                return
+            conv = db.query(Conversation).filter(
+                Conversation.session_id == session_id
+            ).first()
+            if conv is not None and not conv.has_booking_intent:
+                conv.has_booking_intent = True
+                logger.info(
+                    "🔖 BOOKING-CLICK: session=%s tourid=%s → has_booking_intent=True",
+                    session_id[:8], tourid,
+                )
+    except Exception:
+        logger.exception("booking click DB update failed (non-blocking)")
+
+
+@app.route('/go')
+def booking_redirect():
+    """Подписанный redirect для кнопки «Забронировать» (трекинг переходов).
+
+    Проверяет HMAC-подпись (защита от open-redirect), ставит booking-intent
+    для диалога и отдаёт 302 на исходный URL партнёра. Логирование клика —
+    best-effort, редирект гарантирован при валидной подписи.
+    """
+    dest = request.args.get("u", "")
+    sid = request.args.get("c", "")
+    tourid = request.args.get("t", "")
+    sig = request.args.get("s", "")
+
+    _base, secret = _booking_redirect_cfg()
+    if not secret:
+        abort(404)  # фича выключена — эндпойнт «не существует»
+    if not (dest.startswith("http://") or dest.startswith("https://")):
+        abort(400)
+
+    import booking_redirect as _br
+    if not _br.verify(sid, tourid, dest, sig, secret):
+        logger.warning("🔖 BOOKING-CLICK: bad signature session=%s — refusing redirect", sid[:8])
+        abort(400)
+
+    _mark_booking_click(sid, tourid, dest)
+    return redirect(dest, code=302)
+
+
 @app.route('/api/chat', methods=['POST'])
 def chat():
     """Обычный chat без streaming"""
@@ -1641,6 +1726,13 @@ def chat():
         _api_calls_snapshot = list(getattr(handler, '_pending_api_calls', []))
         if hasattr(handler, '_pending_api_calls'):
             handler._pending_api_calls.clear()
+
+        # ── BOOKING-CLICK TRACKING: оборачиваем ссылки «Забронировать» в наш
+        # подписанный redirect (/go), чтобы трекать переход на тур (Цель 5).
+        # Включается только если у тенанта widget_config.track_booking_clicks=true
+        # И заданы BOOKING_REDIRECT_BASE_URL + BOOKING_REDIRECT_SECRET. Иначе —
+        # карточки не трогаем (поведение остальных тенантов не меняется). ──
+        _maybe_wrap_booking_links(tour_cards, session_id, handler)
 
         # ── Enrich cards with addpayments from prefetch cache (no extra API calls) ──
         if tour_cards and hasattr(handler, '_tour_details_cache'):
@@ -1857,6 +1949,13 @@ def chat_v1():
         _api_calls_snapshot = list(getattr(handler, '_pending_api_calls', []))
         if hasattr(handler, '_pending_api_calls'):
             handler._pending_api_calls.clear()
+
+        # ── BOOKING-CLICK TRACKING: оборачиваем ссылки «Забронировать» в наш
+        # подписанный redirect (/go), чтобы трекать переход на тур (Цель 5).
+        # Включается только если у тенанта widget_config.track_booking_clicks=true
+        # И заданы BOOKING_REDIRECT_BASE_URL + BOOKING_REDIRECT_SECRET. Иначе —
+        # карточки не трогаем (поведение остальных тенантов не меняется). ──
+        _maybe_wrap_booking_links(tour_cards, session_id, handler)
 
         # ── Enrich cards with addpayments from prefetch cache (no extra API calls) ──
         if tour_cards and hasattr(handler, '_tour_details_cache'):

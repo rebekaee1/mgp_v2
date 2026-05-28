@@ -54,3 +54,6 @@ reserve/
 
 # Local Docker Compose overrides (e.g. per-host port mappings)
 docker-compose.override.yml
+
+# Reference clones of partner repos for inspection only — do not commit.
+.reference_repos/

@@ -43,6 +43,7 @@ from fastapi import APIRouter, Header, HTTPException, Request, status
 
 from .config import Settings, TenantBinding
 from .chat_proxy import ChatProxy, ChatResponse
+from .deep_link import parse_start_payload, render_llm_context
 from .image_cache import ImageCache
 from .max_api import MaxApiClient, MaxApiError
 from .observability import new_correlation_id
@@ -505,11 +506,33 @@ async def _process_message(
             log.exception("payload_consume_failed")
             pending_payload = None
         if pending_payload:
-            outbound_text = f"[ИСТОЧНИК: {pending_payload}]\n{text}"
+            # Two markers are prepended:
+            #   [ИСТОЧНИК: …]   — raw payload, used by the lead pipeline
+            #                     (TG-уведомление, U-ON note) for ad-level
+            #                     attribution. MUST stay verbatim.
+            #   [КОНТЕКСТ: …]   — decoded utm-structure (channel, keyword,
+            #                     offer, etc.) so the LLM doesn't have to
+            #                     reverse-engineer the slug. Only added for
+            #                     payloads that match the utm-convention;
+            #                     opaque payloads still get the raw marker
+            #                     alone.
+            parsed = parse_start_payload(pending_payload)
+            context_line = render_llm_context(parsed)
+            if context_line:
+                outbound_text = (
+                    f"[ИСТОЧНИК: {pending_payload}]\n"
+                    f"{context_line}\n"
+                    f"{text}"
+                )
+            else:
+                outbound_text = f"[ИСТОЧНИК: {pending_payload}]\n{text}"
             log.info(
                 "deep_link_payload_applied",
                 payload_len=len(pending_payload),
                 payload_preview=pending_payload[:60],
+                structured=parsed.is_structured,
+                source=parsed.source,
+                fields=sorted(parsed.fields.keys()),
             )
 
         # ``external_user_id`` lets the backend store the MAX user_id alongside

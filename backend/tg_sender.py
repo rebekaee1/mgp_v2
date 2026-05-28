@@ -150,10 +150,16 @@ def send_telegram_lead(
     source_payload: Optional[str] = None,
     agency_name: str = "",
     request_number: Optional[int] = None,
+    tour_link: str = "",
     bot_token: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Lightweight lead notification — used for ``submit_client_request``
     (no specific tour, just contact + interest).
+
+    ``tour_link`` (optional): if the lead targets a specific tour (LLM dropped
+    a ``tourid=…`` reference in the comment), the caller can pass the
+    pre-rendered booking URL here and we'll attach it as a clickable
+    Telegram link, separately from the escaped ``summary`` body.
     """
     if not source_payload:
         source_payload = _extract_source_payload(summary)
@@ -180,11 +186,13 @@ def send_telegram_lead(
         if len(short) > 3000:
             short = short[:3000] + "…"
         lines.append("")
-        lines.append("💬 <b>Запрос клиента:</b>")
         lines.append(_escape_html(short))
+    if tour_link:
+        lines.append("")
+        lines.append(f"🔗 <a href=\"{_escape_html(tour_link)}\">Открыть карточку тура</a>")
     if source_payload:
         lines.append("")
-        lines.append(f"🔗 <b>Источник:</b> <code>{_escape_html(source_payload)}</code>")
+        lines.append(f"📍 <b>Источник:</b> <code>{_escape_html(source_payload)}</code>")
     lines.append("")
     lines.append(f"<i>{_escape_html(when)}</i>")
     text = "\n".join(lines)

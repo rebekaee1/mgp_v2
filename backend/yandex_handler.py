@@ -187,6 +187,42 @@ _BUDGET_ABOUT_RE = re.compile(
     re.IGNORECASE,
 )
 
+# ── CHILD-GUARDRAIL: детект упоминания ребёнка в сообщениях клиента ──
+# Используется для защиты от «фантомного ребёнка»: если LLM выставила child>=1,
+# но клиент НИ РАЗУ не упомянул детей — это галлюцинация, форсим child=0.
+# Регэксп СОЗНАТЕЛЬНО широкий: лучше НЕ занулить реального ребёнка (оставить
+# выбор LLM), чем занулить настоящего. Любой намёк на детей → доверяем LLM.
+_CHILD_MENTION_RE = re.compile(
+    r"(?:реб[её]н|дет(?:и|ей|ьм|ям|ск|ьк)|малыш|младен|грудн|новорожд|"
+    r"дочк|дочер|доч[ьи]|сын|ребят|дитя|чадо|годовал|годик|"
+    r"семь|семей|"                              # семья/семейный — слабый сигнал, доверяем LLM
+    r"\d+\s*[-–]\s*\d+\s*\(|"                    # компактный формат «2-1(5)», «3-2(5,8)»
+    r"\b(?:1[0-7]|[1-9])\s*(?:лет|год))",        # возраст «N лет / N год / N года»
+    re.IGNORECASE,
+)
+
+
+def _compute_date_widen_window(datefrom_str, now=None, back=2, forward=3):
+    """Окно вылета для AUTO-RETRY DATE-WIDEN вокруг точной даты.
+
+    Возвращает кортеж (date_from, date_to) в формате DD.MM.YYYY для окна
+    [datefrom-back .. datefrom+forward]. Нижняя граница не раньше «завтра»
+    (нельзя искать вылет в прошлом). Если после клампа from>to — гарантируем
+    непустое окно вперёд. Чистая функция → тестируется без сети/LLM.
+    """
+    from datetime import datetime as _dt, timedelta as _td
+    if now is None:
+        now = _dt.now()
+    base = _dt.strptime(datefrom_str, "%d.%m.%Y")
+    new_from = base - _td(days=back)
+    tomorrow = now + _td(days=1)
+    if new_from < tomorrow:
+        new_from = tomorrow
+    new_to = base + _td(days=forward)
+    if new_from > new_to:
+        new_to = new_from + _td(days=forward)
+    return new_from.strftime("%d.%m.%Y"), new_to.strftime("%d.%m.%Y")
+
 # Поля U-ON, которые tool ВОЗВРАЩАЕТ LLM. Любые PII (паспорт, email, ДР, адрес,
 # номер карты, заметки менеджера) НИКОГДА не должны попадать в LLM-контекст.
 _STATUS_LOOKUP_ALLOWED_REQUEST_FIELDS = {
@@ -1346,8 +1382,8 @@ def _map_hot_tour_to_card(tour_data: dict, booking_base_url: str = None,
             "tourid": tourid,
             "hotel_id": tour_data.get("hotelcode"),
             "country_id": tour_data.get("countrycode"),
-            "region_id": tour_data.get("regioncode"),
-            "departure_id": departure_id,
+            "region_id": tour_data.get("regioncode") or tour_data.get("hotelregioncode"),
+            "departure_id": tour_data.get("departurecode") or departure_id,
             "date_from": _parse_tv_date(flydate_raw),
             "nights": nights,
             "adults": adults,
@@ -1855,6 +1891,54 @@ class YandexGPTHandler:
             _floor, _orig_priceto, _BUDGET_FLOOR_RATIO, _orig_priceto - _floor,
         )
 
+    def _normalize_child_args(self, args: Dict) -> None:
+        """CHILD-GUARDRAIL — защита от «фантомного ребёнка» и лишних возрастов.
+
+        Две независимые нормализации (мутируют ``args`` на месте):
+
+        1. **Фантомный ребёнок.** Если LLM выставила ``child >= 1``, но в
+           сообщениях клиента НЕТ ни одного упоминания детей (``_CHILD_MENTION_RE``)
+           — это галлюцинация модели (реальный кейс: клиент сказал «1 взрослый»,
+           бот придумал «+ ребёнок 1 год» и испортил поиск). Форсим ``child=0`` и
+           убираем все ``childageN``.
+
+        2. **Лишние возрасты.** Схема tool по умолчанию шлёт ``childage1/2/3=1``
+           даже при одном реальном ребёнке → в поиск улетают фантомные «годовалые».
+           Обрезаем возрасты до фактического числа детей.
+
+        Идемпотентно. Безопасно при отсутствии детей. Не трогает adults/даты/бюджет.
+        """
+        child_n = _safe_int(args.get("child"), 0) or 0
+
+        if child_n >= 1:
+            user_text = " ".join(
+                msg.get("content", "")
+                for msg in self.full_history[-30:]
+                if msg.get("role") == "user" and msg.get("content")
+            )
+            if not _CHILD_MENTION_RE.search(user_text):
+                logger.warning(
+                    "🛡️ CHILD-GUARDRAIL: LLM set child=%s, но клиент НЕ упоминал детей "
+                    "→ форсирую child=0 (фантомный ребёнок)",
+                    child_n,
+                )
+                args["child"] = 0
+                child_n = 0
+
+        # Обрезаем возрасты до фактического числа детей (childage(child_n+1..3) — лишние).
+        if child_n <= 0:
+            _dropped = [i for i in (1, 2, 3) if args.pop(f"childage{i}", None) is not None]
+            if _dropped:
+                logger.info("🛡️ CHILD-GUARDRAIL: child=0 → удалил возрасты childage%s", _dropped)
+        else:
+            _dropped = [i for i in range(child_n + 1, 4)
+                        if args.pop(f"childage{i}", None) is not None]
+            if _dropped:
+                logger.info(
+                    "🛡️ CHILD-GUARDRAIL: child=%s → обрезал лишние возрасты childage%s",
+                    child_n, _dropped,
+                )
+
     def _get_manager_phone(self) -> str:
         """Return the tenant-specific manager phone number.
 
@@ -1944,7 +2028,11 @@ class YandexGPTHandler:
         Вызывается из continue_search когда в пуле ещё есть непоказанные отели.
         Формирует tour_cards и tourid_map — аналогично get_search_results.
         """
-        batch_size = 5
+        # Fix #3-B: размер порции = бюджет показа канала (MAX=3, виджет=5).
+        # Иначе берём 5, показываем 3 (после _trim_for_channel), а offset
+        # сдвигаем на 5 → отели #4–5 порции теряются на следующем «Показать ещё».
+        _channel = (getattr(self, "_channel", None) or "widget").strip().lower()
+        batch_size = _MAX_CHANNEL_CARDS_LIMIT if _channel == "max" else 5
         offset = self._results_pool_offset
         batch = self._results_pool[offset:offset + batch_size]
         self._results_pool_offset = offset + len(batch)
@@ -3405,6 +3493,11 @@ class YandexGPTHandler:
             self._metrics["total_searches"] += 1
             self._apply_tenant_search_filters(args)
 
+            # CHILD-GUARDRAIL: занулить фантомного ребёнка + обрезать лишние возрасты.
+            # Должно стоять ПЕРЕД сборкой _tv_kwargs, чтобы и children, и child_ages
+            # ушли в API уже исправленными. См. _normalize_child_args.
+            self._normalize_child_args(args)
+
             # Готовим именованные kwargs для tourvisor.search_tours (имена в API клиенте
             # отличаются от LLM-args). Сохраняем эту dict в self._last_full_search_args,
             # чтобы AUTO-RETRY GDS мог переиспользовать те же параметры с hideregular=0.
@@ -3441,6 +3534,7 @@ class YandexGPTHandler:
             self._last_full_search_args = dict(_tv_kwargs)
             self._gds_retry_done = False  # сбрасываем флаг: каждый новый search_tours имеет право на 1 retry
             self._budget_floor_retry_done = False  # каждый новый search_tours имеет право на 1 retry BUDGET-FLOOR
+            self._date_widen_retry_done = False  # каждый новый search_tours имеет право на 1 retry DATE-WIDEN
 
             request_id = await self.tourvisor.search_tours(**_tv_kwargs)
             
@@ -3560,6 +3654,12 @@ class YandexGPTHandler:
                     # Проверяем есть ли результаты
                     hotels_found = last_status.get("hotelsfound", 0)
                     tours_found = last_status.get("toursfound", 0)
+
+                    # requestid, который держит LLM на входе (до любых AUTO-RETRY,
+                    # которые переназначают локальный request_id). Используется для
+                    # remap'а в get_search_results, чтобы устаревший id у модели
+                    # резолвился на результат финального (повторного) поиска.
+                    _status_entry_requestid = str(request_id)
 
                     # ════════════════════════════════════════════════════════════
                     # AUTO-RETRY GDS: если у tenant включён hide_gds=true и первый
@@ -3766,6 +3866,89 @@ class YandexGPTHandler:
                             logger.warning("💰 AUTO-RETRY BUDGET-FLOOR v2 failed: %s", _re, exc_info=True)
                     # ════════════════════════════════════════════════════════════
                     # END AUTO-RETRY BUDGET-FLOOR v2
+                    # ════════════════════════════════════════════════════════════
+
+                    # ════════════════════════════════════════════════════════════
+                    # AUTO-RETRY DATE-WIDEN — точная дата вылета дала 0 результатов
+                    # (fix/exact-date-zero-results)
+                    #
+                    # Проблема: при «конкретная дата + длительность» промпт ставит
+                    # dateto=datefrom (точный день вылета). Tourvisor ищет рейс
+                    # РОВНО в этот день → часто 0, хотя ±3 дня даёт десятки туров
+                    # (доказано вживую: Египет 22.06 → 0 отелей, 19-25.06 → 18).
+                    #
+                    # Решение: если поиск завершён с 0, дата была ТОЧЕЧНОЙ
+                    # (datefrom==dateto), это НЕ «ближайший вылет» (там своя
+                    # прогрессивная логика) и мы ещё не расширяли — молча
+                    # повторяем с окном [datefrom-2 .. datefrom+3] (clamp >= завтра),
+                    # ночи НЕ трогаем. Клиент не видит ложного «ничего не нашлось».
+                    # ════════════════════════════════════════════════════════════
+                    if (
+                        (hotels_found == 0 or tours_found == 0)
+                        and not getattr(self, "_date_widen_retry_done", False)
+                        and not self._last_search_params.get("_is_nearest")
+                    ):
+                        _df_exact = self._last_search_params.get("datefrom")
+                        _dt_exact = self._last_search_params.get("dateto")
+                        if _df_exact and _dt_exact and _df_exact == _dt_exact:
+                            self._date_widen_retry_done = True
+                            try:
+                                _new_from_s, _new_to_s = _compute_date_widen_window(_df_exact)
+                                logger.info(
+                                    "📅 AUTO-RETRY DATE-WIDEN: точная дата %s дала 0 → "
+                                    "расширяю окно вылета %s..%s (ночи без изменений)",
+                                    _df_exact, _new_from_s, _new_to_s,
+                                )
+
+                                _retry_kwargs = dict(getattr(self, "_last_full_search_args", {}))
+                                _retry_kwargs["date_from"] = _new_from_s
+                                _retry_kwargs["date_to"] = _new_to_s
+
+                                _new_request_id = await self.tourvisor.search_tours(**_retry_kwargs)
+                                if _new_request_id:
+                                    # Запоминаем remap: get_search_results с ИСХОДНЫМ
+                                    # requestid должен получить результаты нового поиска.
+                                    if not hasattr(self, "_date_widen_remap"):
+                                        self._date_widen_remap = {}
+                                    self._date_widen_remap[_status_entry_requestid] = str(_new_request_id)
+                                    self._date_widen_remap[str(request_id)] = str(_new_request_id)
+                                    self._last_requestid = str(_new_request_id)
+                                    self._last_search_params["datefrom"] = _new_from_s
+                                    self._last_search_params["dateto"] = _new_to_s
+                                    self._last_full_search_args["date_from"] = _new_from_s
+                                    self._last_full_search_args["date_to"] = _new_to_s
+                                    request_id = str(_new_request_id)
+
+                                    _retry_status = {}
+                                    for _ in range(20):
+                                        await asyncio.sleep(3)
+                                        _retry_status = await self.tourvisor.get_search_status(_new_request_id)
+                                        if _retry_status.get("state") == "finished":
+                                            break
+                                        if _retry_status.get("hotelsfound", 0) >= 3:
+                                            break
+
+                                    last_status = _retry_status
+                                    hotels_found = _retry_status.get("hotelsfound", 0)
+                                    tours_found = _retry_status.get("toursfound", 0)
+
+                                    if hotels_found > 0:
+                                        last_status["_warning"] = (
+                                            "На точную дату вылета вариантов не было — расширил "
+                                            "поиск на ±несколько дней, чтобы показать доступные туры."
+                                        )
+                                        logger.info(
+                                            "📅 AUTO-RETRY DATE-WIDEN SUCCESS — %d отелей, %d туров",
+                                            hotels_found, tours_found,
+                                        )
+                                    else:
+                                        logger.info(
+                                            "📅 AUTO-RETRY DATE-WIDEN: всё ещё 0 — fall through к стандартной обработке"
+                                        )
+                            except Exception as _dwe:
+                                logger.warning("📅 AUTO-RETRY DATE-WIDEN failed: %s", _dwe, exc_info=True)
+                    # ════════════════════════════════════════════════════════════
+                    # END AUTO-RETRY DATE-WIDEN
                     # ════════════════════════════════════════════════════════════
 
                     if hotels_found == 0 or tours_found == 0:
@@ -3984,6 +4167,19 @@ class YandexGPTHandler:
                     _orig_rid, _remap[_orig_rid],
                 )
                 args["requestid"] = _remap[_orig_rid]
+
+            # ── AUTO-RETRY DATE-WIDEN REMAP: исходный requestid точечной даты →
+            # requestid расширенного поиска (см. блок AUTO-RETRY DATE-WIDEN в
+            # get_search_status). Аналогично GDS-remap, исключает ситуацию когда
+            # модель тянет результаты по устаревшему id и видит 0. ──
+            _dw_remap = getattr(self, "_date_widen_remap", {})
+            _cur_rid = str(args.get("requestid", ""))
+            if _cur_rid in _dw_remap and _cur_rid != _dw_remap[_cur_rid]:
+                logger.info(
+                    "📅 AUTO-RETRY DATE-WIDEN REMAP: get_search_results requestid %s → %s",
+                    _cur_rid, _dw_remap[_cur_rid],
+                )
+                args["requestid"] = _dw_remap[_cur_rid]
             
             _pool_size = 30 if self._ideal_datefrom else 10
             _actual_per_page = max(int(args.get("onpage", _pool_size)), _pool_size)
@@ -3997,6 +4193,35 @@ class YandexGPTHandler:
             
             # Сокращаем результаты для AI — формат карточек с картинками
             hotels = full_results.get("result", {}).get("hotel", [])
+
+            # ── Fix #3 (PARTIAL POOL): get_search_status может вернуть результаты
+            # на ЧАСТИЧНОМ поиске (progress≥40%). Тогда result.php отдаёт лишь
+            # часть отелей → пул неполный → «Показать ещё» уходит на пустую
+            # страницу 2 (реальный кейс: найдено 15, в пуле 3). Добиваем набор:
+            # до 3 коротких до-запросов, пока не получим полную страницу
+            # (len(hotels) ≥ min(hotelsfound, per_page)). Без задержек, если набор
+            # уже полный (обычный случай). ──
+            _pp_status = full_results.get("status", {})
+            _pp_hf = _safe_int(_pp_status.get("hotelsfound"), 0) or 0
+            for _pp_try in range(3):
+                _target = min(_pp_hf, _actual_per_page) if _pp_hf else 0
+                if not _target or len(hotels) >= _target:
+                    break
+                logger.info(
+                    "📦 PARTIAL POOL: got %d/%d hotels (hotelsfound=%d) — добор #%d через 3с",
+                    len(hotels), _target, _pp_hf, _pp_try + 1,
+                )
+                await asyncio.sleep(3)
+                full_results = await self.tourvisor.get_search_results(
+                    request_id=args["requestid"],
+                    page=args.get("page", 1),
+                    per_page=_actual_per_page,
+                    include_operators=args.get("operatorstatus") == 1,
+                    no_description=args.get("nodescription") == 1
+                )
+                hotels = full_results.get("result", {}).get("hotel", [])
+                _pp_status = full_results.get("status", {})
+                _pp_hf = _safe_int(_pp_status.get("hotelsfound"), 0) or _pp_hf
             
             # ── Уровень 1: для каждого отеля выбираем ЛУЧШИЙ тур по релевантности ──
             _scored_hotels = []
@@ -4025,6 +4250,9 @@ class YandexGPTHandler:
                     "hotelrating": h.get("hotelrating"),
                     "regionname": h.get("regionname"),
                     "countryname": h.get("countryname"),
+                    "countrycode": h.get("countrycode"),
+                    "regioncode": h.get("regioncode"),
+                    "subregioncode": h.get("subregioncode"),
                     "price": h.get("price"),
                     "seadistance": h.get("seadistance"),
                     "picturelink": picture if has_real_photo else None,
@@ -4119,6 +4347,9 @@ class YandexGPTHandler:
             _remaining = [item for _idx, item in enumerate(_scored_hotels) if _idx not in _seen_idx]
             _full_pool = _selected + _remaining
             self._results_pool = _full_pool
+            # NB: offset выставляется НИЖЕ, после _trim_for_channel — по числу
+            # РЕАЛЬНО показанных карточек (MAX=3, виджет=5). Иначе при MAX offset=5,
+            # но показано 3 → отели #4–5 теряются на «Показать ещё» (Fix #3-B).
             self._results_pool_offset = min(5, len(_full_pool))
             self._results_pool_page = int(args.get("page", 1))
             self._results_pool_requestid = args.get("requestid")
@@ -4229,6 +4460,14 @@ class YandexGPTHandler:
             # the user can actually see.
             if _visible_count < len(simplified):
                 simplified = simplified[:_visible_count]
+
+            # ── Fix #3-B: пул-offset = число РЕАЛЬНО показанных карточек.
+            # Каждый вызов get_search_results строит СВЕЖИЙ пул для своей
+            # страницы и показывает первые _visible_count карточек. Для MAX
+            # (_visible_count=3) это исключает потерю отелей #4–5 из _selected
+            # при «Показать ещё» (раньше offset жёстко = 5). Инкрементальная
+            # выдача из ТОГО ЖЕ пула — в _serve_next_pool_batch. ──
+            self._results_pool_offset = min(_visible_count, len(self._results_pool))
 
             _result_hint = "Карточки с фото, ценами, датами, питанием, звёздами УЖЕ отображены фронтендом. НЕ перечисляй отели, цены, описания, даты, питание, звёзды в тексте! Напиши ТОЛЬКО краткий комментарий (1-2 предложения) и спроси клиента. Добавь: «Окончательная стоимость — при оформлении тура.» При оформлении возможны незначительные доплаты (мед. страховка и др.) — если клиент спрашивает о точной стоимости, используй actualize_tour."
             if _visible_count:
@@ -4951,6 +5190,13 @@ class YandexGPTHandler:
                     "hotelrating": t.get("hotelrating"),
                     "countryname": t.get("countryname"),
                     "regionname": t.get("hotelregionname"),
+                    # Идентификаторы для booking_url_template (anytour.online и пр.).
+                    # actuhot.php отдаёт countrycode и hotelregioncode — пробрасываем оба,
+                    # _map_hot_tour_to_card подберёт нужный ключ.
+                    "countrycode": t.get("countrycode"),
+                    "regioncode": t.get("hotelregioncode") or t.get("regioncode"),
+                    "hotelregioncode": t.get("hotelregioncode"),
+                    "departurecode": t.get("departurecode"),
                     "departurename": t.get("departurename"),  # Город вылета
                     "departurenamefrom": t.get("departurenamefrom"),  # "из Москвы"
                     "operatorname": t.get("operatorname"),  # Туроператор
@@ -5071,7 +5317,12 @@ class YandexGPTHandler:
         elif name == "submit_booking_request":
             wc = getattr(self.runtime_config, "widget_config", None) or {}
             notification_email = wc.get("notification_email", "").strip()
-            if not wc.get("booking_email_enabled") or not notification_email:
+            email_channel = bool(wc.get("booking_email_enabled") and notification_email)
+            tg_channel = bool((wc.get("telegram_lead_chat_id") or "").strip())
+            # Reject only when NEITHER channel is configured. Pavel-style
+            # tenants (anytour.online) run with telegram-only delivery; the
+            # legacy MGP tenants still rely on e-mail.
+            if not email_channel and not tg_channel:
                 return {
                     "status": "unavailable",
                     "message": (
@@ -5163,34 +5414,44 @@ class YandexGPTHandler:
                 elif tourid:
                     tour_link = f"https://mgp.ru/tours/#tvtourid={tourid}"
 
-            from email_sender import send_booking_email
-            result = send_booking_email(
-                to_email=notification_email,
-                client_name=client_name,
-                client_phone=client_phone,
-                client_email=client_email,
-                hotel_name=card.get("hotel_name") or tour_data.get("hotelname", "Не указан"),
-                country=card.get("country", ""),
-                resort=card.get("resort", ""),
-                departure_city=card.get("departure_city") or self._last_departure_city,
-                fly_date=card.get("date_from", ""),
-                nights=card.get("nights", 0),
-                price=card.get("price", 0),
-                operator=card.get("operator", ""),
-                meal=card.get("meal_description") or card.get("food_type", ""),
-                room_type=card.get("room_type", ""),
-                stars=card.get("hotel_stars", 0),
-                tour_link=tour_link,
-                request_number=request_number,
-                agency_name=agency_name,
-                comment=comment,
-            )
+            if email_channel:
+                from email_sender import send_booking_email
+                result = send_booking_email(
+                    to_email=notification_email,
+                    client_name=client_name,
+                    client_phone=client_phone,
+                    client_email=client_email,
+                    hotel_name=card.get("hotel_name") or tour_data.get("hotelname", "Не указан"),
+                    country=card.get("country", ""),
+                    resort=card.get("resort", ""),
+                    departure_city=card.get("departure_city") or self._last_departure_city,
+                    fly_date=card.get("date_from", ""),
+                    nights=card.get("nights", 0),
+                    price=card.get("price", 0),
+                    operator=card.get("operator", ""),
+                    meal=card.get("meal_description") or card.get("food_type", ""),
+                    room_type=card.get("room_type", ""),
+                    stars=card.get("hotel_stars", 0),
+                    tour_link=tour_link,
+                    request_number=request_number,
+                    agency_name=agency_name,
+                    comment=comment,
+                )
+            else:
+                # Telegram-only tenant (e.g. anytour.online) — no e-mail step.
+                result = {"ok": True, "telegram_only": True}
 
             if result.get("ok"):
-                logger.info(
-                    "📧 BOOKING REQUEST #%d sent to %s for tour %s, client=%s",
-                    request_number, notification_email, tourid or "?", client_name,
-                )
+                if email_channel:
+                    logger.info(
+                        "📧 BOOKING REQUEST #%d sent to %s for tour %s, client=%s",
+                        request_number, notification_email, tourid or "?", client_name,
+                    )
+                else:
+                    logger.info(
+                        "📨 BOOKING REQUEST #%d (telegram-only) for tour %s, client=%s",
+                        request_number, tourid or "?", client_name,
+                    )
                 # ── Phase G: Telegram booking duplicate (non-blocking) ──
                 try:
                     tg_chat_b = (wc.get("telegram_lead_chat_id") or "").__str__().strip() if isinstance(wc, dict) else ""
@@ -5468,26 +5729,54 @@ class YandexGPTHandler:
             )
             crm_type = "lead"
 
-        if result.get("ok"):
-            self._crm_submitted = {"phone": client_phone, "email": client_email, "type": crm_type}
+        crm_ok = bool(result.get("ok"))
+        crm_id: Optional[int] = None
+        _data = result.get("data") if isinstance(result.get("data"), dict) else {}
+        if _data:
+            crm_id = _data.get("id") or _data.get("lead_id") or _data.get("request_id")
+        if crm_ok:
             logger.info(
                 "CRM %s created: name=%s phone=%s email=%s",
                 crm_type, client_name, client_phone, client_email,
             )
+        else:
+            logger.error("CRM %s failed: %s", crm_type, result.get("error"))
 
+        # Phase G: Telegram lead delivery is an INDEPENDENT channel from U-ON CRM —
+        # partners like anytour.online run without any CRM at all and rely
+        # entirely on Telegram notifications. Fire it whether the CRM call
+        # succeeded, failed, or was skipped (no api key).
+        wc = getattr(self.runtime_config, "widget_config", None) or {}
+
+        try:
+            tg_chat = (wc.get("telegram_lead_chat_id") or "").__str__().strip()
+            if tg_chat:
+                asyncio.create_task(
+                    self._send_lead_telegram(
+                        chat_id=tg_chat,
+                        client_name=client_name,
+                        client_phone=client_phone,
+                        client_email=client_email,
+                        comment=comment,
+                        crm_type=crm_type,
+                        crm_id=crm_id,
+                    )
+                )
+                logger.info(
+                    "LEAD-TG: scheduled chat=%s crm_type=%s crm_id=%s crm_ok=%s",
+                    tg_chat, crm_type, crm_id, crm_ok,
+                )
+        except Exception as _e:
+            logger.warning("LEAD-TG: scheduling failed (non-fatal): %s", _e, exc_info=True)
+
+        # E-mail duplicate is opt-in and historically only fired on CRM
+        # success (so it represents a "tracked" lead). Preserve that contract
+        # to avoid surprising existing tenants.
+        if crm_ok:
             try:
-                wc = getattr(self.runtime_config, "widget_config", None) or {}
                 lead_email_enabled = bool(wc.get("lead_email_enabled"))
                 lead_email_to = (wc.get("lead_email_to") or "").strip()
                 if lead_email_enabled and lead_email_to:
-                    crm_id = None
-                    data = result.get("data") or {}
-                    if isinstance(data, dict):
-                        crm_id = (
-                            data.get("id")
-                            or data.get("lead_id")
-                            or data.get("request_id")
-                        )
                     asyncio.create_task(
                         self._send_lead_email_duplicate(
                             to_email=lead_email_to,
@@ -5514,43 +5803,19 @@ class YandexGPTHandler:
                     _e, exc_info=True,
                 )
 
-            # ── Phase G: Telegram lead duplicate (e.g. anytour.online) ──
-            # Mirror of the e-mail block above. Off by default — only fires
-            # when ``widget_config.telegram_lead_chat_id`` is set on the
-            # assistant AND the system env ``TELEGRAM_BOT_TOKEN`` is set.
-            try:
-                wc_tg = getattr(self.runtime_config, "widget_config", None) or {}
-                tg_chat = (wc_tg.get("telegram_lead_chat_id") or "").__str__().strip()
-                if tg_chat:
-                    crm_id_tg = None
-                    data_tg = result.get("data") or {}
-                    if isinstance(data_tg, dict):
-                        crm_id_tg = (
-                            data_tg.get("id")
-                            or data_tg.get("lead_id")
-                            or data_tg.get("request_id")
-                        )
-                    asyncio.create_task(
-                        self._send_lead_telegram(
-                            chat_id=tg_chat,
-                            client_name=client_name,
-                            client_phone=client_phone,
-                            client_email=client_email,
-                            comment=comment,
-                            crm_type=crm_type,
-                            crm_id=crm_id_tg,
-                        )
-                    )
-                    logger.info(
-                        "LEAD-TG: scheduled chat=%s crm_type=%s crm_id=%s",
-                        tg_chat, crm_type, crm_id_tg,
-                    )
-            except Exception as _e:
-                logger.warning(
-                    "LEAD-TG: scheduling failed (non-fatal): %s",
-                    _e, exc_info=True,
-                )
+        # Dedup-guard: once a contact has been processed (via either CRM
+        # success OR Telegram delivery on a CRM-less tenant) treat repeat
+        # /submit_client_request calls as duplicates so we don't double-post
+        # the same lead.
+        tg_configured = bool((wc.get("telegram_lead_chat_id") or "").strip())
+        if crm_ok or tg_configured:
+            self._crm_submitted = {
+                "phone": client_phone,
+                "email": client_email,
+                "type": crm_type,
+            }
 
+        if crm_ok:
             return {
                 "status": "success",
                 "type": crm_type,
@@ -5561,7 +5826,19 @@ class YandexGPTHandler:
                 ),
             }
 
-        logger.error("CRM %s failed: %s", crm_type, result.get("error"))
+        # CRM failed (or never configured). If we *did* push to Telegram,
+        # the lead is effectively delivered — tell the bot to reassure the
+        # client. Otherwise fall back to "please call us".
+        if tg_configured:
+            return {
+                "status": "success",
+                "type": crm_type,
+                "message": (
+                    "Контакт принят. Скажи клиенту: данные переданы менеджеру, "
+                    f"свяжемся по телефону {client_phone} в ближайшее время."
+                ),
+            }
+
         manager_phone = self._get_manager_phone()
         return {
             "status": "error",
@@ -5570,6 +5847,150 @@ class YandexGPTHandler:
                 f"Предложи клиенту позвонить менеджеру: {manager_phone}."
             ),
         }
+
+    def _build_lead_summary_text(self, llm_comment: str = "") -> str:
+        """Compose a manager-friendly multi-line summary for the Telegram
+        lead message: client request → search params → top variants → chosen
+        tour (if any). Plain text — ``tg_sender.send_telegram_lead`` HTML-escapes
+        it before sending.
+        """
+        out: List[str] = []
+
+        # 1) LLM-summarized client request. Strip the "[Канал: …]" prefix that
+        # _handle_submit_client_request prepends — the destination chat already
+        # implies the channel, and the marker eats screen space in TG.
+        if llm_comment:
+            cleaned = re.sub(r"^\s*\[Канал:[^\]]+\]\s*", "", llm_comment).strip()
+            # Drop a trailing "tourid=…" tail — we extract it separately below
+            # and surface the full tour card.
+            cleaned = re.sub(r"\s*tourid\s*=\s*\S+\s*$", "", cleaned).strip()
+            if cleaned:
+                out.append(f"Запрос: {cleaned}")
+
+        # 2) Search parameters. _last_search_params is keyed in tourvisor's
+        # flat-case (datefrom, nightsfrom, …) — see search_tours.
+        sp = getattr(self, "_last_search_params", None) or {}
+        if sp:
+            bits: List[str] = []
+            # Country/resort: prefer human-readable names from the last shown
+            # tour cards over numeric Tourvisor IDs.
+            cards_dict = getattr(self, "_booking_cards_cache", None) or {}
+            sample = next(iter(cards_dict.values()), None) if cards_dict else None
+            if sample and sample.get("country"):
+                geo = sample["country"]
+                if sample.get("resort") and sample["resort"] != geo:
+                    geo += f", {sample['resort']}"
+                bits.append(geo)
+            df, dt = sp.get("datefrom"), sp.get("dateto")
+            if df:
+                d = df if not dt or dt == df else f"{df} — {dt}"
+                bits.append(f"даты {d}")
+            nf, nt = sp.get("nightsfrom"), sp.get("nightsto")
+            if nf:
+                n = str(nf) if not nt or nt == nf else f"{nf}–{nt}"
+                bits.append(f"{n} ноч.")
+            ad = sp.get("adults", 2)
+            ch = sp.get("child", 0)
+            pax = f"{ad} взр."
+            if ch:
+                pax += f" + {ch} дет."
+            bits.append(pax)
+            dep_city = getattr(self, "_last_departure_city", None)
+            if dep_city:
+                bits.append(f"вылет {dep_city}")
+            budget = getattr(self, "_user_stated_budget", None)
+            if budget:
+                bits.append("бюджет до " + f"{int(budget):,} ₽".replace(",", " "))
+            if bits:
+                out.append("Параметры: " + "; ".join(bits))
+
+        # 3) Top-3 last shown variants — gives the manager an immediate idea
+        # of which segment of the market the assistant pitched.
+        cards = list((getattr(self, "_booking_cards_cache", None) or {}).values())[:3]
+        if cards:
+            out.append("")
+            out.append("Показанные варианты:")
+            for i, c in enumerate(cards, start=1):
+                hotel = c.get("hotel_name") or "?"
+                stars_n = int(c.get("hotel_stars") or 0)
+                stars = "★" * stars_n if stars_n else ""
+                geo = c.get("country") or ""
+                if c.get("resort") and c["resort"] != geo:
+                    geo += f", {c['resort']}"
+                price = c.get("price") or 0
+                price_str = f"{int(price):,} ₽".replace(",", " ") if price else ""
+                line = f"  {i}. {hotel}"
+                if stars:
+                    line += f" {stars}"
+                if geo:
+                    line += f" — {geo}"
+                if price_str:
+                    line += f" — {price_str}"
+                out.append(line)
+
+        # 4) Chosen tour — try to extract a "tourid=NNN" reference from the
+        # LLM's comment and resolve it against the booking-cards cache. The
+        # widget-side "submit_client_request" flow doesn't currently take a
+        # tourid argument, so we have to text-mine it. If found, surface the
+        # full card so the manager doesn't have to re-search.
+        chosen_card = self._resolve_chosen_card_from_comment(llm_comment)
+        if chosen_card:
+            out.append("")
+            out.append("Выбранный тур:")
+            hn = chosen_card.get("hotel_name") or "?"
+            stars_n = int(chosen_card.get("hotel_stars") or 0)
+            sstr = "★" * stars_n if stars_n else ""
+            geo = chosen_card.get("country") or ""
+            if chosen_card.get("resort") and chosen_card["resort"] != geo:
+                geo += f", {chosen_card['resort']}"
+            price = int(chosen_card.get("price") or 0)
+            price_str = f"{price:,} ₽".replace(",", " ") if price else ""
+            head = f"  {hn}"
+            if sstr:
+                head += f" {sstr}"
+            if geo:
+                head += f" — {geo}"
+            out.append(head)
+            extra: List[str] = []
+            if chosen_card.get("date_from"):
+                extra.append(str(chosen_card["date_from"]))
+            if chosen_card.get("nights"):
+                extra.append(f"{int(chosen_card['nights'])} ноч.")
+            if chosen_card.get("meal_description") or chosen_card.get("food_type"):
+                extra.append(str(chosen_card.get("meal_description") or chosen_card.get("food_type")))
+            if chosen_card.get("operator"):
+                extra.append(str(chosen_card["operator"]))
+            if extra:
+                out.append("  " + " · ".join(extra))
+            if price_str:
+                out.append(f"  💰 {price_str}")
+            # NB: don't inline the booking URL into the summary — it goes
+            # through HTML-escape in tg_sender (`&` → `&amp;`) which breaks
+            # Telegram's URL auto-detection. The link is sent as a separate
+            # structured field — see _send_lead_telegram → tour_link.
+
+        return "\n".join(out).strip()
+
+    def _resolve_chosen_card_link(self, comment: str) -> str:
+        """Return the rendered booking URL for the tour the client picked,
+        or empty string if no tour was explicitly referenced. Used by the
+        Telegram lead path so the manager gets a one-click verify link."""
+        card = self._resolve_chosen_card_from_comment(comment)
+        return (card.get("hotel_link") or "") if card else ""
+
+    def _resolve_chosen_card_from_comment(self, comment: str) -> Optional[dict]:
+        """Extract ``tourid=NNN`` (LLM puts it into the comment of
+        submit_client_request) and look it up against _booking_cards_cache.
+        Returns the tour card dict or None.
+        """
+        if not comment:
+            return None
+        m = re.search(r"tourid\s*=\s*(\d+)", comment)
+        if not m:
+            return None
+        tid = m.group(1)
+        cache = getattr(self, "_booking_cards_cache", None) or {}
+        return cache.get(tid) or cache.get(str(tid))
 
     def _collect_source_payload_from_history(self) -> Optional[str]:
         """Pull the deep-link source code (e.g. ``utm_ya_key_…_id_123``) that
@@ -5622,6 +6043,11 @@ class YandexGPTHandler:
             )
             source_payload = self._collect_source_payload_from_history()
             request_number = crm_id or None
+            # Build the rich multi-line summary (search params, top variants,
+            # chosen tour). Falls back to the plain LLM comment if context is
+            # missing — e.g. lead submitted before any search was run.
+            rich_summary = self._build_lead_summary_text(comment) or comment
+            tour_link = self._resolve_chosen_card_link(comment)
             from tg_sender import send_telegram_lead
             await asyncio.to_thread(
                 send_telegram_lead,
@@ -5629,10 +6055,11 @@ class YandexGPTHandler:
                 client_name=client_name,
                 client_phone=client_phone,
                 client_email=client_email,
-                summary=comment,
+                summary=rich_summary,
                 source_payload=source_payload,
                 agency_name=agency_name,
                 request_number=request_number,
+                tour_link=tour_link,
             )
         except Exception as e:
             logger.warning("LEAD-TG send failed (non-fatal): %s", e, exc_info=True)

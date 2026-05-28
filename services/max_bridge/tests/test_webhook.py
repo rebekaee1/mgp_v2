@@ -753,3 +753,168 @@ def test_webhook_normal_message_still_calls_chat_proxy(monkeypatch):
     assert response.status_code == 200
     asyncio.get_event_loop().run_until_complete(asyncio.sleep(0.1))
     assert any(m["text"].startswith("reply:") for m in sent_messages)
+
+
+# ── deep-link payload injection (utm-tracked traffic) ──────────────────
+
+
+class _RecordingChatProxy:
+    """Capture every ``message`` value that the webhook passes to the backend
+    so the deep-link tests can assert the exact prefix shape (raw [ИСТОЧНИК]
+    + decoded [КОНТЕКСТ] markers)."""
+
+    def __init__(self) -> None:
+        self.calls: list[dict[str, Any]] = []
+
+    async def chat(self, *, message: str, session_id: str, assistant_id: str, **kwargs):
+        self.calls.append({"message": message, "session_id": session_id, **kwargs})
+        return ChatResponse(reply="ok", tour_cards=[], conversation_id=session_id)
+
+    async def aclose(self) -> None:
+        pass
+
+
+def _build_app_with_recorder(monkeypatch, sent_messages):
+    _patch_max_client(monkeypatch, sent_messages)
+    app = _build_app(settings=_settings(token="test-token"), tour_cards=[],
+                     sent_messages=sent_messages)
+    recorder = _RecordingChatProxy()
+    app.state.chat_proxy = recorder
+    return app, recorder
+
+
+def test_webhook_injects_decoded_context_for_yandex_payload(monkeypatch):
+    """End-to-end: bot_started with ``utm_ya_key_…_id_…`` payload →
+    first user message goes to backend with BOTH the raw [ИСТОЧНИК] marker
+    (preserved verbatim for lead attribution) AND a decoded [КОНТЕКСТ]
+    line that tells the LLM the channel and keyword in human Russian."""
+    sent_messages: list[dict[str, Any]] = []
+    app, recorder = _build_app_with_recorder(monkeypatch, sent_messages)
+    client = TestClient(app)
+
+    bot_started = {
+        "update_type": "bot_started",
+        "chat_id": 7,
+        "user": {"user_id": 7},
+        "payload": "utm_ya_key_tury-v-turciyu_id_123456789",
+    }
+    assert client.post(
+        "/max/webhook",
+        headers={"X-Max-Bot-Api-Secret": "hook-secret"},
+        json=bot_started,
+    ).status_code == 200
+    asyncio.get_event_loop().run_until_complete(asyncio.sleep(0.1))
+
+    msg = _send_message_event("Здравствуйте", user_id=7)
+    assert client.post(
+        "/max/webhook",
+        headers={"X-Max-Bot-Api-Secret": "hook-secret"},
+        json=msg,
+    ).status_code == 200
+    asyncio.get_event_loop().run_until_complete(asyncio.sleep(0.1))
+
+    assert len(recorder.calls) == 1, recorder.calls
+    sent = recorder.calls[0]["message"]
+    # Raw marker must contain the EXACT payload — Pavel's analytics
+    # joins on this string.
+    assert "[ИСТОЧНИК: utm_ya_key_tury-v-turciyu_id_123456789]" in sent
+    # Decoded marker must give the LLM the channel + keyword in Russian.
+    assert "[КОНТЕКСТ:" in sent
+    assert "Яндекс.Директ" in sent
+    assert "ключевая фраза" in sent
+    assert "tury v turciyu" in sent  # dashes → spaces
+    assert "123456789" in sent
+    # User's own text is preserved last.
+    assert sent.rstrip().endswith("Здравствуйте")
+
+
+def test_webhook_opaque_payload_still_attaches_raw_marker(monkeypatch):
+    """Non-utm slug (e.g. ``rixos_turkey_001``) gets [ИСТОЧНИК] only —
+    no fabricated context line. Lead tracking continues to work."""
+    sent_messages: list[dict[str, Any]] = []
+    app, recorder = _build_app_with_recorder(monkeypatch, sent_messages)
+    client = TestClient(app)
+
+    client.post(
+        "/max/webhook",
+        headers={"X-Max-Bot-Api-Secret": "hook-secret"},
+        json={
+            "update_type": "bot_started",
+            "chat_id": 8,
+            "user": {"user_id": 8},
+            "payload": "rixos_turkey_001",
+        },
+    )
+    asyncio.get_event_loop().run_until_complete(asyncio.sleep(0.05))
+    client.post(
+        "/max/webhook",
+        headers={"X-Max-Bot-Api-Secret": "hook-secret"},
+        json=_send_message_event("Подскажите тур", user_id=8),
+    )
+    asyncio.get_event_loop().run_until_complete(asyncio.sleep(0.1))
+
+    sent = recorder.calls[0]["message"]
+    assert "[ИСТОЧНИК: rixos_turkey_001]" in sent
+    assert "[КОНТЕКСТ:" not in sent
+
+
+def test_webhook_no_payload_no_markers(monkeypatch):
+    """Baseline: a user who arrived without a tracked link still sees
+    a clean message — no spurious markers."""
+    sent_messages: list[dict[str, Any]] = []
+    app, recorder = _build_app_with_recorder(monkeypatch, sent_messages)
+    client = TestClient(app)
+
+    client.post(
+        "/max/webhook",
+        headers={"X-Max-Bot-Api-Secret": "hook-secret"},
+        json=_send_message_event("Здравствуйте", user_id=99),
+    )
+    asyncio.get_event_loop().run_until_complete(asyncio.sleep(0.1))
+
+    sent = recorder.calls[0]["message"]
+    assert "ИСТОЧНИК" not in sent
+    assert "КОНТЕКСТ" not in sent
+    assert sent.strip() == "Здравствуйте"
+
+
+def test_webhook_payload_consumed_once(monkeypatch):
+    """Deep-link payload is single-use: the second message in the same
+    session must NOT carry the markers again (otherwise the LLM would
+    re-prime on stale context)."""
+    sent_messages: list[dict[str, Any]] = []
+    app, recorder = _build_app_with_recorder(monkeypatch, sent_messages)
+    client = TestClient(app)
+
+    client.post(
+        "/max/webhook",
+        headers={"X-Max-Bot-Api-Secret": "hook-secret"},
+        json={
+            "update_type": "bot_started",
+            "chat_id": 11,
+            "user": {"user_id": 11},
+            "payload": "utm_tg_to_rixos-turkey_from_kzn_id_12345",
+        },
+    )
+    asyncio.get_event_loop().run_until_complete(asyncio.sleep(0.05))
+
+    client.post(
+        "/max/webhook",
+        headers={"X-Max-Bot-Api-Secret": "hook-secret"},
+        json=_send_message_event("Первое сообщение", user_id=11),
+    )
+    asyncio.get_event_loop().run_until_complete(asyncio.sleep(0.1))
+    client.post(
+        "/max/webhook",
+        headers={"X-Max-Bot-Api-Secret": "hook-secret"},
+        json=_send_message_event("Второе сообщение", user_id=11),
+    )
+    asyncio.get_event_loop().run_until_complete(asyncio.sleep(0.1))
+
+    assert len(recorder.calls) == 2
+    first = recorder.calls[0]["message"]
+    second = recorder.calls[1]["message"]
+    assert "[ИСТОЧНИК:" in first
+    assert "[КОНТЕКСТ:" in first
+    assert "ИСТОЧНИК" not in second
+    assert "КОНТЕКСТ" not in second
