@@ -153,6 +153,13 @@ class Conversation(Base):
     message_count: Mapped[int] = mapped_column(Integer, default=0)
     search_count: Mapped[int] = mapped_column(Integer, default=0)
     tour_cards_shown: Mapped[int] = mapped_column(Integer, default=0)
+    # Number of "Забронировать" clicks tracked via the signed /go redirect.
+    # >0 means the client actually opened a tour page on the partner site —
+    # this powers the LK "Перешли на тур" funnel stage (distinct from the
+    # text-derived has_booking_intent). Mirrors the LK column of the same name.
+    tour_clicks: Mapped[int] = mapped_column(
+        Integer, default=0, nullable=False, server_default="0"
+    )
     has_booking_intent: Mapped[bool] = mapped_column(
         Boolean, default=False, nullable=False, server_default="0"
     )

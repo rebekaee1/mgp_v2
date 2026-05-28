@@ -339,6 +339,11 @@ def _build_snapshot_payload(
             "message_count": conversation.message_count,
             "search_count": conversation.search_count,
             "tour_cards_shown": conversation.tour_cards_shown,
+            # Booking-click counter (added 2026-05-29). Powers the LK
+            # "Перешли на тур" funnel stage. Receivers predating this field
+            # ignore it; the LK ingestion takes max() to survive out-of-order
+            # snapshots. getattr keeps older MGP DBs (pre-migration) safe.
+            "tour_clicks": int(getattr(conversation, "tour_clicks", 0) or 0),
             "has_booking_intent": bool(conversation.has_booking_intent),
             "status": conversation.status,
             "started_at": _iso(conversation.started_at),

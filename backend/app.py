@@ -1665,18 +1665,27 @@ def _mark_booking_click(session_id: str, tourid: str, dest: str) -> None:
             ).first()
             if conv is None:
                 return
-            _changed = False
+            # tour_clicks: реальный переход на тур → строка «Перешли на тур»
+            # в воронке ЛК (отдельно от текстового has_booking_intent).
+            conv.tour_clicks = (conv.tour_clicks or 0) + 1
+            # has_booking_intent — для нашего дашборда/CSV (в ЛК оно
+            # пересчитывается из текста сообщений, поэтому для ЛК ключевой
+            # сигнал — именно tour_clicks выше).
             if not conv.has_booking_intent:
                 conv.has_booking_intent = True
-                _changed = True
-                logger.info(
-                    "🔖 BOOKING-CLICK: session=%s tourid=%s → has_booking_intent=True",
-                    session_id[:8], tourid,
-                )
+            # Bump last_active_at, чтобы occurred_at снапшота был строго новее
+            # ранее доставленного — иначе ингест в ЛК отбросит его как stale
+            # (см. runtime_ingestion: occurred_at < last_ingested_event_at).
+            from datetime import datetime as _dt, timezone as _tz
+            conv.last_active_at = _dt.now(_tz.utc)
+            logger.info(
+                "🔖 BOOKING-CLICK: session=%s tourid=%s → tour_clicks=%d, has_booking_intent=True",
+                session_id[:8], tourid, conv.tour_clicks,
+            )
             # Re-emit snapshot to LK so the click is reflected there even though
             # it lands after the last chat message. Idempotent on the LK side
-            # (event_id is unique); safe to call on repeat clicks too.
-            if _changed and conv.assistant_id is not None:
+            # (event_id is unique); LK takes max() on tour_clicks.
+            if conv.assistant_id is not None:
                 db.flush()
                 try:
                     from dialog_sender import enqueue_conversation_snapshot
