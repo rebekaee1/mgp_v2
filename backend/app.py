@@ -1645,7 +1645,13 @@ def _maybe_wrap_booking_links(tour_cards, session_id, handler):
 
 
 def _mark_booking_click(session_id: str, tourid: str, dest: str) -> None:
-    """Отметить переход по «Забронировать»: has_booking_intent=True для диалога."""
+    """Отметить переход по «Забронировать»: has_booking_intent=True для диалога.
+
+    Клик происходит ПОСЛЕ последнего сообщения, когда снапшот диалога в ЛК
+    уже отправлен. Поэтому, выставив флаг, мы ПЕРЕ-ЭМИТИМ снапшот через
+    outbox (enqueue_conversation_snapshot) — планировщик доставит его в ЛК, и
+    «переход на тур» станет виден там так же, как у виджета на сайте.
+    """
     try:
         from database import get_db, is_db_available
         if not is_db_available():
@@ -1657,12 +1663,31 @@ def _mark_booking_click(session_id: str, tourid: str, dest: str) -> None:
             conv = db.query(Conversation).filter(
                 Conversation.session_id == session_id
             ).first()
-            if conv is not None and not conv.has_booking_intent:
+            if conv is None:
+                return
+            _changed = False
+            if not conv.has_booking_intent:
                 conv.has_booking_intent = True
+                _changed = True
                 logger.info(
                     "🔖 BOOKING-CLICK: session=%s tourid=%s → has_booking_intent=True",
                     session_id[:8], tourid,
                 )
+            # Re-emit snapshot to LK so the click is reflected there even though
+            # it lands after the last chat message. Idempotent on the LK side
+            # (event_id is unique); safe to call on repeat clicks too.
+            if _changed and conv.assistant_id is not None:
+                db.flush()
+                try:
+                    from dialog_sender import enqueue_conversation_snapshot
+                    enqueue_conversation_snapshot(
+                        db, conversation_id=conv.id, assistant_id=conv.assistant_id
+                    )
+                except Exception:
+                    logger.warning(
+                        "booking-click snapshot enqueue failed conversation=%s",
+                        conv.id, exc_info=True,
+                    )
     except Exception:
         logger.exception("booking click DB update failed (non-blocking)")
 
