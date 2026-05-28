@@ -3664,8 +3664,15 @@ class YandexGPTHandler:
                         )
 
                         try:
+                            # NOTE: _last_full_search_args is built in the
+                            # snake_case shape that TourvisorClient.search_tours
+                            # actually accepts (price_from/price_to/etc.). The
+                            # LLM-side schema uses flat-case (pricefrom), but
+                            # we MUST NOT mix the two here — passing
+                            # `pricefrom=` would raise TypeError and abort the
+                            # AUTO-RETRY, leaving the customer with no tours.
                             _retry_kwargs = dict(getattr(self, "_last_full_search_args", {}))
-                            _retry_kwargs["pricefrom"] = _stage2_floor
+                            _retry_kwargs["price_from"] = _stage2_floor
 
                             _new_request_id = await self.tourvisor.search_tours(**_retry_kwargs)
                             if _new_request_id:
@@ -3673,7 +3680,11 @@ class YandexGPTHandler:
                                     self._budget_floor_remap = {}
                                 self._budget_floor_remap[str(request_id)] = str(_new_request_id)
                                 self._last_requestid = str(_new_request_id)
+                                # `_last_search_params` is used by other parts
+                                # of the pipeline (sorting, post-filter); keep
+                                # both views in sync to avoid surprises.
                                 self._last_search_params["pricefrom"] = _stage2_floor
+                                self._last_search_params["price_from"] = _stage2_floor
                                 request_id = str(_new_request_id)
 
                                 _retry_status = {}
@@ -3710,12 +3721,14 @@ class YandexGPTHandler:
                                         tours_found,
                                     )
                                     _retry_kwargs3 = dict(_retry_kwargs)
-                                    _retry_kwargs3.pop("pricefrom", None)
+                                    _retry_kwargs3.pop("price_from", None)
+                                    _retry_kwargs3.pop("pricefrom", None)  # safety
                                     _new_rid3 = await self.tourvisor.search_tours(**_retry_kwargs3)
                                     if _new_rid3:
                                         self._budget_floor_remap[str(request_id)] = str(_new_rid3)
                                         self._last_requestid = str(_new_rid3)
                                         self._last_search_params.pop("pricefrom", None)
+                                        self._last_search_params.pop("price_from", None)
                                         request_id = str(_new_rid3)
 
                                         _retry_status3 = {}
