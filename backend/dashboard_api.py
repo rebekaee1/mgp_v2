@@ -1618,7 +1618,7 @@ def widget_config_update():
             assistant.allowed_domains = (data["allowed_domains"] or "").strip() or None
 
         cfg = dict(assistant.widget_config or {})
-        for key in ("welcome_message", "position", "primary_color", "title", "subtitle", "logo_url", "active_preset", "booking_base_url", "allowed_operators", "hide_gds", "notification_email", "booking_email_enabled", "company_name", "website", "contact_phone", "office_address", "contact_email", "warn_regular_hot_tours"):
+        for key in ("welcome_message", "position", "primary_color", "title", "subtitle", "logo_url", "active_preset", "booking_base_url", "booking_url_template", "telegram_lead_chat_id", "allowed_operators", "hide_gds", "notification_email", "booking_email_enabled", "company_name", "website", "contact_phone", "office_address", "contact_email", "warn_regular_hot_tours"):
             if key in data:
                 cfg[key] = data[key]
         assistant.widget_config = cfg

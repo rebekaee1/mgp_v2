@@ -144,7 +144,12 @@ def test_extract_message_handles_bot_started_user_shape():
         "timestamp": 1778411500000,
     }
     parsed = _extract_message(update)
-    assert parsed == {"event": "bot_started", "user_id": 12345, "chat_id": 555}
+    assert parsed == {
+        "event": "bot_started",
+        "user_id": 12345,
+        "chat_id": 555,
+        "payload": None,
+    }
 
 
 def test_extract_message_handles_bot_started_sender_shape():
@@ -155,7 +160,31 @@ def test_extract_message_handles_bot_started_sender_shape():
         "sender": {"user_id": 42},
     }
     parsed = _extract_message(update)
-    assert parsed == {"event": "bot_started", "user_id": 42, "chat_id": 1}
+    assert parsed == {
+        "event": "bot_started",
+        "user_id": 42,
+        "chat_id": 1,
+        "payload": None,
+    }
+
+
+def test_extract_message_handles_bot_started_with_deep_link_payload():
+    """When the user opens the bot via ?start=…, MAX delivers the value
+    in ``payload``. We must surface it so the next message can prefix the
+    deep-link source for the LLM and the lead pipeline."""
+    update = {
+        "update_type": "bot_started",
+        "chat_id": 7,
+        "user": {"user_id": 99},
+        "payload": "utm_ya_key_tury-v-turciyu_id_123456789",
+    }
+    parsed = _extract_message(update)
+    assert parsed == {
+        "event": "bot_started",
+        "user_id": 99,
+        "chat_id": 7,
+        "payload": "utm_ya_key_tury-v-turciyu_id_123456789",
+    }
 
 
 def test_extract_message_bot_started_without_user_returns_none():

@@ -30,6 +30,18 @@ def _key(max_user_id: int | str, tenant_slug: Optional[str] = None) -> str:
     return f"max:user:{max_user_id}:session"
 
 
+def _payload_key(max_user_id: int | str, tenant_slug: Optional[str] = None) -> str:
+    """Separate Redis key for the deep-link ``payload`` we capture in
+    ``bot_started`` and consume at the first user message.
+
+    Lifecycle: SET on bot_started → GETDEL on first message → discarded.
+    Scoped per tenant for the same reason as the session key.
+    """
+    if tenant_slug:
+        return f"max:user:{max_user_id}:tenant:{tenant_slug}:start_payload"
+    return f"max:user:{max_user_id}:start_payload"
+
+
 class SessionStore:
     """Tiny abstraction over redis-py's async client.
 
@@ -71,6 +83,50 @@ class SessionStore:
         self, max_user_id: int | str, tenant_slug: Optional[str] = None
     ) -> None:
         await self._redis.delete(_key(max_user_id, tenant_slug))
+        # If a user clicks the deep-link again after /restart, we want to
+        # treat them as a fresh visit, so drop any stale pending payload too.
+        await self._redis.delete(_payload_key(max_user_id, tenant_slug))
+
+    async def set_pending_payload(
+        self,
+        max_user_id: int | str,
+        payload: str,
+        tenant_slug: Optional[str] = None,
+        ttl_seconds: Optional[int] = None,
+    ) -> None:
+        """Stash a deep-link payload captured at ``bot_started``.
+
+        Trimmed to MAX's documented 512-char limit; rejects empty strings.
+        Uses a short TTL by default — payload is meant to flow into the very
+        next user message, not to linger across days.
+        """
+        if not payload:
+            return
+        clean = payload.strip()[:512]
+        if not clean:
+            return
+        ttl = ttl_seconds if ttl_seconds is not None else min(self._ttl, 3600)
+        await self._redis.set(
+            _payload_key(max_user_id, tenant_slug),
+            clean,
+            ex=ttl,
+        )
+
+    async def consume_pending_payload(
+        self,
+        max_user_id: int | str,
+        tenant_slug: Optional[str] = None,
+    ) -> Optional[str]:
+        """Return and delete the pending payload (one-shot)."""
+        key = _payload_key(max_user_id, tenant_slug)
+        # Prefer GETDEL when the Redis server supports it (>=6.2).
+        try:
+            return await self._redis.getdel(key)
+        except AttributeError:
+            value = await self._redis.get(key)
+            if value is not None:
+                await self._redis.delete(key)
+            return value
 
     async def ping(self) -> bool:
         return bool(await self._redis.ping())

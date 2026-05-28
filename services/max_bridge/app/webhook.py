@@ -173,10 +173,21 @@ def _extract_message(update: dict[str, Any]) -> Optional[dict[str, Any]]:
         chat_id = update.get("chat_id")
         if user_id is None:
             return None
+        # MAX delivers the deep-link ``?start=…`` value under one of these
+        # keys depending on the platform version. We accept the broadest
+        # union so partner traffic with attribution codes (e.g.
+        # ``utm_ya_key_tury-v-turciyu_id_123456789``) is not dropped.
+        payload_raw = (
+            update.get("payload")
+            or update.get("start_payload")
+            or user.get("payload")
+        )
+        payload = str(payload_raw).strip() if payload_raw else None
         return {
             "event": "bot_started",
             "user_id": int(user_id),
             "chat_id": int(chat_id) if chat_id is not None else None,
+            "payload": payload,
         }
 
     if update_type not in {"message_created", "message"}:
@@ -317,7 +328,16 @@ async def _process_event(
     log = logger.bind(correlation_id=correlation_id, tenant=tenant.slug, user_id=user_id)
 
     if kind == "bot_started":
-        log.info("bot_started_received")
+        payload = event.get("payload")
+        if payload:
+            try:
+                await session_store.set_pending_payload(
+                    user_id, payload, tenant_slug=tenant.slug
+                )
+                log.info("bot_started_payload_captured", payload_len=len(payload))
+            except Exception:
+                log.exception("bot_started_payload_persist_failed")
+        log.info("bot_started_received", has_payload=bool(payload))
         try:
             await _send_welcome(
                 tenant=tenant,
@@ -468,12 +488,36 @@ async def _process_message(
 
         session_id, created = await session_store.get_or_create_session(user_id, tenant.slug)
         log.info("session_resolved", session_id=session_id[:18], created=created)
+
+        # ── Deep-link payload (first user message after `?start=…`) ──────
+        # If the user opened the bot via a tracked deep-link, MAX delivered
+        # the ``payload`` value at ``bot_started``. We stashed it in Redis;
+        # consume it here ONCE and prefix the message so the LLM sees the
+        # source code in its very first turn, and so the payload is
+        # automatically persisted on conversation.messages — the lead-out
+        # path (Telegram, U-ON, e-mail) can grep it back out of the row.
+        outbound_text = text
+        try:
+            pending_payload = await session_store.consume_pending_payload(
+                user_id, tenant_slug=tenant.slug
+            )
+        except Exception:
+            log.exception("payload_consume_failed")
+            pending_payload = None
+        if pending_payload:
+            outbound_text = f"[ИСТОЧНИК: {pending_payload}]\n{text}"
+            log.info(
+                "deep_link_payload_applied",
+                payload_len=len(pending_payload),
+                payload_preview=pending_payload[:60],
+            )
+
         # ``external_user_id`` lets the backend store the MAX user_id alongside
         # the conversation so the LK can later deep-link back into the MAX
         # chat. The backend honours this header only on the FIRST insert of
         # the conversation row.
         chat_response = await chat_proxy.chat(
-            message=text,
+            message=outbound_text,
             session_id=session_id,
             assistant_id=tenant.assistant_id,
             external_user_id=str(user_id),

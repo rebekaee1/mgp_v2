@@ -1151,19 +1151,79 @@ _DEFAULT_BOOKING_BASE_URL = "https://mgp.ru/tours/"
 _MAX_CHANNEL_CARDS_LIMIT = 3
 
 
-def _build_hotel_link(tourid, fallback_link: str = "#", booking_base_url: str = None) -> str:
+def _build_hotel_link(
+    tourid,
+    fallback_link: str = "#",
+    booking_base_url: str = None,
+    *,
+    booking_url_template: Optional[str] = None,
+    tour_meta: Optional[Dict[str, Any]] = None,
+) -> str:
     """Build booking link for a tour card.
 
-    Default (mgp.ru): uses custom #tvtourid= handler on /tours/ page.
-    Custom tenant: constructs tenant_url#tvtourid=XXX.
+    Two modes:
+
+    1. **Legacy (default)** — uses ``{booking_base_url}#tvtourid=...``. Works
+       for all MGP tenants where the partner site has a Tourvisor widget
+       that listens to the ``#tvtourid`` anchor (mgp.ru, mgptambov.ru, etc.).
+
+    2. **Custom template** — if the assistant's ``widget_config`` has a
+       ``booking_url_template`` field with ``{placeholder}``-style markers,
+       we render it using ``tour_meta``. Used for partners with a non-widget
+       search on their own site (e.g. anytour.online expects GET-params
+       ``?country=…&from=…&hotel=…&date_from=…&days_from=…&count_people=…``).
+
+    Supported placeholders (all optional, missing values render empty):
+      - ``{tourid}``           — Tourvisor tour id
+      - ``{hotel_id}``         — Tourvisor hotelcode
+      - ``{country_id}``       — Tourvisor countrycode
+      - ``{region_id}``        — Tourvisor regioncode (resort)
+      - ``{departure_id}``     — Tourvisor departure id
+      - ``{date_from}``        — flydate in ``YYYY-MM-DD``
+      - ``{date_till}``        — same as date_from by default (tourvisor returns
+                                  a single ``flydate`` per tour; partners that
+                                  need a window can re-use it as a single-day
+                                  range)
+      - ``{nights}``           — tour nights
+      - ``{nights_from}``      — alias of ``{nights}`` (for partners that
+                                  require a range)
+      - ``{nights_to}``        — alias of ``{nights}``
+      - ``{adults}``           — number of adults
+      - ``{count_people}``     — alias of ``{adults}`` (anytour.online uses it)
 
     We deliberately preserve the trailing slash of ``booking_base_url``:
     some tenant sites (e.g. mgput.ru/poisk/) issue a 301 redirect from
     ``/poisk`` to ``/poisk/``, and the URL fragment (``#tvtourid=...``)
-    is not guaranteed to survive a 301 in every browser. Keeping the
-    slash means the Tourvisor widget gets the anchor on the very first
-    request.
+    is not guaranteed to survive a 301 in every browser.
     """
+    if booking_url_template:
+        meta = tour_meta or {}
+        nights = meta.get("nights")
+        adults = meta.get("adults")
+        flydate = meta.get("date_from") or ""
+        placeholders = {
+            "tourid": meta.get("tourid") or tourid or "",
+            "hotel_id": meta.get("hotel_id") or "",
+            "country_id": meta.get("country_id") or "",
+            "region_id": meta.get("region_id") or "",
+            "departure_id": meta.get("departure_id") or "",
+            "date_from": flydate,
+            "date_till": meta.get("date_till") or flydate,
+            "nights": nights if nights is not None else "",
+            "nights_from": meta.get("nights_from") if meta.get("nights_from") is not None else (nights if nights is not None else ""),
+            "nights_to": meta.get("nights_to") if meta.get("nights_to") is not None else (nights if nights is not None else ""),
+            "adults": adults if adults is not None else "",
+            "count_people": adults if adults is not None else "",
+        }
+        try:
+            return booking_url_template.format(**placeholders)
+        except (KeyError, IndexError, ValueError) as e:
+            logger.warning(
+                "booking_url_template render failed: %s (template=%s) — falling back to legacy",
+                e, booking_url_template[:120]
+            )
+            # fall through to legacy below
+
     base = booking_base_url or _DEFAULT_BOOKING_BASE_URL
     if tourid:
         return f"{base}#tvtourid={tourid}"
@@ -1177,7 +1237,9 @@ def _build_hotel_link(tourid, fallback_link: str = "#", booking_base_url: str = 
 
 
 def _map_hotel_to_card(hotel: dict, departure_city: str = "Москва", adults: int = 2,
-                       booking_base_url: str = None) -> dict:
+                       booking_base_url: str = None,
+                       booking_url_template: Optional[str] = None,
+                       departure_id: Optional[int] = None) -> dict:
     """
     Маппинг отеля из get_search_results → формат tour_card для фронтенда.
     Структура совпадает с ожиданиями createTourCardHTML в script.js.
@@ -1196,7 +1258,26 @@ def _map_hotel_to_card(hotel: dict, departure_city: str = "Москва", adults
     is_no_flight = (departure_city == "Без перелёта") or bool(tour.get("noflight"))
 
     tourid = tour.get("tourid")
-    hotel_link = _build_hotel_link(tourid, hotel.get("fulldesclink"), booking_base_url)
+    # ── Booking link: legacy #tvtourid= OR custom GET-template (anytour.online style)
+    _tour_meta: Optional[Dict[str, Any]] = None
+    if booking_url_template:
+        _tour_meta = {
+            "tourid": tourid,
+            "hotel_id": hotel.get("hotelcode"),
+            "country_id": hotel.get("countrycode"),
+            "region_id": hotel.get("regioncode"),
+            "departure_id": departure_id,
+            "date_from": _parse_tv_date(flydate_raw),
+            "nights": nights,
+            "adults": adults,
+        }
+    hotel_link = _build_hotel_link(
+        tourid,
+        hotel.get("fulldesclink"),
+        booking_base_url,
+        booking_url_template=booking_url_template,
+        tour_meta=_tour_meta,
+    )
 
     return {
         "hotel_name": hotel.get("hotelname") or "Отель",
@@ -1236,7 +1317,10 @@ _MEAL_CODE_TO_RU = {
 }
 
 
-def _map_hot_tour_to_card(tour_data: dict, booking_base_url: str = None) -> dict:
+def _map_hot_tour_to_card(tour_data: dict, booking_base_url: str = None,
+                          booking_url_template: Optional[str] = None,
+                          departure_id: Optional[int] = None,
+                          adults: int = 2) -> dict:
     """
     Маппинг горящего тура из get_hot_tours → формат tour_card для фронтенда.
     ⚠️ Цена горящих туров — ЗА ЧЕЛОВЕКА!
@@ -1256,7 +1340,25 @@ def _map_hot_tour_to_card(tour_data: dict, booking_base_url: str = None) -> dict
     meal_ru = _MEAL_CODE_TO_RU.get(meal_code.strip(), meal_code)
 
     tourid = tour_data.get("tourid")
-    hotel_link = _build_hotel_link(tourid, tour_data.get("fulldesclink"), booking_base_url)
+    _tour_meta: Optional[Dict[str, Any]] = None
+    if booking_url_template:
+        _tour_meta = {
+            "tourid": tourid,
+            "hotel_id": tour_data.get("hotelcode"),
+            "country_id": tour_data.get("countrycode"),
+            "region_id": tour_data.get("regioncode"),
+            "departure_id": departure_id,
+            "date_from": _parse_tv_date(flydate_raw),
+            "nights": nights,
+            "adults": adults,
+        }
+    hotel_link = _build_hotel_link(
+        tourid,
+        tour_data.get("fulldesclink"),
+        booking_base_url,
+        booking_url_template=booking_url_template,
+        tour_meta=_tour_meta,
+    )
 
     card = {
         "hotel_name": tour_data.get("hotelname") or "Отель",
@@ -1601,6 +1703,7 @@ class YandexGPTHandler:
         self._pending_tour_cards: List[Dict] = []
         self._booking_cards_cache: Dict[str, Dict] = {}  # tourid → full card (survives across turns)
         self._last_departure_city: str = "Москва"
+        self._last_departure_id: int = 1
         
         # ── Идеальные параметры для пересортировки результатов ──
         self._ideal_datefrom: Optional[str] = None   # "DD.MM.YYYY"
@@ -1855,9 +1958,16 @@ class YandexGPTHandler:
         simplified = [item[2] for item in batch]
 
         _adults = self._last_search_params.get("adults", 2) if self._last_search_params else 2
-        _booking_url = (getattr(self.runtime_config, "widget_config", None) or {}).get("booking_base_url")
+        _wc = (getattr(self.runtime_config, "widget_config", None) or {})
+        _booking_url = _wc.get("booking_base_url")
+        _booking_tpl = _wc.get("booking_url_template")
         self._pending_tour_cards = [
-            _map_hotel_to_card(h, self._last_departure_city, adults=_adults, booking_base_url=_booking_url)
+            _map_hotel_to_card(
+                h, self._last_departure_city, adults=_adults,
+                booking_base_url=_booking_url,
+                booking_url_template=_booking_tpl,
+                departure_id=self._last_departure_id,
+            )
             for h in simplified
         ]
         for _c in self._pending_tour_cards:
@@ -2476,6 +2586,10 @@ class YandexGPTHandler:
                 self._last_departure_city = _DEPARTURE_CITIES.get(
                     dep_code, self._last_departure_city
                 )
+                try:
+                    self._last_departure_id = int(dep_code)
+                except (TypeError, ValueError):
+                    pass
             
             # ── Fix H4: Санитизация параметров — детекция галлюцинаций ──
             # Модель иногда вставляет вызовы функций ВНУТРЬ аргументов:
@@ -4011,9 +4125,16 @@ class YandexGPTHandler:
             
             # ── Строим tour_cards для нового фронтенда ──
             _adults = self._last_search_params.get("adults", 2) if self._last_search_params else 2
-            _booking_url = (getattr(self.runtime_config, "widget_config", None) or {}).get("booking_base_url")
+            _wc = (getattr(self.runtime_config, "widget_config", None) or {})
+            _booking_url = _wc.get("booking_base_url")
+            _booking_tpl = _wc.get("booking_url_template")
             self._pending_tour_cards = [
-                _map_hotel_to_card(h, self._last_departure_city, adults=_adults, booking_base_url=_booking_url)
+                _map_hotel_to_card(
+                    h, self._last_departure_city, adults=_adults,
+                    booking_base_url=_booking_url,
+                    booking_url_template=_booking_tpl,
+                    departure_id=self._last_departure_id,
+                )
                 for h in simplified
             ]
             for _c in self._pending_tour_cards:
@@ -4835,9 +4956,17 @@ class YandexGPTHandler:
                 })
             
             # ── Строим tour_cards для нового фронтенда ──
-            _booking_url_hot = (getattr(self.runtime_config, "widget_config", None) or {}).get("booking_base_url")
+            _wc_hot = (getattr(self.runtime_config, "widget_config", None) or {})
+            _booking_url_hot = _wc_hot.get("booking_base_url")
+            _booking_tpl_hot = _wc_hot.get("booking_url_template")
+            _adults_hot = self._last_search_params.get("adults", 2) if self._last_search_params else 2
             self._pending_tour_cards = [
-                _map_hot_tour_to_card(t, booking_base_url=_booking_url_hot) for t in simplified
+                _map_hot_tour_to_card(
+                    t, booking_base_url=_booking_url_hot,
+                    booking_url_template=_booking_tpl_hot,
+                    departure_id=self._last_departure_id,
+                    adults=_adults_hot,
+                ) for t in simplified
             ]
             for _c in self._pending_tour_cards:
                 _cid = str(_c.get("id") or _c.get("tourid") or "")
@@ -5012,11 +5141,14 @@ class YandexGPTHandler:
             )
 
             booking_base = wc.get("booking_base_url", "")
-            tour_link = ""
-            if tourid and booking_base:
-                tour_link = f"{booking_base.rstrip('/')}#tvtourid={tourid}"
-            elif tourid:
-                tour_link = f"https://mgp.ru/tours/#tvtourid={tourid}"
+            # Prefer the link we already rendered for the user-facing card
+            # (it respects booking_url_template, e.g. anytour.online GET-params).
+            tour_link = card.get("hotel_link") or ""
+            if not tour_link:
+                if tourid and booking_base:
+                    tour_link = f"{booking_base.rstrip('/')}#tvtourid={tourid}"
+                elif tourid:
+                    tour_link = f"https://mgp.ru/tours/#tvtourid={tourid}"
 
             from email_sender import send_booking_email
             result = send_booking_email(
@@ -5046,6 +5178,44 @@ class YandexGPTHandler:
                     "📧 BOOKING REQUEST #%d sent to %s for tour %s, client=%s",
                     request_number, notification_email, tourid or "?", client_name,
                 )
+                # ── Phase G: Telegram booking duplicate (non-blocking) ──
+                try:
+                    tg_chat_b = (wc.get("telegram_lead_chat_id") or "").__str__().strip() if isinstance(wc, dict) else ""
+                    if tg_chat_b:
+                        source_payload = self._collect_source_payload_from_history()
+                        from tg_sender import send_telegram_booking
+                        asyncio.create_task(
+                            asyncio.to_thread(
+                                send_telegram_booking,
+                                tg_chat_b,
+                                client_name=client_name,
+                                client_phone=client_phone,
+                                client_email=client_email,
+                                hotel_name=card.get("hotel_name") or tour_data.get("hotelname", "Не указан"),
+                                country=card.get("country", ""),
+                                resort=card.get("resort", ""),
+                                departure_city=card.get("departure_city") or self._last_departure_city,
+                                fly_date=card.get("date_from", ""),
+                                nights=int(card.get("nights", 0) or 0),
+                                price=int(card.get("price", 0) or 0),
+                                operator=card.get("operator", ""),
+                                meal=card.get("meal_description") or card.get("food_type", ""),
+                                room_type=card.get("room_type", ""),
+                                stars=int(card.get("hotel_stars", 0) or 0),
+                                tour_link=tour_link,
+                                source_payload=source_payload,
+                                agency_name=agency_name,
+                                request_number=request_number,
+                                comment=comment,
+                            )
+                        )
+                        logger.info(
+                            "📨 TG BOOKING scheduled chat=%s tour=%s client=%s",
+                            tg_chat_b, tourid or "?", client_name,
+                        )
+                except Exception as _tg_e:
+                    logger.warning("TG BOOKING scheduling failed (non-fatal): %s", _tg_e, exc_info=True)
+
                 return {
                     "status": "success",
                     "request_number": request_number,
@@ -5331,6 +5501,43 @@ class YandexGPTHandler:
                     _e, exc_info=True,
                 )
 
+            # ── Phase G: Telegram lead duplicate (e.g. anytour.online) ──
+            # Mirror of the e-mail block above. Off by default — only fires
+            # when ``widget_config.telegram_lead_chat_id`` is set on the
+            # assistant AND the system env ``TELEGRAM_BOT_TOKEN`` is set.
+            try:
+                wc_tg = getattr(self.runtime_config, "widget_config", None) or {}
+                tg_chat = (wc_tg.get("telegram_lead_chat_id") or "").__str__().strip()
+                if tg_chat:
+                    crm_id_tg = None
+                    data_tg = result.get("data") or {}
+                    if isinstance(data_tg, dict):
+                        crm_id_tg = (
+                            data_tg.get("id")
+                            or data_tg.get("lead_id")
+                            or data_tg.get("request_id")
+                        )
+                    asyncio.create_task(
+                        self._send_lead_telegram(
+                            chat_id=tg_chat,
+                            client_name=client_name,
+                            client_phone=client_phone,
+                            client_email=client_email,
+                            comment=comment,
+                            crm_type=crm_type,
+                            crm_id=crm_id_tg,
+                        )
+                    )
+                    logger.info(
+                        "LEAD-TG: scheduled chat=%s crm_type=%s crm_id=%s",
+                        tg_chat, crm_type, crm_id_tg,
+                    )
+            except Exception as _e:
+                logger.warning(
+                    "LEAD-TG: scheduling failed (non-fatal): %s",
+                    _e, exc_info=True,
+                )
+
             return {
                 "status": "success",
                 "type": crm_type,
@@ -5350,6 +5557,72 @@ class YandexGPTHandler:
                 f"Предложи клиенту позвонить менеджеру: {manager_phone}."
             ),
         }
+
+    def _collect_source_payload_from_history(self) -> Optional[str]:
+        """Pull the deep-link source code (e.g. ``utm_ya_key_…_id_123``) that
+        max_bridge prefixed to the very first user turn as
+        ``[ИСТОЧНИК: …]`` (see services/max_bridge/app/webhook.py).
+
+        Returns ``None`` if there is no source marker (typical for widget
+        users on lk.navilet.ru who arrived without a tracked link).
+        """
+        try:
+            history = getattr(self, "full_history", None) or []
+            for m in history:
+                role = m.get("role") if isinstance(m, dict) else None
+                content = m.get("content") if isinstance(m, dict) else None
+                if role != "user" or not isinstance(content, str):
+                    continue
+                idx = content.find("[ИСТОЧНИК:")
+                if idx < 0:
+                    continue
+                end = content.find("]", idx)
+                if end < 0:
+                    continue
+                payload = content[idx + len("[ИСТОЧНИК:"): end].strip()
+                if payload:
+                    return payload
+        except Exception as e:  # pragma: no cover — defensive
+            logger.debug("_collect_source_payload_from_history: %s", e)
+        return None
+
+    async def _send_lead_telegram(
+        self,
+        chat_id: str,
+        client_name: str,
+        client_phone: str,
+        client_email: str,
+        comment: str,
+        crm_type: str,
+        crm_id: Optional[int] = None,
+    ) -> None:
+        """Background Telegram-notification when a U-ON lead/request is created.
+
+        Never raises — wraps every error in a warning log so the LLM-side
+        flow remains identical regardless of the Telegram outcome.
+        """
+        try:
+            agency_name = (
+                getattr(self.runtime_config, "company_name", None)
+                or getattr(self.runtime_config, "assistant_name", None)
+                or "Магазин Горящих Путёвок"
+            )
+            source_payload = self._collect_source_payload_from_history()
+            request_number = crm_id or None
+            from tg_sender import send_telegram_lead
+            await asyncio.to_thread(
+                send_telegram_lead,
+                chat_id,
+                client_name=client_name,
+                client_phone=client_phone,
+                client_email=client_email,
+                summary=comment,
+                source_payload=source_payload,
+                agency_name=agency_name,
+                request_number=request_number,
+            )
+        except Exception as e:
+            logger.warning("LEAD-TG send failed (non-fatal): %s", e, exc_info=True)
 
     async def _send_lead_email_duplicate(
         self,
@@ -5393,11 +5666,14 @@ class YandexGPTHandler:
                 tourid = first_key
 
             if act_tid and card:
-                tour_link = ""
-                if tourid and booking_base:
-                    tour_link = f"{booking_base.rstrip('/')}#tvtourid={tourid}"
-                elif tourid:
-                    tour_link = f"https://mgp.ru/tours/#tvtourid={tourid}"
+                # Prefer the link we already rendered for the user-facing card
+                # (it respects booking_url_template, e.g. anytour.online GET-params).
+                tour_link = card.get("hotel_link") or ""
+                if not tour_link:
+                    if tourid and booking_base:
+                        tour_link = f"{booking_base.rstrip('/')}#tvtourid={tourid}"
+                    elif tourid:
+                        tour_link = f"https://mgp.ru/tours/#tvtourid={tourid}"
 
                 price_int = 0
                 try:
@@ -6886,6 +7162,7 @@ class YandexGPTHandler:
         self._pending_api_calls = []
         self._last_message_usage = None
         self._last_departure_city = "Москва"
+        self._last_departure_id = 1
         self._tour_details_cache = {}
         self._tour_actualized_id = None
         self._crm_submitted = None
