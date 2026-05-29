@@ -36,6 +36,12 @@ class RuntimeTenantConfig:
     uon_api_key: Optional[str] = None
     uon_source: str = "AI-Ассистент"
     uon_dry_run: bool = True
+    # CRM provider selector: "uon" (default) | "moidoc"
+    crm_provider: str = "uon"
+    moidoc_account_url: Optional[str] = None
+    moidoc_api_key: Optional[str] = None
+    moidoc_source: str = "AI-Ассистент"
+    moidoc_dry_run: bool = True
     source: str = "env-default"
 
 
@@ -54,6 +60,10 @@ def build_default_runtime_config() -> RuntimeTenantConfig:
         uon_api_key=settings.uon_api_key or None,
         uon_source=settings.uon_source,
         uon_dry_run=settings.uon_dry_run,
+        moidoc_account_url=settings.moidoc_account_url or None,
+        moidoc_api_key=settings.moidoc_api_key or None,
+        moidoc_source=settings.moidoc_source,
+        moidoc_dry_run=settings.moidoc_dry_run,
     )
 
 
@@ -119,6 +129,18 @@ def resolve_runtime_config(assistant_id: Optional[str] = None) -> RuntimeTenantC
             ).get("secret")
             runtime_config.uon_api_key = getattr(assistant, "uon_api_key", None) or runtime_config.uon_api_key
             runtime_config.uon_source = getattr(assistant, "uon_source", None) or runtime_config.uon_source
+            runtime_config.crm_provider = (
+                getattr(assistant, "crm_provider", None) or runtime_config.crm_provider or "uon"
+            ).strip().lower()
+            runtime_config.moidoc_account_url = (
+                getattr(assistant, "moidoc_account_url", None) or runtime_config.moidoc_account_url
+            )
+            runtime_config.moidoc_api_key = (
+                getattr(assistant, "moidoc_api_key", None) or runtime_config.moidoc_api_key
+            )
+            runtime_config.moidoc_source = (
+                getattr(assistant, "moidoc_source", None) or runtime_config.moidoc_source
+            )
             runtime_config.source = "assistant-db"
             return runtime_config
     except Exception:

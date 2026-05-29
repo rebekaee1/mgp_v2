@@ -584,11 +584,10 @@ provision_arbat() {
 
 # ── Travel Time ───────────────────────────────────────────────────────────────
 #
-# CRM NOTE: Travel Time uses МоиДокументы-Туристам (cabinet trevel-time.moidokumenti.ru),
-# NOT U-ON. There is no native client for МДТ in this codebase and its inbound API is
-# not publicly documented (spec lives inside the cabinet, often disabled by default).
-# CRM is therefore intentionally left unconfigured (deferred). Everything else (widget,
-# branding, booking URL, office facts, reporting) is provisioned.
+# CRM NOTE: Travel Time uses «МоиДокументы-Туризм» (cabinet trevel-time.moidokumenti.ru),
+# NOT U-ON. Integrated via backend/moidoc_client.py (crm_provider="moidoc", endpoint
+# /api/add-lead). Credentials are set per-tenant below (account URL + API key). Make sure
+# the backend env has MOIDOC_DRY_RUN=false in production so leads are actually delivered.
 
 provision_traveltime() {
     log "════════════════════════════════════════════════"
@@ -652,8 +651,11 @@ provision_traveltime() {
 - Принимаем любые способы оплаты: по банковским реквизитам, банковскими картами, по QR-коду, по ссылке для оплаты, наличными в офисе.
 - Если клиент спрашивает про оплату, договор или регионы работы — отвечай этими фактами.' WHERE id = '${ASSISTANT_ID}';"
 
-    log "⚠️  CRM: Travel Time uses МоиДокументы-Туристам (trevel-time.moidokumenti.ru) — NOT U-ON."
-    log "    No native client yet; CRM deferred until МДТ inbound API spec is provided."
+    log "Configuring CRM: МоиДокументы-Туризм (trevel-time.moidokumenti.ru)..."
+    # Per-tenant credentials. Override the key via env MOIDOC_API_KEY_TRAVEL_TIME
+    # if it rotates; otherwise the value below (provided by the client) is used.
+    local MOIDOC_KEY="${MOIDOC_API_KEY_TRAVEL_TIME:-oVoxP3H9lYM39a9nnbcg8qgpHxKHsX3530BY5ys0cVh90ySSmEhaULq1XoXm2D98}"
+    run_sql "UPDATE assistants SET crm_provider = 'moidoc', moidoc_account_url = 'https://trevel-time.moidokumenti.ru', moidoc_api_key = '${MOIDOC_KEY}', moidoc_source = 'AI-Ассистент' WHERE id = '${ASSISTANT_ID}';"
 
     log "Configuring runtime_metadata.reporting (PUSH → LK)..."
     setup_reporting "$ASSISTANT_ID" "travel-time"
@@ -661,7 +663,8 @@ provision_traveltime() {
 
     log ""
     log "✅ Travel Time — provisioned (assistant: ${ASSISTANT_ID})"
-    log "   CRM: deferred (МоиДокументы-Туристам, no inbound API spec yet)"
+    log "   CRM: МоиДокументы-Туризм (crm_provider=moidoc, cabinet trevel-time.moidokumenti.ru)"
+    log "   ⚠️  Ensure backend env has MOIDOC_DRY_RUN=false so leads are actually sent."
     echo ""
 }
 

@@ -73,6 +73,10 @@ class Assistant(Base):
     allowed_domains: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     uon_api_key: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     uon_source: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    crm_provider: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
+    moidoc_account_url: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    moidoc_api_key: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    moidoc_source: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow

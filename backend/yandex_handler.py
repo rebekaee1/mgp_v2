@@ -1770,9 +1770,16 @@ class YandexGPTHandler:
         self._original_requested_meal: Optional[int] = None
         self._regions_resolved_via_dict: bool = False
         
-        # ── U-ON CRM ──
+        # ── CRM ── провайдер выбирается per-tenant: "uon" (по умолчанию) | "moidoc"
         from uon_client import UONClient
         self.uon_client = UONClient(runtime_config=runtime_config)
+        self._crm_provider = (
+            getattr(runtime_config, "crm_provider", None) or "uon"
+        ).strip().lower()
+        self.moidoc_client = None
+        if self._crm_provider == "moidoc":
+            from moidoc_client import MoiDocumentiClient
+            self.moidoc_client = MoiDocumentiClient(runtime_config=runtime_config)
         self._crm_submitted: Optional[Dict] = None  # dedup guard: {phone, email, type}
         self._tour_actualized_id: Optional[str] = None  # tourid explicitly actualized by LLM
 
@@ -6290,6 +6297,8 @@ class YandexGPTHandler:
         parts.append(f"Источник: виджет {agency}")
         note = "; ".join(parts)
 
+        if self._crm_provider == "moidoc" and self.moidoc_client is not None:
+            return await self.moidoc_client.create_lead(name, phone, email, note)
         return await self.uon_client.create_lead(name, phone, email, note)
 
     async def _crm_create_request(self, name: str, phone: str, email: str,
@@ -6362,6 +6371,14 @@ class YandexGPTHandler:
         )
         parts.append(f"Источник: виджет {agency}")
         note = "; ".join(parts)
+
+        # «МоиДокументы-Туризм» не имеет лёгкого аналога «заявки с туром»
+        # (create-preorder требует предварительного создания туриста и числовых
+        # ID стран/городов вылета). Поэтому заявку с выбранным туром тоже кладём
+        # в /api/add-lead — весь контекст (отель, страна, даты, цена, оператор)
+        # уже разложен в note и попадёт в структурированные поля лида.
+        if self._crm_provider == "moidoc" and self.moidoc_client is not None:
+            return await self.moidoc_client.create_lead(name, phone, email, note)
 
         return await self.uon_client.create_request(
             name, phone, email, note,

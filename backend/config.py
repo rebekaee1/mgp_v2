@@ -33,6 +33,12 @@ class Settings(BaseSettings):
     uon_source: str = "AI-Ассистент"
     uon_dry_run: bool = True
 
+    # --- МоиДокументы-Туризм CRM (moidokumenti.ru) ---
+    moidoc_account_url: str = ""
+    moidoc_api_key: str = ""
+    moidoc_source: str = "AI-Ассистент"
+    moidoc_dry_run: bool = True
+
     # --- TourVisor ---
     tourvisor_auth_login: str = ""
     tourvisor_auth_pass: str = ""
