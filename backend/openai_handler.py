@@ -53,6 +53,10 @@ load_dotenv()
 
 logger = logging.getLogger("mgp_bot")
 
+# Жёсткий потолок времени одного ответа chat() (сек). В проде — 120 (без изменений);
+# конфигурируется через env для нагрузочного/E2E-тестирования из высоколатентной среды.
+_CHAT_WALL_CLOCK_S = int(os.getenv("CHAT_WALL_CLOCK_S", "120"))
+
 _RE_FUNC_NAMES = re.compile(
     r'\(?(get_tour_details|search_tours|get_search_results|'
     r'get_search_status|get_hotel_info|actualize_tour|'
@@ -541,6 +545,9 @@ class OpenAIHandler(YandexGPTHandler):
         """
         # Reset tour cards for this message
         self._pending_tour_cards = []
+        # Новое сообщение клиента — снимаем блокировку показа карточек после
+        # smart-alt (теперь клиент мог выбрать вариант → get_search_results разрешён).
+        self._smart_alt_awaiting_pick = False
         self._metrics["total_messages"] += 1
 
         # Add user message to history
@@ -563,6 +570,7 @@ class OpenAIHandler(YandexGPTHandler):
         max_iterations = 20
         iteration = 0
         chat_start = time.perf_counter()
+        self._chat_started_at = time.monotonic()  # для time-budget разведки SMART-ALT
         empty_retries = 0
         timeout_retries = 0
         geo_retries = 0
@@ -572,7 +580,7 @@ class OpenAIHandler(YandexGPTHandler):
             iteration += 1
 
             elapsed = time.perf_counter() - chat_start
-            if elapsed > 120:
+            if elapsed > _CHAT_WALL_CLOCK_S:
                 logger.error(
                     "⏱ WALL-CLOCK TIMEOUT after %.1fs at iteration %d",
                     elapsed, iteration

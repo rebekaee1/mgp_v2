@@ -1790,6 +1790,33 @@ def _strip_trailing_fragment(text: str) -> str:
     return text
 
 
+# ════════════════════════════════════════════════════════════════════
+# SMART-ALTERNATIVES (Умный подбор альтернатив при 0 результатов)
+# ════════════════════════════════════════════════════════════════════
+# Когда точные критерии клиента дали 0 туров (уже ПОСЛЕ каскадов GDS /
+# budget-floor / date-widen), вместо «мёртвого» меню из N пунктов делаем
+# ОДИН разведочный поиск со снятыми «мягкими» фильтрами (цена / звёзды /
+# питание / курорт / прямой рейс), партиционируем найденный пул на 1-3
+# конкретных фрейминга и отдаём их LLM, чтобы тот предложил клиенту
+# реальные варианты с цифрами и задал ОДИН уточняющий вопрос.
+#
+# Это ОБЩАЯ правка для ВСЕХ ассистентов (наследуется OpenAIHandler).
+# Глобальный kill-switch: мгновенно вернуть старое поведение (меню),
+# не откатывая код и без per-tenant флагов.
+_SMART_ALT_ENABLED = True
+# Минимум отелей в разведочном пуле, чтобы предлагать альтернативы.
+_SMART_ALT_MIN_HOTELS = 1
+# Максимум фреймингов (альтернатив), которые показываем клиенту за раз.
+_SMART_ALT_MAX_FRAMINGS = 3
+# Бюджет времени на разведку (chat() имеет жёсткий wall-clock ~120с). Если к моменту
+# 0-результата уже потрачено больше (120 - этого запаса) — разведку НЕ запускаем,
+# чтобы хватило времени на ответ LLM; падаем в обычное меню (безопасная деградация).
+_SMART_ALT_RESERVE_S = 38
+# Параметры быстрого поллинга разведки (TourVisor отдаёт частичные результаты рано).
+_SMART_ALT_POLL_TRIES = 8
+_SMART_ALT_POLL_SLEEP_S = 2
+
+
 class YandexGPTHandler:
     """Обработчик запросов к Yandex GPT с Function Calling (Responses API)"""
 
@@ -1856,6 +1883,14 @@ class YandexGPTHandler:
         # в polling-цикле get_search_status.
         self._budget_floor_meta: Optional[Dict] = None
         self._budget_floor_retry_done: bool = False
+
+        # ── SMART-ALTERNATIVES: разведочный поиск при 0 результатов (1 раз/диалог) ──
+        self._smart_alt_done: bool = False
+        self._smart_alt_remap: Dict[str, str] = {}
+        # True между «предложил альтернативы» и следующим сообщением клиента —
+        # блокирует преждевременный get_search_results в том же ответе.
+        self._smart_alt_awaiting_pick: bool = False
+        self._last_smart_alt: Optional[Dict] = None
 
         # ── P1/P13: Кэш requestid и tourid для валидации ──
         # Предотвращает placeholder hallucination (requestid_egypt, tourid_третьего_варианта)
@@ -2516,6 +2551,224 @@ class YandexGPTHandler:
         )
         stats["reasons"] = reasons
         return tours, stats
+
+    async def _try_smart_alternatives(self, original_request_id: str) -> Optional[Dict]:
+        """SMART-ALTERNATIVES: один разведочный поиск + партиция пула.
+
+        Возвращает структуру с альтернативами для LLM, либо None (тогда
+        вызывающий код падает в штатное меню §5.4 через NoResultsError).
+
+        Запускается ТОЛЬКО из блока 0-результатов get_search_status, ПОСЛЕ
+        каскадов GDS / budget-floor / date-widen и guard-проверок. Делает
+        не более ОДНОГО тарифицируемого search_tours на диалог
+        (флаг self._smart_alt_done выставляет вызывающий код).
+        """
+        base = dict(getattr(self, "_last_full_search_args", {}) or {})
+        if not base.get("country") or not base.get("departure"):
+            return None  # нет базовых параметров — нечего расслаблять
+
+        # ── Бюджет времени: не запускаем разведку, если до wall-clock мало времени ──
+        _started = getattr(self, "_chat_started_at", None)
+        if _started is not None:
+            _spent = time.monotonic() - _started
+            _wall = int(os.getenv("CHAT_WALL_CLOCK_S", "120"))
+            if _spent > (_wall - _SMART_ALT_RESERVE_S):
+                logger.info(
+                    "🔎 SMART-ALT: мало времени до wall-clock (%.0fс потрачено) — fallback в меню",
+                    _spent,
+                )
+                return None
+
+        # ── Снимаем «мягкие» фильтры; фиксируем направление + состав + даты + ПИТАНИЕ ──
+        # Питание (meal) НЕ снимаем: для клиента это обычно реальное требование
+        # («всё включено»), а блокирует поиск чаще бюджет/звёзды/курорт. Так
+        # альтернативы остаются «на тему» (то же питание, ниже звёзды / дороже).
+        probe = dict(base)
+        for _soft in (
+            "price_from", "price_to", "stars", "starsbetter",
+            "regions", "subregions", "directflight", "services", "hideregular",
+            "hotels", "operators", "hotel_types", "onrequest",
+        ):
+            probe.pop(_soft, None)
+
+        # Точечная дата (date_from == date_to) → расширяем окно; диапазон клиента
+        # оставляем как есть (его «мягкость» по датам уже учтена выше date-widen'ом).
+        _df = probe.get("date_from")
+        _dt = probe.get("date_to")
+        if _df and _dt and _df == _dt:
+            try:
+                _nf, _ntp = _compute_date_widen_window(_df)
+                probe["date_from"], probe["date_to"] = _nf, _ntp
+            except Exception:
+                pass
+
+        # Исходные «жёсткие» критерии клиента — для партиции и честных пометок.
+        orig_priceto = self._user_stated_budget or _safe_int(base.get("price_to"), None)
+        orig_stars = _safe_int(self._last_search_params.get("stars"), None)
+
+        try:
+            _probe_rid = await self.tourvisor.search_tours(**probe)
+        except Exception as _e:
+            logger.warning("🔎 SMART-ALT: разведочный search_tours упал: %s", _e)
+            return None
+        if not _probe_rid:
+            return None
+
+        # ── Быстрый поллинг разведки: ранний выход при hotelsfound>=3 (частичный пул ок) ──
+        _status = {}
+        for _ in range(_SMART_ALT_POLL_TRIES):
+            await asyncio.sleep(_SMART_ALT_POLL_SLEEP_S)
+            try:
+                _status = await self.tourvisor.get_search_status(_probe_rid)
+            except Exception as _e:
+                logger.warning("🔎 SMART-ALT: get_search_status упал: %s", _e)
+                break
+            if _status.get("state") == "finished":
+                break
+            if _safe_int(_status.get("hotelsfound"), 0) >= 3:
+                break
+
+        _hf = _safe_int(_status.get("hotelsfound"), 0) or 0
+        if _hf < _SMART_ALT_MIN_HOTELS:
+            logger.info("🔎 SMART-ALT: разведка дала %d отелей (<%d) — fallback в меню",
+                        _hf, _SMART_ALT_MIN_HOTELS)
+            return None
+
+        # ── Забираем пул разведки ──
+        try:
+            _full = await self.tourvisor.get_search_results(
+                request_id=_probe_rid, page=1, per_page=50,
+            )
+        except Exception as _e:
+            logger.warning("🔎 SMART-ALT: get_search_results упал: %s", _e)
+            return None
+        _hotels = (_full.get("result", {}) or {}).get("hotel", []) or []
+        if not _hotels:
+            return None
+
+        # ── Нормализуем пул в плоские записи (берём самый дешёвый тур отеля) ──
+        pool = []
+        for h in _hotels:
+            _tours = (h.get("tours", {}) or {}).get("tour", []) or []
+            _best = None
+            for t in _tours:
+                _p = _safe_int(t.get("price"), None)
+                if _p is None:
+                    continue
+                if _best is None or _p < _safe_int(_best.get("price"), 10 ** 12):
+                    _best = t
+            _hotel_price = _safe_int(h.get("price"), None)
+            _best_price = _safe_int((_best or {}).get("price"), None) if _best else None
+            _candidates = [p for p in (_hotel_price, _best_price) if p is not None]
+            if not _candidates:
+                continue
+            pool.append({
+                "stars": _safe_int(h.get("hotelstars"), 0) or 0,
+                "region": h.get("regionname") or "",
+                "hotelname": h.get("hotelname") or "",
+                "price": min(_candidates),
+                "meal": (_best or {}).get("mealrussian") or "",
+                "flydate": (_best or {}).get("flydate") or "",
+                "nights": _safe_int((_best or {}).get("nights"), None),
+            })
+        if not pool:
+            return None
+        pool.sort(key=lambda x: x["price"])
+
+        # ── Партиция на 1-3 фрейминга ──
+        def _mk(entry, fits):
+            _over = None
+            if orig_priceto:
+                _d = entry["price"] - orig_priceto
+                _over = _d if _d > 0 else None
+            return {
+                "stars": entry["stars"],
+                "meal": entry["meal"],
+                "region": entry["region"],
+                "date": entry["flydate"],
+                "nights": entry["nights"],
+                "price_from": entry["price"],
+                "fits_budget": fits,
+                "over_budget_by": _over,
+            }
+
+        framings, seen = [], set()
+
+        def _add(entry, fits):
+            if entry is None:
+                return
+            key = (entry["stars"], entry["region"], entry["price"])
+            if key in seen:
+                return
+            seen.add(key)
+            framings.append(_mk(entry, fits))
+
+        cheapest = pool[0]
+        # «Лучшее в бюджет» = максимальная звёздность в рамках бюджета (при равных — дешевле).
+        _in_budget_pool = [e for e in pool if e["price"] <= orig_priceto] if orig_priceto else []
+        in_budget = max(_in_budget_pool, key=lambda e: (e["stars"], -e["price"])) if _in_budget_pool else None
+        # «Категория клиента» = самый дешёвый отель нужной звёздности (может быть дороже бюджета).
+        match_stars = next((e for e in pool if e["stars"] >= orig_stars), None) if orig_stars else None
+
+        # 1) Лучшее в рамках бюджета (если бюджет задан и что-то влезло).
+        if in_budget is not None:
+            _add(in_budget, True)
+        # 2) Категория клиента (если просил звёзды) — возможно дороже бюджета.
+        if match_stars is not None:
+            _add(match_stars, (not orig_priceto) or match_stars["price"] <= orig_priceto)
+        # 3) Если нет ни бюджета, ни звёзд — стартуем с самого дешёвого доступного.
+        if not framings:
+            _add(cheapest, (not orig_priceto) or cheapest["price"] <= orig_priceto)
+        # 4) Добиваем до 2 РАЗНЫХ вариантов из пула (реальный выбор клиенту).
+        for e in pool:
+            if len(framings) >= 2:
+                break
+            _add(e, (not orig_priceto) or e["price"] <= orig_priceto)
+
+        framings = framings[:_SMART_ALT_MAX_FRAMINGS]
+        if not framings:
+            return None
+
+        # ── Remap: старый requestid → разведочный (если LLM позовёт старый id) ──
+        if not hasattr(self, "_smart_alt_remap"):
+            self._smart_alt_remap = {}
+        self._smart_alt_remap[str(original_request_id)] = str(_probe_rid)
+        if self._last_requestid:
+            self._smart_alt_remap[str(self._last_requestid)] = str(_probe_rid)
+        self._last_requestid = str(_probe_rid)
+
+        logger.info(
+            "🔎 SMART-ALT SUCCESS: probe_rid=%s pool=%d framings=%d orig_priceto=%s orig_stars=%s",
+            _probe_rid, len(pool), len(framings), orig_priceto, orig_stars,
+        )
+
+        # Флаг: ждём выбор клиента. Блокирует преждевременный get_search_results
+        # в ЭТОМ же ответе (см. guard в get_search_results). Сбрасывается в chat()
+        # при следующем сообщении клиента.
+        self._smart_alt_awaiting_pick = True
+
+        _hint = (
+            "SMART-ALTERNATIVES: под ТОЧНЫЕ критерии клиента туров нет, но разведка нашла "
+            "реальные варианты на то же направление, состав и питание. Действуй как живой "
+            "менеджер ТЕКСТОМ: (1) коротко скажи, что точно под исходные параметры ничего "
+            "не нашлось; (2) предложи альтернативы ниже КОНКРЕТНЫМИ цифрами (звёзды, питание, "
+            "курорт, дата, цена «от N ₽»), ЯВНО указав ЧТО изменено (напр. «4★ вместо 5★» или "
+            "«дороже бюджета на X ₽»); (3) задай РОВНО ОДИН вопрос (показать вариант 1 / поднять "
+            "категорию / поднять бюджет). "
+            "⛔ ЗАПРЕЩЕНО в ЭТОМ ответе вызывать get_search_results и показывать карточки — "
+            "сначала ТОЛЬКО текст с альтернативами и один вопрос. "
+            f"ТОЛЬКО ПОСЛЕ ответа клиента вызови get_search_results(requestid={_probe_rid}). "
+            "Нумерованное меню вариантов НЕ показывай."
+        )
+
+        return {
+            "state": "alternatives",
+            "hotelsfound": 0,
+            "toursfound": 0,
+            "smart_alternatives": framings,
+            "discovery_requestid": str(_probe_rid),
+            "_hint": _hint,
+        }
 
     def _load_system_prompt(self) -> str:
         """Load unified system prompt with per-tenant personalization.
@@ -3649,6 +3902,7 @@ class YandexGPTHandler:
             self._gds_retry_done = False  # сбрасываем флаг: каждый новый search_tours имеет право на 1 retry
             self._budget_floor_retry_done = False  # каждый новый search_tours имеет право на 1 retry BUDGET-FLOOR
             self._date_widen_retry_done = False  # каждый новый search_tours имеет право на 1 retry DATE-WIDEN
+            self._smart_alt_done = False  # каждый новый search_tours имеет право на 1 разведочный SMART-ALT
 
             request_id = await self.tourvisor.search_tours(**_tv_kwargs)
             
@@ -4092,6 +4346,41 @@ class YandexGPTHandler:
                                 "Повтори search_tours БЕЗ параметра hideregular или с hideregular=0."
                             )
 
+                        # ════════════════════════════════════════════════
+                        # SMART-ALTERNATIVES — последняя ступень ПЕРЕД меню.
+                        # Один разведочный поиск + конкретные альтернативы.
+                        # Guard: kill-switch; специфичные хинты (отель+meal /
+                        # hideregular) имеют приоритет; «ближайший вылет» до
+                        # попытки 3 (своя прогрессивная логика); один раз/диалог.
+                        # ════════════════════════════════════════════════
+                        _is_nearest_sa = self._last_search_params.get("_is_nearest")
+                        if (
+                            _SMART_ALT_ENABLED
+                            and not _hotel_hint
+                            and not _hideregular_hint
+                            and not getattr(self, "_smart_alt_done", False)
+                            and not (_is_nearest_sa and self._nearest_search_attempt < 3)
+                        ):
+                            self._smart_alt_done = True
+                            try:
+                                _sa_payload = await self._try_smart_alternatives(request_id)
+                            except Exception as _sae:
+                                logger.warning(
+                                    "🔎 SMART-ALT: неожиданная ошибка — fallback в меню: %s",
+                                    _sae, exc_info=True,
+                                )
+                                _sa_payload = None
+                            if _sa_payload:
+                                self._last_smart_alt = _sa_payload  # для аналитики/тестов
+                                self._last_search_result = {
+                                    "requestid": _sa_payload.get("discovery_requestid", request_id),
+                                    "hotels_found": 0,
+                                    "tours_found": 0,
+                                    "min_price": None,
+                                    "duration_ms": elapsed * 1000,
+                                }
+                                return _sa_payload
+
                         # ── Interactive options hint (§5.4) — only when no specific hints ──
                         _cascade_hint = ""
                         if not _hotel_hint and not _hideregular_hint:
@@ -4294,6 +4583,36 @@ class YandexGPTHandler:
                     _cur_rid, _dw_remap[_cur_rid],
                 )
                 args["requestid"] = _dw_remap[_cur_rid]
+
+            # ── SMART-ALT GUARD: запрет преждевременного показа карточек ──
+            # Если альтернативы только что предложены и клиент ещё НЕ выбрал
+            # (тот же ход диалога) — не отдаём карточки, заставляем сперва
+            # спросить. Сбрасывается в chat() при следующем сообщении клиента.
+            _sa_remap = getattr(self, "_smart_alt_remap", {})
+            _sa_rid_in = str(args.get("requestid", ""))
+            if getattr(self, "_smart_alt_awaiting_pick", False) and (
+                _sa_rid_in in _sa_remap or _sa_rid_in in set(_sa_remap.values())
+            ):
+                logger.info("🔎 SMART-ALT GUARD: блокирую get_search_results до выбора клиента")
+                return {
+                    "hotels_found": 0, "tours_found": 0, "hotels": [],
+                    "_hint": (
+                        "⛔ СНАЧАЛА предложи клиенту альтернативы ТЕКСТОМ (конкретные цифры) "
+                        "и задай ОДИН вопрос. get_search_results вызывай ТОЛЬКО ПОСЛЕ того, "
+                        "как клиент выберет вариант. Карточки сейчас не показывай."
+                    ),
+                }
+
+            # ── SMART-ALT REMAP: исходный requestid (0 результатов) → разведочный
+            # requestid (см. SMART-ALTERNATIVES в get_search_status). Если LLM
+            # после показа альтернатив тянет результаты по старому id — подменяем. ──
+            _sa_rid = str(args.get("requestid", ""))
+            if _sa_rid in _sa_remap and _sa_rid != _sa_remap[_sa_rid]:
+                logger.info(
+                    "🔎 SMART-ALT REMAP: get_search_results requestid %s → %s",
+                    _sa_rid, _sa_remap[_sa_rid],
+                )
+                args["requestid"] = _sa_remap[_sa_rid]
             
             _pool_size = 30 if self._ideal_datefrom else 10
             _actual_per_page = max(int(args.get("onpage", _pool_size)), _pool_size)
@@ -6806,6 +7125,8 @@ class YandexGPTHandler:
         # Сбрасываем tour_cards перед каждым новым сообщением
         self._pending_tour_cards = []
         self._last_message_usage = None
+        # Новое сообщение клиента → снимаем блокировку показа карточек после smart-alt.
+        self._smart_alt_awaiting_pick = False
         
         # Инкрементируем счётчик сообщений
         self._metrics["total_messages"] += 1
@@ -6825,6 +7146,7 @@ class YandexGPTHandler:
         max_iterations = 15
         iteration = 0
         chat_start = time.perf_counter()
+        self._chat_started_at = time.monotonic()  # для time-budget разведки SMART-ALT
         empty_retries = 0
         
         while iteration < max_iterations:
