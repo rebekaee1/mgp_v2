@@ -329,7 +329,11 @@ class OpenAIHandler(YandexGPTHandler):
             (r'(?:без\s*детей)', "без детей"),
         ],
         "Возраст ребёнка": [
-            (r'^(\d{1,2})$', None),
+            # Только ЯВНЫЙ возраст ("7 лет", "5 годика"). Голое число НЕ ловим
+            # здесь — оно может быть ночами/составом/выбором карточки. Голое
+            # число обрабатывается контекстно в _update_collected_slots (только
+            # если ассистент ТОЛЬКО ЧТО спросил про возраст).
+            (r'(\d{1,2})\s*(?:лет|год|годик)', None),
         ],
         "Питание": [
             (r'(?:вс[её]\s*включен|all\s*inclusive|олл\s*инклюзив)', "всё включено"),
@@ -434,6 +438,18 @@ class OpenAIHandler(YandexGPTHandler):
                 self._collected_slots["Звёздность"] = "любая"
             elif any(w in last_assistant for w in ("питани", "meal")):
                 self._collected_slots["Питание"] = "любое"
+
+        # Голое число → возраст ребёнка ТОЛЬКО если ассистент только что спросил
+        # про возраст (иначе «3» = 3 ночи / выбор карточки / состав — НЕ возраст).
+        # Защита от бага «клиент ответил "3" на вопрос о ночах → Возраст ребёнка: 3».
+        if re.match(r'^\d{1,2}$', text) and "Возраст ребёнка" not in self._collected_slots:
+            _last_a = ""
+            for msg in reversed(self.full_history):
+                if msg.get("role") == "assistant" and msg.get("content"):
+                    _last_a = msg["content"].lower()
+                    break
+            if any(w in _last_a for w in ("возраст", "сколько лет", "лет ребён", "ребёнку лет", "возраста ребён")):
+                self._collected_slots["Возраст ребёнка"] = f"{text} лет"
 
         # Авто-заполнение звёздности при обнаружении отеля/бренда
         if "Отель" in self._collected_slots and "Звёздность" not in self._collected_slots:
@@ -1322,21 +1338,19 @@ class OpenAIHandler(YandexGPTHandler):
                 _WARNING_HARD = 96
 
                 if _hist_len >= _WARNING_HARD and self._context_warning_stage < 2:
-                    summary = self._build_context_summary()
                     _phone = self._get_manager_phone()
-                    warning = (
+                    # NB: авто-сводку параметров клиенту НЕ показываем — она
+                    # собиралась эвристикой и могла содержать неверные данные
+                    # (напр. «Возраст ребёнка: 3», когда ребёнку 7). Менеджер
+                    # получит полный контекст из лида. Клиенту — только чистый
+                    # запрос контакта.
+                    final_text += (
                         "\n\n---\n"
                         "Диалог получился длинным. Давайте передам ваши контакты "
                         "менеджеру — он перезвонит и завершит подбор лично. "
                         "Оставьте имя и телефон, пожалуйста. "
                         f"Или позвоните сами: {_phone}."
                     )
-                    if summary:
-                        warning += (
-                            "\nВот данные из нашего разговора, чтобы не пришлось повторять:\n"
-                            + summary
-                        )
-                    final_text += warning
                     self._context_warning_stage = 2
                     logger.info(
                         "⚠️ CONTEXT-WARNING stage=2 (hard)  history=%d",
@@ -1458,6 +1472,7 @@ class OpenAIHandler(YandexGPTHandler):
         self._shown_flight_signatures = {}
         self._last_search_params = {}
         self._user_stated_budget = None
+        self._upsell_budget = None
         self._empty_iterations = 0
         self.previous_response_id = None
         self._pending_api_calls = []

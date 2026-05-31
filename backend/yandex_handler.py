@@ -169,6 +169,29 @@ _BUDGET_FLOOR_MIN_PRICETO_RUB = 30_000
 # Глобальный feature-flag (быстрый откат: поставить False).
 _BUDGET_FLOOR_DEFAULT_ON = True
 
+# ════════════════════════════════════════════════════════════════════════════
+# UPSELL-ВИЛКА (идея Павла: «предлагать чуть дороже, но заметно лучше»)
+# Когда клиент задал бюджет и туры ЕСТЬ — расширяем верхнюю границу поиска до
+# budget×(1+headroom) и в выдаче показываем 1 карточку «чуть дороже, но лучше»
+# (выше звёздность/рейтинг) рядом с вариантами в бюджет. Работает ТОЛЬКО при
+# заданном бюджете; без бюджета — обычная выдача. Быстрый откат: UPSELL_ENABLED=0.
+# ════════════════════════════════════════════════════════════════════════════
+_UPSELL_ENABLED = os.getenv("UPSELL_ENABLED", "1").lower() not in ("0", "false", "no", "off")
+# Насколько максимум поднимаем потолок поиска над бюджетом (Павел: до +30%).
+_UPSELL_HEADROOM = float(os.getenv("UPSELL_HEADROOM", "0.30"))
+# Ниже этого бюджета апселл НЕ делаем (Павел: «не применять до 100к» —
+# дешёвый сегмент не окупается, его не раздуваем и не «греем» сильнее).
+_UPSELL_MIN_PRICETO_RUB = int(os.getenv("UPSELL_MIN_PRICETO", "100000"))
+# Позиция (1-based) апселл-карточки в видимой выдаче (3 = последняя видимая для MAX).
+_UPSELL_VISIBLE_POS = int(os.getenv("UPSELL_VISIBLE_POS", "3"))
+# Апселлим ТОЛЬКО при РЕАЛЬНОМ апгрейде над лучшим доступным в бюджет вариантом
+# (идея Павла «чуть дороже, но СИЛЬНО лучше»). При равной звёздности — нужен скачок
+# рейтинга минимум на столько (иначе «+6% без причины» — кейс Уфа/msk200).
+_UPSELL_MIN_RATING_DELTA = float(os.getenv("UPSELL_MIN_RATING_DELTA", "0.3"))
+# Апгрейд по звёздам (4★→5★) считаем апселлом, только если рейтинг не проседает
+# больше чем на столько (не толкаем 5★ с плохими отзывами вместо хорошего 4★).
+_UPSELL_STAR_UP_RATING_TOL = float(os.getenv("UPSELL_STAR_UP_RATING_TOL", "0.5"))
+
 # Skip-фразы: «без ограничения / любой / не важен / на ваше усмотрение / сколько угодно».
 # Если найдено в последних user-сообщениях — floor НЕ применяется.
 # Поддерживаем оба порядка: «любой бюджет» и «бюджет любой».
@@ -1905,6 +1928,7 @@ class YandexGPTHandler:
         # и используется как fallback для пропущенных параметров.
         self._last_search_params: Dict = {}
         self._user_stated_budget: Optional[int] = None
+        self._upsell_budget: Optional[int] = None  # UPSELL-вилка: исходный бюджет клиента
         self._russia_no_region_hint: bool = False
         self._original_requested_meal: Optional[int] = None
         self._regions_resolved_via_dict: bool = False
@@ -2036,6 +2060,134 @@ class YandexGPTHandler:
             "💰 BUDGET-FLOOR v2 stage=1: pricefrom=%s, priceto=%s (ratio=%.2f, window=%s)",
             _floor, _orig_priceto, _BUDGET_FLOOR_RATIO, _orig_priceto - _floor,
         )
+
+    def _apply_upsell_ceiling(self, args: Dict, orig_priceto: int) -> None:
+        """UPSELL-ВИЛКА: расширяем верхнюю границу поиска до budget×(1+headroom).
+
+        Вызывается в search_tours ПОСЛЕ budget-floor (тот уже посчитал
+        ``pricefrom`` от исходного бюджета) и ДО сборки _tv_kwargs. Запоминает
+        исходный бюджет клиента в ``self._upsell_budget`` — по нему позже
+        партиционируем выдачу (в бюджет / чуть дороже). Мутирует ``args``.
+
+        НЕ применяется: при выключенном флаге, без бюджета, на дешёвом сегменте,
+        при поиске конкретного отеля (hotels=...) — там клиент уже выбрал.
+        """
+        self._upsell_budget = None
+        if not _UPSELL_ENABLED:
+            return
+        if not orig_priceto or orig_priceto < _UPSELL_MIN_PRICETO_RUB:
+            return
+        if args.get("hotels"):
+            return
+        B = int(orig_priceto)
+        new_ceiling = int(round(B * (1 + _UPSELL_HEADROOM)))
+        cur = _safe_int(args.get("priceto"), 0) or 0
+        if new_ceiling > cur:
+            args["priceto"] = new_ceiling
+        self._upsell_budget = B
+        logger.info(
+            "⬆️ UPSELL CEILING: budget=%d → search priceto=%d (+%.0f%%)",
+            B, args.get("priceto"), _UPSELL_HEADROOM * 100,
+        )
+
+    def _inject_upsell_card(self, selected, scored_hotels, seen_idx):
+        """Гарантируем 1 карточку «чуть дороже, но лучше» в видимой выдаче.
+
+        ``selected`` — list[(rel_score, price, entry)], выбранные для показа.
+        ``scored_hotels`` — полный отсортированный список тех же кортежей.
+        ``seen_idx`` — set индексов уже выбранных (обновляем, чтобы апселл-отель
+        не задвоился в _remaining).
+
+        Возвращает meta (позиция карточки, цена, на сколько дороже, причины),
+        либо None — если апселлить нечем (нет вариантов в бюджет ИЛИ выше бюджета).
+        Мутирует ``selected`` на месте (ставит апселл-отель на _UPSELL_VISIBLE_POS).
+        """
+        B = getattr(self, "_upsell_budget", None)
+        if not B or not selected:
+            return None
+        headroom = int(round(B * (1 + _UPSELL_HEADROOM)))
+        above = [it for it in scored_hotels if B < (it[1] or 0) <= headroom]
+        if not above:
+            return None
+
+        # ── ЯКОРЬ = лучший доступный В БЮДЖЕТ вариант во ВСЁМ пуле ──────────
+        # Апселлить к тому, что ХУЖЕ уже доступного в бюджет — бессмысленно
+        # (реальный кейс Уфа: в бюджет есть 5★, а выше бюджета только 4★ →
+        # «чуть дороже» = downgrade). Сравниваем именно с лучшим доступным.
+        in_budget_all = [it for it in scored_hotels if 0 < (it[1] or 0) <= B]
+        if not in_budget_all:
+            return None  # всё дороже бюджета — отработает обычное предупреждение
+
+        def _q(it):
+            e = it[2]
+            return (_safe_int(e.get("hotelstars"), 0), _safe_float(e.get("hotelrating"), 0))
+
+        anchor = max(in_budget_all, key=_q)
+        a_stars, a_rating = _q(anchor)
+
+        # ── РЕАЛЬНЫЙ апгрейд над якорем (идея Павла «СИЛЬНО лучше») ─────────
+        def _is_upgrade(it):
+            s, r = _q(it)
+            # выше по звёздам (и рейтинг не проседает сильно)
+            if s > a_stars and r >= a_rating - _UPSELL_STAR_UP_RATING_TOL:
+                return True
+            # та же звёздность, но заметно выше рейтинг
+            if s == a_stars and r >= a_rating + _UPSELL_MIN_RATING_DELTA:
+                return True
+            return False
+
+        eligible = [it for it in above if _is_upgrade(it)]
+        if not eligible:
+            # Нет РЕАЛЬНОГО апгрейда выше бюджета → НЕ навязываем «чуть дороже».
+            # Лучше работать с вариантами в бюджет (см. §10.1).
+            logger.info(
+                "💡 UPSELL SKIP: нет реального апгрейда выше бюджета=%d "
+                "(якорь %d★ r%.1f, кандидатов выше=%d)",
+                B, a_stars, a_rating, len(above),
+            )
+            return None
+
+        # Среди реальных апгрейдов: лучшее качество, при равном — ДОРОЖЕ
+        # (вариант B Павла: целимся выше, ближе к потолку).
+        def _pick(it):
+            s, r = _q(it)
+            return (s, r, (it[1] or 0))
+
+        best_up = max(eligible, key=_pick)
+
+        _au, _bu = anchor[2], best_up[2]
+        reasons = []
+        _bs, _as = _safe_int(_bu.get("hotelstars"), 0), _safe_int(_au.get("hotelstars"), 0)
+        if _bs > _as:
+            reasons.append(f"{_bs}★ вместо {_as}★")
+        _br, _ar = _safe_float(_bu.get("hotelrating"), 0), _safe_float(_au.get("hotelrating"), 0)
+        if _br and _br >= _ar + 0.2:
+            reasons.append(f"выше рейтинг ({_br})")
+        if not reasons:
+            reasons.append("выше уровень отеля")
+        delta = (best_up[1] or 0) - B
+
+        # Обновляем seen_idx, чтобы _remaining не задвоил апселл-отель.
+        for _idx, _it in enumerate(scored_hotels):
+            if _it is best_up:
+                seen_idx.add(_idx)
+                break
+
+        new_order = [it for it in selected if it is not best_up]
+        insert_idx = min(_UPSELL_VISIBLE_POS - 1, len(new_order))
+        new_order.insert(insert_idx, best_up)
+        selected[:] = new_order
+        logger.info(
+            "💡 UPSELL CARD: pos=%d price=%d (+%d over budget=%d) reasons=%s",
+            insert_idx + 1, best_up[1] or 0, delta, B, reasons,
+        )
+        return {
+            "position": insert_idx + 1,
+            "price": best_up[1] or 0,
+            "over_budget_by": delta,
+            "reasons": reasons,
+            "hotelname": _bu.get("hotelname"),
+        }
 
     def _normalize_child_args(self, args: Dict) -> None:
         """CHILD-GUARDRAIL — защита от «фантомного ребёнка» и лишних возрастов.
@@ -3651,7 +3803,12 @@ class YandexGPTHandler:
             # BUDGET-FLOOR v2 (default-on, fix/budget-upper-floor-v2):
             # Полная логика вынесена в метод _apply_budget_floor_v2 для тестируемости.
             # Откат: верни _BUDGET_FLOOR_DEFAULT_ON=False (module-level).
+            # NB: фиксируем исходный бюджет клиента ДО budget-floor — он нужен
+            # для UPSELL-вилки (расширяем потолок над исходным бюджетом).
+            _upsell_orig_priceto = _safe_int(args.get("priceto"), 0) or 0
             self._apply_budget_floor_v2(args)
+            # UPSELL-вилка: расширяем верхнюю границу поиска до budget×(1+headroom).
+            self._apply_upsell_ceiling(args, _upsell_orig_priceto)
             
             # ── Safety-net: bare "N-M" misinterpreted as dates when it's nights ──
             _df_raw = args.get("datefrom", "")
@@ -3924,7 +4081,9 @@ class YandexGPTHandler:
             if hasattr(self, '_shown_flight_signatures'):
                 self._shown_flight_signatures = {}
             if args.get("priceto"):
-                self._user_stated_budget = int(args["priceto"])
+                # При UPSELL-вилке priceto уже раздут до budget×1.3 — для
+                # предупреждений/партиции храним ИСХОДНЫЙ бюджет клиента.
+                self._user_stated_budget = getattr(self, "_upsell_budget", None) or int(args["priceto"])
             
             # ── Fix C2: Сохраняем параметры успешного поиска в кэш ──
             self._last_search_params = {
@@ -4776,6 +4935,12 @@ class YandexGPTHandler:
                 _tier_counts, len(_scored_hotels)
             )
 
+            # ── UPSELL-вилка: гарантируем 1 карточку «чуть дороже, но лучше» ──
+            # (идея Павла). Только при заданном бюджете и наличии достойного
+            # варианта выше бюджета (в пределах +headroom). seen_idx обновляется
+            # внутри, чтобы апселл-отель не задвоился в _remaining.
+            _upsell_meta = self._inject_upsell_card(_selected, _scored_hotels, _seen_idx)
+
             # ── Пул: первые 5 (tiered) + остальные в порядке сортировки ──
             _remaining = [item for _idx, item in enumerate(_scored_hotels) if _idx not in _seen_idx]
             _full_pool = _selected + _remaining
@@ -4908,6 +5073,20 @@ class YandexGPTHandler:
                     f" Клиент видит {_visible_count} карточек в чате (нумерация 1–{_visible_count}). "
                     f"Когда ссылаешься на конкретный тур — используй ТОЛЬКО эти номера, "
                     f"никогда не пиши «1–5» если показано меньше."
+                )
+
+            # ── UPSELL hint (идея Павла): карточка «чуть дороже, но лучше» ──
+            if _upsell_meta and _upsell_meta.get("position", 0) <= (_visible_count or 0):
+                _pos = _upsell_meta["position"]
+                _why = "; ".join(_upsell_meta.get("reasons") or ["выше уровень"])
+                _over = _upsell_meta.get("over_budget_by", 0)
+                _result_hint += (
+                    f" 💡 АПСЕЛЛ: карточка {_pos} — чуть дороже бюджета клиента "
+                    f"(примерно на +{_over} ₽), но ЗАМЕТНО ЛУЧШЕ: {_why}. "
+                    f"Сначала кратко представь варианты В БЮДЖЕТ (карточки до №{_pos}), "
+                    f"потом ОДНОЙ фразой предложи карточку {_pos}: «а чуть дороже — заметно лучше: {_why}». "
+                    f"Задай РОВНО ОДИН вопрос: показать вариант получше или остаёмся в бюджете? "
+                    f"⛔ НЕ выдавай карточку {_pos} за вариант в бюджет — честно скажи, что она дороже."
                 )
 
             _req_meal_code = _safe_int(self._original_requested_meal, None) or _safe_int(self._last_search_params.get("meal"), None)
@@ -5152,6 +5331,31 @@ class YandexGPTHandler:
             )
             if isinstance(act_result, dict) and not act_result.get("iserror"):
                 self._tour_actualized_id = str(args["tourid"])
+                # ── COMPOSITION-MISMATCH: оператор вернул тариф на меньший состав ──
+                # (классический кейс: клиент с ребёнком, а promo-тариф — на 2 взр.,
+                # child=0 → цена занижена и НЕ за всю семью). Помечаем, чтобы LLM
+                # честно предупредил и не выдавал цену за финальную (см. §10.3).
+                _req_child = _safe_int((self._last_search_params or {}).get("child"), 0) or 0
+                if _req_child > 0:
+                    _act_child = _safe_int(act_result.get("child"), 0) or 0
+                    if _act_child < _req_child:
+                        _act_adults = _safe_int(act_result.get("adults"), 0) or 0
+                        act_result["composition_mismatch"] = {
+                            "requested_child": _req_child,
+                            "actual_child": _act_child,
+                            "actual_adults": _act_adults,
+                            "hint": (
+                                f"⚠️ ВНИМАНИЕ: тариф оператора рассчитан на {_act_adults} взр. "
+                                f"и {_act_child} детей, а клиент указывал {_req_child} ребёнка(детей). "
+                                f"Цена НЕ включает ребёнка и НЕ является финальной на всю семью. "
+                                f"ОБЯЗАТЕЛЬНО предупреди клиента (см. §10.3) и предложи передать "
+                                f"менеджеру для точного пересчёта с ребёнком."
+                            ),
+                        }
+                        logger.warning(
+                            "👶 COMPOSITION-MISMATCH: requested child=%d, actual child=%d (adults=%d) tourid=%s",
+                            _req_child, _act_child, _act_adults, args["tourid"],
+                        )
             return act_result
         
         elif name == "get_tour_details":
