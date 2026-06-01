@@ -1959,12 +1959,18 @@ class YandexGPTHandler:
         self._original_requested_meal: Optional[int] = None
         self._regions_resolved_via_dict: bool = False
         
-        # ── CRM ── провайдер выбирается per-tenant: "uon" (по умолчанию) | "moidoc"
+        # ── CRM ── провайдер выбирается per-tenant:
+        #   "uon" (по умолчанию) | "moidoc" | "none"/прочее = CRM ОТКЛЮЧЁН.
+        # Отключённый CRM не пишет во внешнюю систему вообще. Это защищает от
+        # утечки лидов тенанта без собственного ключа в общий U-ON-аккаунт
+        # (когда сработал бы глобальный UON_API_KEY). Доставка лида в Telegram
+        # — независимый канал и продолжает работать при отключённом CRM.
         from uon_client import UONClient
         self.uon_client = UONClient(runtime_config=runtime_config)
         self._crm_provider = (
             getattr(runtime_config, "crm_provider", None) or "uon"
         ).strip().lower()
+        self._crm_enabled = self._crm_provider in ("uon", "moidoc")
         self.moidoc_client = None
         if self._crm_provider == "moidoc":
             from moidoc_client import MoiDocumentiClient
@@ -7009,6 +7015,9 @@ class YandexGPTHandler:
         Если задано, добавляется первым сегментом в note, чтобы менеджер
         сразу видел суть запроса даже без контекста поиска.
         """
+        if not getattr(self, "_crm_enabled", True):
+            logger.info("CRM disabled (provider=%s) — lead write skipped", self._crm_provider)
+            return {"ok": False, "skipped": "crm_disabled"}
         parts = []
         if llm_comment:
             parts.append(f"Запрос клиента: {llm_comment}")
@@ -7049,6 +7058,9 @@ class YandexGPTHandler:
         llm_comment — краткое описание запроса клиента от LLM (из tool args).
         Если задано, добавляется первым сегментом в note.
         """
+        if not getattr(self, "_crm_enabled", True):
+            logger.info("CRM disabled (provider=%s) — request write skipped", self._crm_provider)
+            return {"ok": False, "skipped": "crm_disabled"}
         parts = []
         if llm_comment:
             parts.append(f"Запрос клиента: {llm_comment}")
