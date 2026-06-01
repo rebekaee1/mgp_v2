@@ -1839,6 +1839,32 @@ _SMART_ALT_RESERVE_S = 38
 _SMART_ALT_POLL_TRIES = 8
 _SMART_ALT_POLL_SLEEP_S = 2
 
+# ──────────────────────────────────────────────────────────────────────────────
+# LEAD-SUMMARY SMART CARDS — согласованный выбор карточек для Telegram-заявки.
+# Якорит сводку на «фокусном» туре (тот, что клиент явно выбрал tourid в
+# комментарии ИЛИ актуализировал), а «Показанные варианты» берёт по той же
+# стране и по СВЕЖЕСТИ — вместо первых попавшихся из накопленного кэша (которые
+# могут быть старыми горящими турами совсем другого направления, см. кейс
+# Ринат: запрос Египет, а в варианты попали Россия/Абхазия).
+#
+# ⚠️ ВКЛЮЧЕНО ТОЛЬКО ДЛЯ ПАВЛА (Anytour). Бэкенд общий для всех тенантов,
+# поэтому скоупим по whitelist (slug + assistant_id) — как _STATUS_LOOKUP_* и
+# _OFFICES_LOOKUP_*. Для остальных тенантов поведение НЕ меняется (legacy:
+# первые 3 из кэша + «Выбранный тур» только по tourid из комментария).
+#
+# Двойной откат:
+#   1) LEAD_SUMMARY_SMART_CARDS=false — мастер-выключатель (без передеплоя), ИЛИ
+#   2) убрать тенанта из whitelist ниже.
+_LEAD_SUMMARY_SMART_CARDS = os.getenv(
+    "LEAD_SUMMARY_SMART_CARDS", "true"
+).strip().lower() in ("1", "true", "yes", "on")
+_LEAD_SUMMARY_SMART_CARDS_ALLOWED_SLUGS = {
+    "anytour-pyatkoff",          # Anytour (Павел Пятков) — пилот
+}
+_LEAD_SUMMARY_SMART_CARDS_ALLOWED_ASSISTANT_IDS = {
+    "64fea0d3-2605-4c4c-be67-62258ebfa7a9",  # Прод: Anytour AI Assistant (MAX-канал)
+}
+
 
 class YandexGPTHandler:
     """Обработчик запросов к Yandex GPT с Function Calling (Responses API)"""
@@ -2600,6 +2626,22 @@ class YandexGPTHandler:
         return (
             slug in _OFFICES_LOOKUP_ALLOWED_SLUGS
             or assistant_id in _OFFICES_LOOKUP_ALLOWED_ASSISTANT_IDS
+        )
+
+    def _lead_summary_smart_enabled(self) -> bool:
+        """Smart card-selection в Telegram-заявке (см. _build_lead_summary_text).
+
+        Включён ТОЛЬКО для тенантов из whitelist (сейчас — Павел/Anytour) И при
+        включённом мастер-флаге LEAD_SUMMARY_SMART_CARDS. Для остальных тенантов
+        возвращает False → прежнее (legacy) поведение сводки.
+        """
+        if not _LEAD_SUMMARY_SMART_CARDS:
+            return False
+        slug = (getattr(self.runtime_config, "company_slug", None) or "").strip().lower()
+        assistant_id = (getattr(self.runtime_config, "assistant_id", None) or "").strip().lower()
+        return (
+            slug in _LEAD_SUMMARY_SMART_CARDS_ALLOWED_SLUGS
+            or assistant_id in _LEAD_SUMMARY_SMART_CARDS_ALLOWED_ASSISTANT_IDS
         )
     
     def _apply_tenant_search_filters(self, args: dict) -> None:
@@ -6493,6 +6535,17 @@ class YandexGPTHandler:
         """
         out: List[str] = []
 
+        # Focus tour (F): the single tour the client actually settled on, if any.
+        # Priority: explicit ``tourid=`` in the LLM comment → the actualized tour
+        # (``_tour_actualized_id``). Anchors the whole summary so гео, «Показанные
+        # варианты» и «Выбранный тур» остаются согласованными по контексту, а не
+        # берут самые старые карточки из накопленного кэша (которые могут быть
+        # горящими турами совсем другого направления). Включено ТОЛЬКО для
+        # whitelist-тенантов (Павел/Anytour) — см. _lead_summary_smart_enabled().
+        _smart = self._lead_summary_smart_enabled()
+        cache_vals = list((getattr(self, "_booking_cards_cache", None) or {}).values())
+        focus = self._resolve_focus_card(llm_comment) if _smart else None
+
         # 1) LLM-summarized client request. Strip the "[Канал: …]" prefix that
         # _handle_submit_client_request prepends — the destination chat already
         # implies the channel, and the marker eats screen space in TG.
@@ -6509,14 +6562,18 @@ class YandexGPTHandler:
         sp = getattr(self, "_last_search_params", None) or {}
         if sp:
             bits: List[str] = []
-            # Country/resort: prefer human-readable names from the last shown
-            # tour cards over numeric Tourvisor IDs.
-            cards_dict = getattr(self, "_booking_cards_cache", None) or {}
-            sample = next(iter(cards_dict.values()), None) if cards_dict else None
-            if sample and sample.get("country"):
-                geo = sample["country"]
-                if sample.get("resort") and sample["resort"] != geo:
-                    geo += f", {sample['resort']}"
+            # Country/resort: prefer human-readable names from the tour cards
+            # over numeric Tourvisor IDs. Smart mode anchors on the focus tour
+            # (or the most-recently shown card); legacy mode used the FIRST
+            # cached card (could be a stale earlier-direction hot tour).
+            if _smart:
+                geo_card = focus or (cache_vals[-1] if cache_vals else None)
+            else:
+                geo_card = cache_vals[0] if cache_vals else None
+            if geo_card and geo_card.get("country"):
+                geo = geo_card["country"]
+                if geo_card.get("resort") and geo_card["resort"] != geo:
+                    geo += f", {geo_card['resort']}"
                 bits.append(geo)
             df, dt = sp.get("datefrom"), sp.get("dateto")
             if df:
@@ -6541,9 +6598,33 @@ class YandexGPTHandler:
             if bits:
                 out.append("Параметры: " + "; ".join(bits))
 
-        # 3) Top-3 last shown variants — gives the manager an immediate idea
-        # of which segment of the market the assistant pitched.
-        cards = list((getattr(self, "_booking_cards_cache", None) or {}).values())[:3]
+        # 3) Shown variants — gives the manager an immediate idea of which
+        # segment the assistant pitched.
+        #   • Smart mode + focus tour → show ONLY same-country alternatives
+        #     (excluding the chosen one, which goes to «Выбранный тур»), newest
+        #     first — keeps the list coherent with the request (no Россия/
+        #     Абхазия under an Египет request). If there were no other same-
+        #     country variants, the block is skipped (covered by «Выбранный тур»).
+        #   • Smart mode, no focus → the MOST RECENTLY shown cards (the actual
+        #     selection the client last saw), not the oldest in the cache.
+        #   • Legacy mode → first 3 from the cache (previous behaviour).
+        if _smart:
+            if focus is not None:
+                f_country = (focus.get("country") or "").strip()
+                f_id = str(focus.get("id") or focus.get("tourid") or "")
+                if f_country:
+                    same = [
+                        c for c in cache_vals
+                        if (c.get("country") or "").strip() == f_country
+                        and str(c.get("id") or c.get("tourid") or "") != f_id
+                    ]
+                else:
+                    same = []
+                cards = list(reversed(same))[:3]
+            else:
+                cards = list(reversed(cache_vals))[:3]
+        else:
+            cards = cache_vals[:3]
         if cards:
             out.append("")
             out.append("Показанные варианты:")
@@ -6565,12 +6646,12 @@ class YandexGPTHandler:
                     line += f" — {price_str}"
                 out.append(line)
 
-        # 4) Chosen tour — try to extract a "tourid=NNN" reference from the
-        # LLM's comment and resolve it against the booking-cards cache. The
-        # widget-side "submit_client_request" flow doesn't currently take a
-        # tourid argument, so we have to text-mine it. If found, surface the
-        # full card so the manager doesn't have to re-search.
-        chosen_card = self._resolve_chosen_card_from_comment(llm_comment)
+        # 4) Chosen tour. Smart mode: the focus tour (explicit tourid in the
+        # comment → actualized tour), so the manager sees the exact tour even
+        # when the model didn't embed tourid in its comment (the common Anytour
+        # case — client confirms «этот»/«да» and leaves a phone). Legacy mode:
+        # only the comment-tourid card.
+        chosen_card = focus if _smart else self._resolve_chosen_card_from_comment(llm_comment)
         if chosen_card:
             out.append("")
             out.append("Выбранный тур:")
@@ -6608,11 +6689,41 @@ class YandexGPTHandler:
 
         return "\n".join(out).strip()
 
+    def _resolve_focus_card(self, llm_comment: str = "") -> Optional[dict]:
+        """The single tour the client settled on, if any — the anchor for the
+        Telegram lead summary.
+
+        Priority:
+          1. explicit ``tourid=`` embedded in the LLM comment (manager-facing
+             choice the model recorded);
+          2. the tour the client asked to actualize (``_tour_actualized_id``) —
+             the strongest implicit «я выбрал этот тур» signal even when the
+             model didn't write the tourid into its comment.
+        Returns ``None`` when the client only browsed a selection without
+        settling on one tour (then the summary stays in «подборка» mode).
+        """
+        card = self._resolve_chosen_card_from_comment(llm_comment)
+        if card:
+            return card
+        act_tid = getattr(self, "_tour_actualized_id", None)
+        if act_tid:
+            cache = getattr(self, "_booking_cards_cache", None) or {}
+            return cache.get(str(act_tid)) or cache.get(act_tid)
+        return None
+
     def _resolve_chosen_card_link(self, comment: str) -> str:
         """Return the rendered booking URL for the tour the client picked,
         or empty string if no tour was explicitly referenced. Used by the
-        Telegram lead path so the manager gets a one-click verify link."""
-        card = self._resolve_chosen_card_from_comment(comment)
+        Telegram lead path so the manager gets a one-click verify link.
+
+        Smart mode (whitelist-тенанты, см. _lead_summary_smart_enabled): falls
+        back to the actualized tour when the comment carries no ``tourid=`` —
+        keeps the link aligned with «Выбранный тур». Legacy mode: comment-tourid
+        only."""
+        if self._lead_summary_smart_enabled():
+            card = self._resolve_focus_card(comment)
+        else:
+            card = self._resolve_chosen_card_from_comment(comment)
         return (card.get("hotel_link") or "") if card else ""
 
     def _resolve_chosen_card_from_comment(self, comment: str) -> Optional[dict]:
