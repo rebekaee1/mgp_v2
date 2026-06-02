@@ -1,0 +1,9 @@
+# Re-outreach (Feature 1) — never commit runtime data / secrets / PII
+*.sqlite
+*.sqlite-*
+*.json
+*.log
+.secrets*
+.env
+__pycache__/
+*.pyc

@@ -352,6 +352,8 @@ def _restore_handler_from_db(handler, session_id: str, assistant_id: str = None)
 
             restored_history = []
             latest_tour_cards = None
+            card_batches = []  # every card-bearing batch in order — lets us keep
+            # EARLIER подборки referenceable ("те, что показывали ранее")
             for msg in messages:
                 if msg.role not in ("user", "assistant", "tool"):
                     continue
@@ -370,6 +372,7 @@ def _restore_handler_from_db(handler, session_id: str, assistant_id: str = None)
                 restored_history.append(entry)
                 if msg.tour_cards:
                     latest_tour_cards = list(msg.tour_cards)
+                    card_batches.append(list(msg.tour_cards))
 
             if not restored_history:
                 return False
@@ -488,6 +491,40 @@ def _restore_handler_from_db(handler, session_id: str, assistant_id: str = None)
                             f"{pos}. {entry.get('hotelname', '?')} "
                             f"(tourid={entry['tourid']}, hotelcode={entry.get('hotelcode', '?')})"
                         )
+                    # ── EARLIER подборки (AnyTour + pilot bot only) ──
+                    # Keep previously-shown hotels referenceable so the client can
+                    # say "те, что показывали ранее" and we re-actualize them by
+                    # name. Additive + tenant-scoped: other tenants are untouched.
+                    _LABELED_PODBORKA_TENANTS = {
+                        "64fea0d3-2605-4c4c-be67-62258ebfa7a9",  # AnyTour
+                        "593471b7-42da-4ae0-8499-904dcedd6a4b",  # mgp-tour (pilot/testing)
+                    }
+                    if (str(getattr(conv, "assistant_id", "")) in _LABELED_PODBORKA_TENANTS
+                            and len(card_batches) >= 2):
+                        current_codes = {str(c.get("hotelcode")) for c in latest_tour_cards
+                                         if c.get("hotelcode")}
+                        seen, prev_lines = set(), []
+                        for batch in card_batches[:-1]:
+                            for card in batch:
+                                code = str(card.get("hotelcode") or "")
+                                name = card.get("hotel_name") or card.get("hotelname") or ""
+                                if not name or not code or code in current_codes or code in seen:
+                                    continue
+                                seen.add(code)
+                                prev_lines.append(f"- {name} (hotelcode={code})")
+                        if prev_lines:
+                            lines.append("")
+                            lines.append("[КОНТЕКСТ: ранее показанные туры — для справки, цены могли измениться]")
+                            lines.extend(prev_lines[:8])
+                            lines.append(
+                                "Если клиент ссылается на ранее показанные/предыдущие варианты — это ИМЕННО "
+                                "отели из списка выше. Чтобы показать их с АКТУАЛЬНЫМИ ценами, вызови "
+                                "search_tours с параметром hotels=<hotelcode этих отелей через запятую> и "
+                                "теми же датами/составом (НЕ делай общий поиск по всем отелям). Если какого-то "
+                                "отеля нет в результатах — значит тура на эти даты больше нет: честно скажи это "
+                                "по конкретному отелю и предложи ближайшие альтернативы. НЕ путай их с номерами "
+                                "текущей подборки."
+                            )
                     handler._pinned_context = "\n".join(lines)
 
             logger.info(
