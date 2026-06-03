@@ -64,13 +64,26 @@ def test_format_meal_uses_description_first():
 
 
 def test_format_pax_declension():
+    # _format_pax now labels the TOTAL party size (adults + children),
+    # so 5+ reads "за N человек" rather than the old adults-only wording.
     assert _format_pax(1) == "за одного"
     assert _format_pax(2) == "за двоих"
     assert _format_pax(3) == "за троих"
     assert _format_pax(4) == "за четверых"
-    assert _format_pax(5) == "за 5 взрослых"
+    assert _format_pax(5) == "за 5 человек"
     assert _format_pax(0) == ""
     assert _format_pax(None) == ""
+
+
+def test_format_composition():
+    from app.renderers import _format_composition
+    assert _format_composition(2, 0) == "2 взрослых"
+    assert _format_composition(1, 0) == "1 взрослый"
+    assert _format_composition(2, 1) == "2 взрослых + 1 ребёнок"
+    assert _format_composition(2, 2) == "2 взрослых + 2 ребёнка"
+    assert _format_composition(1, 3) == "1 взрослый + 3 ребёнка"
+    assert _format_composition(2, 5) == "2 взрослых + 5 детей"
+    assert _format_composition(0, 0) == ""
 
 
 # ── caption ────────────────────────────────────────────────────────────

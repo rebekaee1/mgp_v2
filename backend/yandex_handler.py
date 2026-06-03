@@ -1399,10 +1399,31 @@ def _build_hotel_link(
     return base
 
 
+def _extract_children_from_params(params: Optional[dict]) -> tuple:
+    """Return (children_count, [ages]) from a saved search-params dict.
+
+    Mirrors how the search was actually sent to TourVisor (``child`` +
+    ``childage1..3``) so the tour card can show the real party composition.
+    """
+    p = params or {}
+    children = _safe_int(p.get("child", 0), 0) or 0
+    ages = []
+    for i in (1, 2, 3):
+        raw = p.get(f"childage{i}")
+        if raw in (None, ""):
+            continue
+        age = _safe_int(raw, None)
+        if age is not None:
+            ages.append(age)
+    return children, ages
+
+
 def _map_hotel_to_card(hotel: dict, departure_city: str = "Москва", adults: int = 2,
                        booking_base_url: str = None,
                        booking_url_template: Optional[str] = None,
-                       departure_id: Optional[int] = None) -> dict:
+                       departure_id: Optional[int] = None,
+                       children: int = 0,
+                       child_ages: Optional[list] = None) -> dict:
     """
     Маппинг отеля из get_search_results → формат tour_card для фронтенда.
     Структура совпадает с ожиданиями createTourCardHTML в script.js.
@@ -1455,6 +1476,8 @@ def _map_hotel_to_card(hotel: dict, departure_city: str = "Москва", adults
         "price": tour_price,
         "price_per_person": None,
         "adults": adults,
+        "children": children,
+        "child_ages": child_ages or [],
         "food_type": "",                      # Код питания (для JS fallback)
         "meal_description": meal_desc,        # Русское описание питания
         "room_type": tour.get("room") or "Standard",
@@ -1483,7 +1506,9 @@ _MEAL_CODE_TO_RU = {
 def _map_hot_tour_to_card(tour_data: dict, booking_base_url: str = None,
                           booking_url_template: Optional[str] = None,
                           departure_id: Optional[int] = None,
-                          adults: int = 2) -> dict:
+                          adults: int = 2,
+                          children: int = 0,
+                          child_ages: Optional[list] = None) -> dict:
     """
     Маппинг горящего тура из get_hot_tours → формат tour_card для фронтенда.
     ⚠️ Цена горящих туров — ЗА ЧЕЛОВЕКА!
@@ -1535,6 +1560,9 @@ def _map_hot_tour_to_card(tour_data: dict, booking_base_url: str = None,
         "nights": nights,
         "price": price_pp,                   # За человека (как в API)
         "price_per_person": price_pp,         # Дубль для явного отображения
+        "adults": adults,
+        "children": children,
+        "child_ages": child_ages or [],
         "food_type": meal_code,               # Код питания для JS fallback
         "meal_description": meal_ru,          # Русское описание для фронтенда
         "room_type": "Standard",
@@ -2376,6 +2404,7 @@ class YandexGPTHandler:
         simplified = [item[2] for item in batch]
 
         _adults = self._last_search_params.get("adults", 2) if self._last_search_params else 2
+        _children, _child_ages = _extract_children_from_params(self._last_search_params)
         _wc = (getattr(self.runtime_config, "widget_config", None) or {})
         _booking_url = _wc.get("booking_base_url")
         _booking_tpl = _wc.get("booking_url_template")
@@ -2385,6 +2414,8 @@ class YandexGPTHandler:
                 booking_base_url=_booking_url,
                 booking_url_template=_booking_tpl,
                 departure_id=self._last_departure_id,
+                children=_children,
+                child_ages=_child_ages,
             )
             for h in simplified
         ]
@@ -5015,6 +5046,7 @@ class YandexGPTHandler:
             
             # ── Строим tour_cards для нового фронтенда ──
             _adults = self._last_search_params.get("adults", 2) if self._last_search_params else 2
+            _children, _child_ages = _extract_children_from_params(self._last_search_params)
             _wc = (getattr(self.runtime_config, "widget_config", None) or {})
             _booking_url = _wc.get("booking_base_url")
             _booking_tpl = _wc.get("booking_url_template")
@@ -5024,6 +5056,8 @@ class YandexGPTHandler:
                     booking_base_url=_booking_url,
                     booking_url_template=_booking_tpl,
                     departure_id=self._last_departure_id,
+                    children=_children,
+                    child_ages=_child_ages,
                 )
                 for h in simplified
             ]
@@ -5904,12 +5938,15 @@ class YandexGPTHandler:
             _booking_url_hot = _wc_hot.get("booking_base_url")
             _booking_tpl_hot = _wc_hot.get("booking_url_template")
             _adults_hot = self._last_search_params.get("adults", 2) if self._last_search_params else 2
+            _children_hot, _child_ages_hot = _extract_children_from_params(self._last_search_params)
             self._pending_tour_cards = [
                 _map_hot_tour_to_card(
                     t, booking_base_url=_booking_url_hot,
                     booking_url_template=_booking_tpl_hot,
                     departure_id=self._last_departure_id,
                     adults=_adults_hot,
+                    children=_children_hot,
+                    child_ages=_child_ages_hot,
                 ) for t in simplified
             ]
             for _c in self._pending_tour_cards:

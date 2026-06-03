@@ -97,16 +97,51 @@ def _format_meal(card: dict[str, Any]) -> str:
     return _MEAL_FALLBACK.get(code, code)
 
 
-def _format_pax(adults: Any) -> str:
+def _to_int(value: Any) -> int:
     try:
-        n = int(adults or 0)
+        return int(value or 0)
     except (TypeError, ValueError):
-        n = 0
+        return 0
+
+
+def _format_pax(total: Any) -> str:
+    """Label for the *total* number of travellers a price covers.
+
+    ``total`` is adults + children (the price in a tour card is for the whole
+    party). 1..4 use the natural Russian wording ("за двоих", "за троих"),
+    5+ fall back to "за N человек".
+    """
+    n = _to_int(total)
     if n in _PAX_LABELS:
         return _PAX_LABELS[n]
     if n > 4:
-        return f"за {n} взрослых"
+        return f"за {n} человек"
     return ""
+
+
+def _decline_children(n: int) -> str:
+    """Russian plural for children: 1 ребёнок, 2-4 ребёнка, 5+ детей."""
+    if n % 10 == 1 and n % 100 != 11:
+        return "ребёнок"
+    if n % 10 in (2, 3, 4) and n % 100 not in (12, 13, 14):
+        return "ребёнка"
+    return "детей"
+
+
+def _format_composition(adults: Any, children: Any) -> str:
+    """Compact party composition, e.g. "2 взрослых + 1 ребёнок".
+
+    Ages are intentionally omitted to keep the line short and always fit the
+    card. Adults: "1 взрослый" / "N взрослых". Children appended only when > 0.
+    """
+    a = _to_int(adults)
+    c = _to_int(children)
+    parts: list[str] = []
+    if a > 0:
+        parts.append("1 взрослый" if a == 1 else f"{a} взрослых")
+    if c > 0:
+        parts.append(f"{c} {_decline_children(c)}")
+    return " + ".join(parts)
 
 
 def render_tour_card_caption(card: dict[str, Any]) -> str:
@@ -121,8 +156,9 @@ def render_tour_card_caption(card: dict[str, Any]) -> str:
         📅 18.05 → 25.05 · 7 ночей
         🍽 Всё включено · 🛏 Standard Double
         ✈️ Перелёт включён · из Москвы
+        👥 2 взрослых + 1 ребёнок
 
-        *410 000 ₽* за двоих
+        *410 000 ₽* за троих
     """
     name = _md_escape(card.get("hotel_name") or "Отель")
     stars = _format_stars(card.get("hotel_stars"))
@@ -137,7 +173,15 @@ def render_tour_card_caption(card: dict[str, Any]) -> str:
         nights = 0
     meal = _md_escape(_format_meal(card))
     room = _md_escape(card.get("room_type"))
-    pax_label = _format_pax(card.get("adults"))
+    adults = card.get("adults")
+    children = card.get("children")
+    composition = _format_composition(adults, children)
+    # Price in a tour card covers the whole party (adults + children). Hot
+    # tours, however, are priced PER PERSON — keep that wording honest.
+    if card.get("price_per_person"):
+        pax_label = "за человека"
+    else:
+        pax_label = _format_pax(_to_int(adults) + _to_int(children))
     price_str = _format_price(card.get("price"))
     flight_included = bool(card.get("flight_included"))
     is_hotel_only = bool(card.get("is_hotel_only"))
@@ -205,6 +249,8 @@ def render_tour_card_caption(card: dict[str, Any]) -> str:
         lines.append(extras_line)
     if travel_line:
         lines.append(travel_line)
+    if composition:
+        lines.append(f"👥 {composition}")
     if price_line:
         lines.append("")
         lines.append(price_line)
