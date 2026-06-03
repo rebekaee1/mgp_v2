@@ -102,6 +102,49 @@ _OFFICES_LOOKUP_ALLOWED_ASSISTANT_IDS = {
     "d1327f41-3c31-4776-9f80-f22cde9bd579",
 }
 
+# ── Feature 2: подписка/мониторинг туров (subscribe_tours) ──
+# Инструмент subscribe_tours и оффер подписки в промпте включены ТОЛЬКО для
+# тенантов из этого списка. Старт — тест-бот «Навылет! AI» (MAX-канал МГП Тур);
+# после пилота сюда добавится AnyTour (64fea0d3-...). Для остальных тенантов
+# tool вообще не отдаётся модели и подписка не предлагается.
+_SUBSCRIPTION_ALLOWED_SLUGS: set = set()
+_SUBSCRIPTION_ALLOWED_ASSISTANT_IDS = {
+    # Тест-бот: MAX-канал МГП Тур «Навылет! AI» (не подвязан к ЛК)
+    "593471b7-42da-4ae0-8499-904dcedd6a4b",
+    # Локальный mgp-tour (для разработки)
+    "d1327f41-3c31-4776-9f80-f22cde9bd579",
+}
+
+# Минимальный бюджет (₽), с которого имеет смысл предлагать подписку.
+_SUBSCRIPTION_MIN_BUDGET = 200000
+
+# Блок-инструкция оффера подписки, добавляется в системный промпт ТОЛЬКО для
+# тенантов из _SUBSCRIPTION_ALLOWED_*. Намеренно лаконичен и директивен.
+_SUBSCRIPTION_PROMPT_BLOCK = """\
+---
+
+## ПОДПИСКА НА МОНИТОРИНГ ТУРОВ (инструмент subscribe_tours)
+
+У тебя есть возможность подписать клиента на мониторинг: мы сами напишем ему в этот же чат, когда по его запросу появится подходящий или подешевеет тур. Клиенту ничего делать не нужно.
+
+КОГДА ПРЕДЛАГАТЬ подписку:
+- Только ПОСЛЕ того, как ты уже показал клиенту подборку туров (был search_tours).
+- Когда клиент колеблется или прощается без выбора: «подумаю», «надо посоветоваться», «попозже», «дороговато сейчас», «спасибо, я подумаю» и т.п.
+- Только если бюджет клиента от 200 000 ₽. Если бюджет ниже — подписку НЕ предлагай.
+- Предлагай не более одного раза за диалог и ненавязчиво.
+
+КАК ПРЕДЛАГАТЬ (мягко, по-человечески):
+«Если хотите, я буду следить за турами по вашему запросу и напишу вам сюда, как только появится более подходящий или подешевеет вариант — ничего делать не нужно. Подключить?»
+
+ЕСЛИ КЛИЕНТ СОГЛАСИЛСЯ («да», «давайте», «хочу», «подключайте»):
+- Вызови subscribe_tours с dest_text (направление в винительном падеже, напр. «Турцию»).
+- Если клиент хочет следить за КОНКРЕТНЫМ отелем — передай его название в hotel.
+- После вызова — тепло подтверди своими словами, БЕЗ перечисления критериев списком.
+
+ЕСЛИ КЛИЕНТ ОТКАЗАЛСЯ — не настаивай, продолжай как обычно.
+НЕ предлагай подписку, если клиент уже оставил контакт менеджеру или готов бронировать.
+"""
+
 _MGP_OFFICES_CACHE: Optional[List[Dict]] = None
 
 def _load_mgp_offices() -> List[Dict]:
@@ -2006,6 +2049,11 @@ class YandexGPTHandler:
         self._crm_submitted: Optional[Dict] = None  # dedup guard: {phone, email, type}
         self._tour_actualized_id: Optional[str] = None  # tourid explicitly actualized by LLM
 
+        # ── Feature 2 (подписка на мониторинг туров) — intent set by the
+        # subscribe_tours tool, persisted by app.py after the turn (it owns the
+        # conversation row + MAX user/chat ids). None until the client opts in.
+        self._pending_subscription: Optional[Dict] = None
+
         # ── Feature "Статус заявки" — session state ──
         self._status_lookup_calls: int = 0          # счётчик вызовов tool за сессию
         self._status_lookup_attempts: int = 0       # неуспешные попытки верификации (mismatch имени)
@@ -2647,6 +2695,11 @@ class YandexGPTHandler:
         # клиенту чужой адрес из Москвы вместо своего из widget_config.
         if not self._offices_lookup_allowed():
             custom_tools = [t for t in custom_tools if t.get("name") != "get_offices"]
+
+        # ── Per-tenant filter: subscribe_tours только для тенантов с включённой
+        # подпиской (Фича 2). Для остальных модель даже не видит инструмент.
+        if not self._subscription_enabled():
+            custom_tools = [t for t in custom_tools if t.get("name") != "subscribe_tours"]
         
         # Добавляем встроенный web_search инструмент
         web_search_tool = {
@@ -2663,6 +2716,15 @@ class YandexGPTHandler:
         return (
             slug in _OFFICES_LOOKUP_ALLOWED_SLUGS
             or assistant_id in _OFFICES_LOOKUP_ALLOWED_ASSISTANT_IDS
+        )
+
+    def _subscription_enabled(self) -> bool:
+        """True если у тенанта включена подписка на мониторинг туров (Фича 2)."""
+        slug = (getattr(self.runtime_config, "company_slug", None) or "").strip().lower()
+        assistant_id = (getattr(self.runtime_config, "assistant_id", None) or "").strip().lower()
+        return (
+            slug in _SUBSCRIPTION_ALLOWED_SLUGS
+            or assistant_id in _SUBSCRIPTION_ALLOWED_ASSISTANT_IDS
         )
 
     def _lead_summary_smart_enabled(self) -> bool:
@@ -3087,6 +3149,11 @@ class YandexGPTHandler:
             faq = runtime_faq
         if faq:
             prompt = prompt + "\n\n" + faq
+
+        # ── Feature 2: оффер подписки на мониторинг туров (только для включённых
+        # тенантов; для остальных инструмент даже не загружен) ──
+        if self._subscription_enabled():
+            prompt = prompt + "\n\n" + _SUBSCRIPTION_PROMPT_BLOCK
 
         return prompt
     
@@ -6256,6 +6323,9 @@ class YandexGPTHandler:
         elif name == "submit_client_request":
             return await self._handle_submit_client_request(args)
 
+        elif name == "subscribe_tours":
+            return self._handle_subscribe_tours(args)
+
         elif name == "get_client_request_status":
             return await self._handle_get_client_request_status(args)
 
@@ -6389,6 +6459,68 @@ class YandexGPTHandler:
         }
 
     # ── U-ON CRM handlers ────────────────────────────────────────────────
+
+    def _handle_subscribe_tours(self, args: Dict) -> Dict:
+        """Feature 2 opt-in: record a subscription INTENT from the current dialogue.
+
+        We do NOT touch the DB here — the handler has no conversation/MAX-id
+        context. Instead we stash the assembled criteria on
+        ``self._pending_subscription`` and let app.py persist it after the turn
+        (gated to enabled tenants + MAX channel). Criteria come straight from the
+        last successful search cache, so no extra Tourvisor call is needed.
+        """
+        sp = self._last_search_params or {}
+        if not sp or not sp.get("_country"):
+            return {
+                "status": "error",
+                "message": ("Сначала выполни поиск туров (search_tours) — без него не из чего "
+                            "формировать подписку. Сначала подбери варианты, потом предлагай уведомления."),
+            }
+
+        dest_text = (args.get("dest_text") or "").strip()
+        budget = (_safe_int(args.get("budget"))
+                  or _safe_int(sp.get("priceto"))
+                  or self._user_stated_budget)
+
+        seen_codes: List[str] = []
+        for v in (self._tourid_map or {}).values():
+            hc = v.get("hotelcode")
+            if hc and str(hc) not in seen_codes:
+                seen_codes.append(str(hc))
+
+        baseline = (self._last_search_result or {}).get("min_price")
+        child_ages = [sp[k] for k in ("childage1", "childage2", "childage3")
+                      if sp.get(k) is not None]
+
+        self._pending_subscription = {
+            "departure": sp.get("departure"),
+            "country": sp.get("_country"),
+            "regions": sp.get("_regions"),
+            "dest_text": dest_text or None,
+            "date_from": sp.get("datefrom"),
+            "date_to": sp.get("dateto"),
+            "nights_from": sp.get("nightsfrom"),
+            "nights_to": sp.get("nightsto"),
+            "adults": sp.get("adults"),
+            "children": sp.get("child"),
+            "child_ages": child_ages or None,
+            "min_stars": _safe_int(sp.get("stars")),
+            "budget": budget,
+            "hotel_name": (args.get("hotel") or "").strip() or None,
+            "baseline_price": baseline,
+            "seen_codes": seen_codes or None,
+        }
+        logger.info(
+            "🔔 SUBSCRIBE intent: country=%s dest=%s budget=%s stars=%s seen=%d baseline=%s",
+            sp.get("_country"), dest_text, budget, sp.get("stars"),
+            len(seen_codes), baseline,
+        )
+        return {
+            "status": "ok",
+            "message": ("Подписка оформлена. Скажи клиенту СВОИМИ словами и тепло: ты будешь "
+                        "следить за турами по его запросу и напишешь сюда, как только появится "
+                        "подходящий или подешевеет вариант. Не дублируй критерии списком."),
+        }
 
     async def _handle_submit_client_request(self, args: Dict) -> Dict:
         """Validate, dedup, and route to lead or request creation in U-ON CRM."""

@@ -527,6 +527,38 @@ def _restore_handler_from_db(handler, session_id: str, assistant_id: str = None)
                             )
                     handler._pinned_context = "\n".join(lines)
 
+            # ── Feature 2: подсказка по активной подписке (для включённых тенантов).
+            # Если мы недавно отправили тизер ("появился/подешевел тур") и клиент
+            # отвечает согласием — ассистент должен ПОКАЗАТЬ именно этот отель
+            # свежим search_tours(hotels=...), а не растеряться.
+            try:
+                _SUB_HINT_TENANTS = {
+                    "593471b7-42da-4ae0-8499-904dcedd6a4b",  # mgp-tour (тест/пилот)
+                    "d1327f41-3c31-4776-9f80-f22cde9bd579",  # локальный mgp-tour
+                }
+                if str(getattr(conv, "assistant_id", "")) in _SUB_HINT_TENANTS:
+                    from models import TourSubscription
+                    _sub = db.query(TourSubscription).filter(
+                        TourSubscription.conversation_id == conv.id,
+                        TourSubscription.status == "active",
+                        TourSubscription.last_notified_hotelcode.isnot(None),
+                    ).order_by(TourSubscription.last_notified_at.desc()).first()
+                    if _sub is not None:
+                        _hint = (
+                            "\n\n[КОНТЕКСТ: активная подписка на туры]\n"
+                            f"Ты недавно сам написал клиенту, что по его запросу "
+                            f"({_sub.dest_text or 'направление'}) появился/подешевел тур "
+                            f"(отель hotelcode={_sub.last_notified_hotelcode}, около "
+                            f"{_sub.last_notified_price} ₽). Если клиент отвечает согласием "
+                            f"('да', 'покажите', 'давайте') — вызови search_tours с "
+                            f"hotels={_sub.last_notified_hotelcode} и теми же датами/составом и "
+                            f"покажи карточку с АКТУАЛЬНОЙ ценой. Если этого отеля уже нет в "
+                            f"выдаче — честно скажи и предложи ближайшие альтернативы."
+                        )
+                        handler._pinned_context = (getattr(handler, "_pinned_context", "") or "") + _hint
+            except Exception:
+                logger.debug("Ф.2 subscription pinned-context hint failed", exc_info=True)
+
             logger.info(
                 "♻️ Restored session %s from DB (%d messages, assistant=%s)",
                 session_id[:8],
@@ -907,6 +939,50 @@ def _enforce_feminine_persona(text: str) -> str:
     return text
 
 
+def _persist_pending_subscription(db, conv, pend: dict) -> None:
+    """Persist a tour subscription captured by the subscribe_tours tool (Feature 2).
+
+    Only for MAX dialogues with a known external_user_id — that is the channel we
+    deliver teasers through. "One active subscription per client" is enforced by
+    the store (an older active subscription is superseded).
+    """
+    channel = (getattr(conv, "channel", None) or "").lower()
+    uid = getattr(conv, "external_user_id", None)
+    if channel != "max" or not uid:
+        logger.info("Ф.2 subscribe skipped: channel=%s uid=%s (нужен MAX + uid)", channel, uid)
+        return
+    import subscription_store as _subs
+    sub = _subs.upsert_subscription(
+        db,
+        assistant_id=conv.assistant_id,
+        conversation_id=conv.id,
+        channel="max",
+        external_user_id=str(uid),
+        external_chat_id=getattr(conv, "external_chat_id", None),
+        departure=pend.get("departure"),
+        country=pend.get("country"),
+        regions=pend.get("regions"),
+        dest_text=pend.get("dest_text"),
+        date_from=pend.get("date_from"),
+        date_to=pend.get("date_to"),
+        nights_from=pend.get("nights_from"),
+        nights_to=pend.get("nights_to"),
+        adults=pend.get("adults"),
+        children=pend.get("children"),
+        child_ages=pend.get("child_ages"),
+        min_stars=pend.get("min_stars"),
+        budget=pend.get("budget"),
+        hotel_name=pend.get("hotel_name"),
+        baseline_price=pend.get("baseline_price"),
+        seen_codes=pend.get("seen_codes"),
+    )
+    logger.info(
+        "🔔 Ф.2 subscription saved id=%s assistant=%s uid=%s country=%s budget=%s baseline=%s",
+        sub.id, conv.assistant_id, uid, pend.get("country"),
+        pend.get("budget"), pend.get("baseline_price"),
+    )
+
+
 def _log_chat_to_db(session_id: str, user_message: str, reply: str,
                      tour_cards: list, latency_ms: int = None,
                      model_name: str = "unknown",
@@ -922,7 +998,8 @@ def _log_chat_to_db(session_id: str, user_message: str, reply: str,
                      external_first_name: str = None,
                      external_last_name: str = None,
                      external_user_name: str = None,
-                     external_chat_id: str = None):
+                     external_chat_id: str = None,
+                     pending_subscription: dict = None):
     """
     Записать в PostgreSQL клиентски-видимую историю:
     - все обычные записи из history_snapshot (user, assistant, tool)
@@ -1008,6 +1085,16 @@ def _log_chat_to_db(session_id: str, user_message: str, reply: str,
                 )
                 db.add(conv)
                 db.flush()
+
+            # ── Feature 2: записать подписку, если клиент согласился в этом ходе.
+            # Гарантия gating — tool subscribe_tours загружается только включённым
+            # тенантам, поэтому _pending_subscription приходит лишь от них. Доп.
+            # защита: пишем только для MAX-диалогов с известным uid (туда шлём).
+            if pending_subscription and conv is not None:
+                try:
+                    _persist_pending_subscription(db, conv, pending_subscription)
+                except Exception as _sub_err:
+                    logger.warning("Ф.2 subscription persist failed: %s", _sub_err)
 
             msg_count = 0
             final_reply_in_snapshot = False
@@ -2101,7 +2188,8 @@ def chat_v1():
                         external_first_name=external_first_name_hdr,
                         external_last_name=external_last_name_hdr,
                         external_user_name=external_user_name_hdr,
-                        external_chat_id=external_chat_id_hdr)
+                        external_chat_id=external_chat_id_hdr,
+                        pending_subscription=getattr(handler, '_pending_subscription', None))
 
         _mark_assistant_responded(session_id)
 

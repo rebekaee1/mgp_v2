@@ -1,0 +1,6 @@
+# Runtime artifacts — never commit
+*.sqlite
+*.db
+*.log
+*_report.json
+__pycache__/

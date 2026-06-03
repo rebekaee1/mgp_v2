@@ -293,6 +293,117 @@ class TourSearch(Base):
     )
 
 
+class TourSubscription(Base):
+    """
+    Подписка клиента на мониторинг туров (Фича 2).
+
+    Клиент в диалоге (или в ответ на повторный аутрич) соглашается, что мы
+    пришлём ему уведомление, когда по его запросу появится подходящий или
+    подешевевший тур. Фоновый монитор-джоб периодически ищет в Tourvisor по
+    сохранённым критериям и, если находит улучшение (≥5% дешевле базовой цены
+    ИЛИ новый отель уровня клиента в бюджете), шлёт тизер.
+
+    Записывается ТОЛЬКО для тенантов, где фича включена (gating — на стороне
+    промпта/handler); таблица сама по себе тенант-агностична.
+    """
+    __tablename__ = "tour_subscriptions"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    assistant_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(), ForeignKey("assistants.id", ondelete="SET NULL"), nullable=True
+    )
+    conversation_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(), ForeignKey("conversations.id", ondelete="SET NULL"), nullable=True
+    )
+    # how/where to reach the client (mirrors conversations.* channel fields)
+    channel: Mapped[str] = mapped_column(String(16), nullable=False, default="max")
+    external_user_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    external_chat_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    # active | stopped | expired | fulfilled
+    status: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="active", server_default="active"
+    )
+
+    # ── monitored criteria (SOFT match: country+dates+pax+budget, stars as floor) ──
+    departure: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    country: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    regions: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    dest_text: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    date_from: Mapped[Optional[str]] = mapped_column(String(10), nullable=True)
+    date_to: Mapped[Optional[str]] = mapped_column(String(10), nullable=True)
+    nights_from: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    nights_to: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    adults: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    children: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    child_ages: Mapped[Optional[list]] = mapped_column(JSON, nullable=True)
+    min_stars: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    budget: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    # optional hotel-centric subscription
+    hotel_codes: Mapped[Optional[list]] = mapped_column(JSON, nullable=True)
+    hotel_name: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+
+    # ── baseline & dedup (anti-spam) ──
+    baseline_price: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    seen_codes: Mapped[Optional[list]] = mapped_column(JSON, nullable=True)
+    last_notified_price: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    last_notified_hotelcode: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
+    last_tourid: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    last_notified_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
+    # ── cadence & lifecycle ──
+    notifications_sent: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    silent_streak: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    last_reply_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    travel_date: Mapped[Optional[str]] = mapped_column(String(10), nullable=True)
+    expires_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    stop_reason: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
+    meta: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, onupdate=_utcnow
+    )
+
+    __table_args__ = (
+        Index("ix_tour_subs_status_assistant", "status", "assistant_id"),
+        Index("ix_tour_subs_user", "assistant_id", "external_user_id"),
+        Index("ix_tour_subs_expires", "status", "expires_at"),
+    )
+
+
+class ContactOptout(Base):
+    """
+    Общий do-not-contact для проактивных сообщений (Фичи 1 и 2).
+
+    Если клиент попросил «не пишите» / заблокировал бота — заносим сюда, и
+    больше его не трогают НИ повторный аутрич (Ф.1), НИ подписка (Ф.2).
+    """
+    __tablename__ = "contact_optout"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    assistant_id: Mapped[Optional[uuid.UUID]] = mapped_column(UUID(), nullable=True)
+    external_user_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    channel: Mapped[str] = mapped_column(String(16), nullable=False, default="max")
+    reason: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
+    source: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow
+    )
+
+    __table_args__ = (
+        Index("uq_contact_optout_user", "assistant_id", "external_user_id", "channel",
+              unique=True),
+    )
+
+
 class ApiCall(Base):
     """
     Лог ВСЕХ внешних API вызовов: TourVisor, Yandex, OpenAI.
