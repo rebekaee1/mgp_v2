@@ -939,6 +939,43 @@ def _enforce_feminine_persona(text: str) -> str:
     return text
 
 
+_SUBSCRIPTION_OPTOUT_RE = re.compile(
+    r"(?:не\s*пиши(?:те)?|больше\s*не\s*пиш|отпиш|не\s*беспоко|"
+    r"убер.{0,8}рассылк|отказ.{0,8}рассылк|хватит\s*писать|перестань.{0,8}писа|"
+    r"не\s*нужно\s*писать|не\s*присылай)",
+    re.IGNORECASE,
+)
+
+
+def _subscription_dialog_signals(db, conv, user_message: str) -> None:
+    """Feature 2 reactions to an incoming client message (MAX, gated tenants):
+      • opt-out phrase → global do-not-contact + stop active subscription;
+      • otherwise (client engaged / replied) → reset silent_streak.
+    Gated to subscription-enabled assistants so other tenants pay no overhead.
+    """
+    try:
+        from yandex_handler import _SUBSCRIPTION_ALLOWED_ASSISTANT_IDS
+    except Exception:
+        return
+    if (getattr(conv, "channel", None) or "").lower() != "max":
+        return
+    uid = getattr(conv, "external_user_id", None)
+    if not uid:
+        return
+    if str(getattr(conv, "assistant_id", "") or "").lower() not in _SUBSCRIPTION_ALLOWED_ASSISTANT_IDS:
+        return
+    import subscription_store as _subs
+    txt = (user_message or "").lower().replace("ё", "е")
+    if _SUBSCRIPTION_OPTOUT_RE.search(txt):
+        _subs.add_optout(db, conv.assistant_id, uid, reason="optout_phrase", source="dialog")
+        sub = _subs.get_active_for_user(db, conv.assistant_id, uid)
+        if sub is not None:
+            _subs.stop_subscription(db, sub, reason="optout")
+        logger.info("🔕 Ф.2 opt-out by phrase uid=%s — do-not-contact + stop subscription", uid)
+    else:
+        _subs.record_reply(db, conv.assistant_id, uid)
+
+
 def _persist_pending_subscription(db, conv, pend: dict) -> None:
     """Persist a tour subscription captured by the subscribe_tours tool (Feature 2).
 
@@ -1095,6 +1132,15 @@ def _log_chat_to_db(session_id: str, user_message: str, reply: str,
                     _persist_pending_subscription(db, conv, pending_subscription)
                 except Exception as _sub_err:
                     logger.warning("Ф.2 subscription persist failed: %s", _sub_err)
+
+            # ── Feature 2: реакция на входящее сообщение подписанного клиента ──
+            # «не пишите» → общий do-not-contact + стоп подписки; иначе (клиент
+            # ответил/вовлечён) → сброс silent_streak его активной подписки.
+            if conv is not None:
+                try:
+                    _subscription_dialog_signals(db, conv, user_message)
+                except Exception as _sig_err:
+                    logger.debug("Ф.2 dialog signals failed: %s", _sig_err)
 
             msg_count = 0
             final_reply_in_snapshot = False

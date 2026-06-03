@@ -255,6 +255,12 @@ async def run(args) -> int:
         log(f"active subscriptions: {len(subs)}")
         for sub in subs:
             m["candidates"] += 1
+            # Уважаем общий do-not-contact (Ф.1 + Ф.2): если клиент в opt-out —
+            # НИКОГДА не шлём тизер и закрываем его подписку.
+            if ST.is_opted_out(db, aid, sub.external_user_id):
+                ST.stop_subscription(db, sub, reason="optout")
+                m["skip_optout"] += 1
+                continue
             conv = db.get(Conversation, sub.conversation_id) if sub.conversation_id else None
             conv_last = getattr(conv, "last_active_at", None)
             ok, why = timing_ok(sub, conv_last, args.ignore_timing)
