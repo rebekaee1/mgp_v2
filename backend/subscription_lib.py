@@ -134,6 +134,10 @@ def build_search_args(sub: dict, floor_stage: int = 0) -> dict:
         _floor = budget_floor_staged(sub.get("budget"), floor_stage)
         if _floor:
             args["price_from"] = _floor
+        # RATING floor как у основного ассистента: rating=3 → API-пол ≥3.5,
+        # чтобы НЕ показывать слаборейтинговые отели. Для hotel-centric не нужно
+        # (клиент уже выбрал конкретный отель).
+        args["rating"] = 3
     # quality floor applied at SEARCH time so page 1 already holds the cheapest
     # hotels of the client's level (results are price-ascending; 5* resorts in
     # budget otherwise sit on later pages and get missed). Meal stays unconstrained.
@@ -288,11 +292,11 @@ def render_teaser(decision: dict, sub: dict) -> str:
             return (f"Здравствуйте! 🙂 Хорошая новость: отель {hotel}, который вы "
                     f"присматривали, подешевел — теперь от ~{price} ₽ (раньше ~{prev}). "
                     f"Показать актуальный вариант?")
-        return (f"Здравствуйте! 🙂 Хорошая новость по вашему запросу: тур в {dest_raw} "
-                f"подешевел — теперь от ~{price} ₽ (раньше ~{prev}). Показать предложение?")
+        return (f"Здравствуйте! 🙂 Хорошая новость по вашему запросу: туры в {dest_raw} "
+                f"подешевели — теперь от ~{price} ₽ (раньше ~{prev}). Показать подборку?")
     # new_option
     if hotel:
         return (f"Здравствуйте! 🙂 По отелю {hotel} появился выгодный вариант — "
                 f"от ~{price} ₽. Прислать?")
-    return (f"Здравствуйте! 🙂 По вашему запросу ({dest_nom}) появилось выгодное "
-            f"предложение — от ~{price} ₽. Показать?")
+    return (f"Здравствуйте! 🙂 По вашему запросу ({dest_nom}) появились выгодные "
+            f"варианты — от ~{price} ₽. Показать подборку?")
