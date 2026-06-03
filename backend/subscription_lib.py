@@ -24,6 +24,21 @@ DEFAULT_MIN_STARS = 4  # quality floor when the client's level is unknown
 _TRANSIT_MARKERS = ("airport", "аэропорт", "transit", "транзит", "hostel",
                     "хостел", "apartment", "апартамент", "guest house", "гостевой")
 
+# ── BUDGET-FLOOR (mirror of yandex_handler BUDGET-FLOOR v2, gated tenant value) ──
+# Подписка обслуживает только премиум-сегмент: для «до X» ищем верхнюю часть
+# бюджета (pricefrom = X × ratio), а НЕ самое дешёвое. Значения совпадают с
+# тем, что основной ассистент применяет для тех же (gated) тенантов, чтобы
+# baseline (что видел клиент) и монитор сравнивались на одной базе.
+BUDGET_FLOOR_RATIO = 0.90          # pricefrom = budget × 0.90  (для 200к → 180к)
+BUDGET_FLOOR_MIN_WINDOW = 20_000   # минимальная ширина окна [pricefrom; budget]
+BUDGET_FLOOR_MIN_PRICETO = 30_000  # ниже этого бюджета floor не применяем (дешёвый сегмент)
+# Каскад нижней границы (зеркало AUTO-RETRY основного ассистента): сначала
+# премиум-полоса 0.90; если в ней пусто — монитор повторяет поиск со ступенью
+# 1 (0.60), затем 2 (без пола). Так клиент не остаётся без уведомления, когда
+# в верхней части бюджета ничего нет, но премиум показываем первым.
+_FLOOR_STAGES = (BUDGET_FLOOR_RATIO, 0.60, None)  # stage 0 / 1 / 2
+FLOOR_MAX_STAGE = len(_FLOOR_STAGES) - 1
+
 
 def _to_int(v):
     try:
@@ -32,13 +47,65 @@ def _to_int(v):
         return None
 
 
+def budget_floor_staged(budget, stage: int = 0) -> "int | None":
+    """``pricefrom`` для заданной ступени каскада (0=премиум … последняя=без пола).
+
+    Возвращает ``None``, если floor не применяется (нет бюджета / дешёвый
+    сегмент / ступень без пола). Окно [pricefrom; budget] не уже
+    ``BUDGET_FLOOR_MIN_WINDOW``.
+    """
+    b = _to_int(budget)
+    if not b or b < BUDGET_FLOOR_MIN_PRICETO:
+        return None
+    if stage < 0 or stage > FLOOR_MAX_STAGE:
+        return None
+    ratio = _FLOOR_STAGES[stage]
+    if ratio is None:
+        return None
+    floor = int(b * ratio)
+    if b - floor < BUDGET_FLOOR_MIN_WINDOW:
+        floor = max(b - BUDGET_FLOOR_MIN_WINDOW, 0)
+    return floor or None
+
+
+def budget_floor(budget) -> "int | None":
+    """Премиум-пол (ступень 0). Тонкая обёртка над :func:`budget_floor_staged`."""
+    return budget_floor_staged(budget, 0)
+
+
+# ── destination display normalisation (винительный → именительный) ─────────────
+# dest_text приходит из аргумента LLM ("Турцию"), показываем в именительном
+# падеже ("Турция"). Карта на частые направления; для остальных — как есть.
+_DEST_NORMALISE = {
+    "турцию": "Турция", "анталию": "Анталия", "грецию": "Греция",
+    "испанию": "Испания", "италию": "Италия", "тунис": "Тунис",
+    "тайланд": "Таиланд", "таиланд": "Таиланд", "вьетнам": "Вьетнам",
+    "кубу": "Куба", "доминикану": "Доминикана", "мальдивы": "Мальдивы",
+    "шри-ланку": "Шри-Ланка", "индию": "Индия", "абхазию": "Абхазия",
+    "грузию": "Грузия", "армению": "Армения", "кипр": "Кипр",
+    "болгарию": "Болгария", "черногорию": "Черногория", "оаэ": "ОАЭ",
+    "эмираты": "ОАЭ", "египет": "Египет", "россию": "Россия", "сочи": "Сочи",
+}
+
+
+def _normalise_dest(text) -> str:
+    raw = (text or "").strip()
+    if not raw:
+        return "вашему запросу"
+    return _DEST_NORMALISE.get(raw.lower(), raw)
+
+
 # ── build Tourvisor search kwargs from a subscription (SOFT match) ─────────────
-def build_search_args(sub: dict) -> dict:
+def build_search_args(sub: dict, floor_stage: int = 0) -> dict:
     """Map a subscription's stored criteria to tourvisor_client.search_tours kwargs.
 
     SOFT match: we search by direction + dates + pax + budget only. Stars/meal are
     NOT passed as hard filters (they're preferences) so that a strong in-budget
     option is never hidden. A hotel-centric subscription narrows by `hotel_codes`.
+
+    ``floor_stage`` selects the budget-floor cascade step (0=premium 0.90,
+    1=0.60, 2=no floor). The monitor steps it up only when the premium band
+    comes back empty, so the client still gets a notification.
 
     Accepts both the stored ``country`` field and the test-only ``country_code``.
     """
@@ -59,6 +126,14 @@ def build_search_args(sub: dict) -> dict:
         args["regions"] = sub["regions"]
     if sub.get("hotel_codes"):
         args["hotels"] = ",".join(str(c) for c in sub["hotel_codes"])
+    # BUDGET-FLOOR: ищем ВЕРХНЮЮ часть бюджета (премиум-сегмент), а не самое
+    # дешёвое — это и есть бизнес-правило «до 200к → показывать от ~180к».
+    # Не применяем при поиске конкретного отеля (клиент уже выбрал) — там важна
+    # его цена, а не полоса бюджета.
+    if not sub.get("hotel_codes"):
+        _floor = budget_floor_staged(sub.get("budget"), floor_stage)
+        if _floor:
+            args["price_from"] = _floor
     # quality floor applied at SEARCH time so page 1 already holds the cheapest
     # hotels of the client's level (results are price-ascending; 5* resorts in
     # budget otherwise sit on later pages and get missed). Meal stays unconstrained.
@@ -201,7 +276,10 @@ def _fmt_money(v) -> str:
 def render_teaser(decision: dict, sub: dict) -> str:
     """V1-tone teaser. The card itself is shown by the normal assistant flow on 'да'."""
     offer = decision.get("offer") or {}
-    dest = sub.get("dest_text") or offer.get("region") or "вашему запросу"
+    # dest_raw — как назвал клиент (винительный: «Турцию») для оборота «тур в …»;
+    # dest_nom — именительный («Турция») для скобочной формы «(…)».
+    dest_raw = (sub.get("dest_text") or offer.get("region") or "вашему запросу").strip()
+    dest_nom = _normalise_dest(sub.get("dest_text") or offer.get("region"))
     hotel = sub.get("hotel_name")  # set only for hotel-centric subscriptions
     price = _fmt_money(offer.get("price"))
     if decision.get("reason") == "price_drop":
@@ -210,11 +288,11 @@ def render_teaser(decision: dict, sub: dict) -> str:
             return (f"Здравствуйте! 🙂 Хорошая новость: отель {hotel}, который вы "
                     f"присматривали, подешевел — теперь от ~{price} ₽ (раньше ~{prev}). "
                     f"Показать актуальный вариант?")
-        return (f"Здравствуйте! 🙂 Хорошая новость по вашему запросу: тур в {dest} "
+        return (f"Здравствуйте! 🙂 Хорошая новость по вашему запросу: тур в {dest_raw} "
                 f"подешевел — теперь от ~{price} ₽ (раньше ~{prev}). Показать предложение?")
     # new_option
     if hotel:
         return (f"Здравствуйте! 🙂 По отелю {hotel} появился выгодный вариант — "
                 f"от ~{price} ₽. Прислать?")
-    return (f"Здравствуйте! 🙂 По вашему запросу ({dest}) появилось выгодное "
+    return (f"Здравствуйте! 🙂 По вашему запросу ({dest_nom}) появилось выгодное "
             f"предложение — от ~{price} ₽. Показать?")

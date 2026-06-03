@@ -2151,14 +2151,24 @@ class YandexGPTHandler:
             )
             return
 
-        _floor = int(_orig_priceto * _BUDGET_FLOOR_RATIO)
-        if _orig_priceto - _floor < _BUDGET_FLOOR_MIN_WINDOW_RUB:
-            _floor = max(_orig_priceto - _BUDGET_FLOOR_MIN_WINDOW_RUB, 0)
+        # Gated PREMIUM floor: для пилотных тенантов с подпиской (Фича 2) пол
+        # выше — 0.90 c окном 20к («до 200к → от 180к»), чтобы выдача и
+        # подписка показывали верх бюджета. Остальным тенантам — прежние
+        # глобальные значения 0.80/40к (поведение не меняется).
+        if self._subscription_enabled():
+            _ratio = 0.90
+            _min_window = 20_000
+        else:
+            _ratio = _BUDGET_FLOOR_RATIO
+            _min_window = _BUDGET_FLOOR_MIN_WINDOW_RUB
+        _floor = int(_orig_priceto * _ratio)
+        if _orig_priceto - _floor < _min_window:
+            _floor = max(_orig_priceto - _min_window, 0)
         args["pricefrom"] = _floor
         self._budget_floor_meta = {
             "original_priceto": _orig_priceto,
             "applied_pricefrom": _floor,
-            "ratio": _BUDGET_FLOOR_RATIO,
+            "ratio": _ratio,
             "stage": 1,
             "retry_triggered": False,
             "retry_succeeded": False,
@@ -2166,7 +2176,7 @@ class YandexGPTHandler:
         }
         logger.info(
             "💰 BUDGET-FLOOR v2 stage=1: pricefrom=%s, priceto=%s (ratio=%.2f, window=%s)",
-            _floor, _orig_priceto, _BUDGET_FLOOR_RATIO, _orig_priceto - _floor,
+            _floor, _orig_priceto, _ratio, _orig_priceto - _floor,
         )
 
     def _apply_upsell_ceiling(self, args: Dict, orig_priceto: int) -> None:

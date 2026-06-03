@@ -40,6 +40,8 @@ import subscription_store as ST
 
 TEST_ASSISTANT_ID = "593471b7-42da-4ae0-8499-904dcedd6a4b"  # «Навылет! AI» (mgp-tour MAX)
 MAX_API = "https://botapi.max.ru"
+BACKEND_INTERNAL_URL = "http://127.0.0.1:8080"  # backend on localhost (same container)
+BRIDGE_SESSION_TTL = 7 * 24 * 3600  # re-point sessions for 7 days (mirror Feature-1)
 
 QUIET_HOURS = 2        # don't notify if client chatted within the last N hours
 CADENCE_HOURS = 20     # >= this many hours between notifications (~1/day)
@@ -115,17 +117,44 @@ def timing_ok(sub, conv_last_active, ignore_timing: bool) -> tuple:
     return True, None
 
 
-async def search_offers(tv, sub_dict: dict) -> list:
-    args = SL.build_search_args(sub_dict)
+async def _search_one(tv, sub_dict: dict, stage: int) -> list:
+    args = SL.build_search_args(sub_dict, floor_stage=stage)
     rid = await tv.search_tours(**args)
     if not rid:
         return []
     try:
         res = await tv.wait_for_search(rid, max_wait=40)
     except Exception as e:  # NoResultsError etc.
-        log(f"  search no-results: {type(e).__name__}")
+        log(f"  search stage={stage} no-results: {type(e).__name__}")
         return []
     return SL.parse_offers(res)
+
+
+async def search_offers(tv, sub_dict: dict) -> list:
+    """Budget-floor cascade (mirror of the main assistant's AUTO-RETRY).
+
+    Stage 0 = premium band (0.90). If it yields NO qualifying offer we step
+    the floor down (0.60, then no floor) so the client still gets a useful
+    notification when the upper band is empty — premium is just tried first.
+    Hotel-centric / cheap-segment subs have no floor, so a single search runs.
+    """
+    budget = sub_dict.get("budget")
+    min_stars = sub_dict.get("min_stars")
+    # If no premium floor applies at all (no budget / cheap segment / hotel-
+    # centric), there is nothing to widen — one plain search is enough.
+    if sub_dict.get("hotel_codes") or SL.budget_floor(budget) is None:
+        return await _search_one(tv, sub_dict, 0)
+
+    last_offers: list = []
+    for stage in range(SL.FLOOR_MAX_STAGE + 1):
+        offers = await _search_one(tv, sub_dict, stage)
+        if offers:
+            last_offers = offers
+        if SL.qualifying(offers, budget, min_stars):
+            if stage > 0:
+                log(f"  budget-floor widen: stage={stage} (premium band empty → lower floor)")
+            return offers
+    return last_offers
 
 
 def fetch_bot_token(db, assistant_id) -> str:
@@ -147,6 +176,63 @@ def persist_teaser(db, conversation_id, text: str) -> None:
     db.flush()
 
 
+def fetch_tenant_slug(db, assistant_id) -> str:
+    """company.slug for the assistant — needed for the bridge session key."""
+    from models import Assistant, Company
+    a = db.get(Assistant, assistant_id)
+    if a is None:
+        return None
+    c = db.get(Company, a.company_id)
+    return getattr(c, "slug", None)
+
+
+def repoint_bridge_session(uid: str, slug: str, session_id: str) -> bool:
+    """Re-point the bridge's Redis session (db1) so the client's reply — even
+    days later — maps to THIS dialogue with full memory (mirror Feature-1).
+
+    The bridge stores ``max:user:{uid}:tenant:{slug}:session`` in Redis db1.
+    We only have the backend REDIS_URL (db0) in-env, so we swap the db index.
+    """
+    if not (uid and slug and session_id):
+        return False
+    try:
+        import redis as _redis
+    except Exception:
+        return False
+    url = os.environ.get("MAX_REDIS_URL") or os.environ.get("REDIS_URL", "")
+    if not url:
+        return False
+    if not os.environ.get("MAX_REDIS_URL"):
+        url = url.rsplit("/", 1)[0] + "/1"  # bridge sessions live in db1
+    try:
+        cli = _redis.from_url(url, decode_responses=True,
+                              socket_connect_timeout=3, socket_timeout=2)
+        cli.set(f"max:user:{uid}:tenant:{slug}:session", session_id, ex=BRIDGE_SESSION_TTL)
+        return True
+    except Exception as e:  # noqa: BLE001
+        log(f"  repoint failed uid={uid}: {e}")
+        return False
+
+
+def evict_backend_session(session_id: str, assistant_id) -> bool:
+    """Ask the backend to drop the warm in-memory handler for this session so
+    the client's reply cold-restores from DB (teaser in history + sub hint)."""
+    if not session_id:
+        return False
+    body = json.dumps({"session_id": session_id,
+                       "assistant_id": str(assistant_id)}).encode("utf-8")
+    req = urllib.request.Request(f"{BACKEND_INTERNAL_URL}/api/runtime/session/evict",
+                                 data=body, method="POST")
+    req.add_header("Content-Type", "application/json")
+    try:
+        with urllib.request.urlopen(req, timeout=10) as r:
+            res = json.loads(r.read().decode("utf-8"))
+            return bool(res.get("evicted"))
+    except Exception as e:  # noqa: BLE001
+        log(f"  evict failed session={session_id}: {e}")
+        return False
+
+
 async def run(args) -> int:
     import database
     from models import Conversation
@@ -160,6 +246,8 @@ async def run(args) -> int:
     samples = []
     sent = 0
     token = None
+    slug = None
+    handoffs = []  # (uid, slug, session_id) per delivered teaser — processed after commit
 
     with get_db() as db:
         ST.expire_due(db)
@@ -241,7 +329,25 @@ async def run(args) -> int:
                                    hotelcode=offer["hotelcode"], tourid=offer.get("tourid"))
             sent += 1
             m["sent"] += 1
+            # Collect the handoff; we re-point + evict AFTER the DB commit so the
+            # client's reply cold-restores a fully-persisted dialogue.
+            _sid = getattr(conv, "session_id", None)
+            if _sid:
+                if slug is None:
+                    slug = fetch_tenant_slug(db, aid)
+                handoffs.append((str(sub.external_user_id or ""), slug, _sid))
             time.sleep(args.throttle_sec)
+
+    # ── Session handoff (mirror Feature-1): now that the teasers are committed,
+    #    re-point the bridge session (late replies resume THIS dialogue) and
+    #    evict the warm backend handler (so the reply picks up the teaser +
+    #    the active-subscription pinned-context hint → assistant shows the card). ──
+    for uid, tslug, sid in handoffs:
+        if tslug and uid:
+            repoint_bridge_session(uid, tslug, sid)
+        evict_backend_session(sid, args.assistant_id)
+    if handoffs:
+        log(f"handoff done for {len(handoffs)} session(s): repoint+evict")
 
     summary = {"mode": "SEND" if args.send else "DRY-RUN", "metrics": dict(m), "sent": sent}
     log("SUMMARY " + json.dumps(summary, ensure_ascii=False))

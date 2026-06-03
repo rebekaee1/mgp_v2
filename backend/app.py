@@ -2560,6 +2560,44 @@ def runtime_status():
     return jsonify(checks), 200 if all_ok else 503
 
 
+@app.route('/api/runtime/session/evict', methods=['POST'])
+def runtime_session_evict():
+    """Evict an in-memory handler so the next client message cold-restores from DB.
+
+    Used by the Feature-2 subscription monitor: after it delivers a proactive
+    teaser (written straight to the DB, out-of-band from the handler) it calls
+    this endpoint so the client's reply rebuilds the handler from the DB —
+    picking up the teaser in history AND the "active subscription" pinned-
+    context hint. Without this, a still-warm in-memory handler would answer
+    the client's "да" without ever knowing a teaser was sent.
+
+    Internal-only (same gate as the other ``/api/runtime`` endpoints). With
+    ``GUNICORN_WORKERS=1`` a single eviction is authoritative.
+    """
+    if not _is_internal_request():
+        return jsonify({"error": "Forbidden"}), 403
+    data = request.get_json(silent=True) or {}
+    session_id = (data.get("session_id") or "").strip()
+    assistant_id = (data.get("assistant_id") or "").strip() or None
+    if not session_id:
+        return jsonify({"error": "session_id required"}), 400
+    cache_key = _session_cache_key(session_id, assistant_id)
+    evicted = False
+    with _handlers_lock:
+        info = _handlers.pop(cache_key, None)
+        if info is not None:
+            evicted = True
+            try:
+                info["handler"].close_sync()
+            except Exception:
+                logger.debug("evict: close_sync failed for %s", cache_key[:24], exc_info=True)
+    logger.info(
+        "🔁 session evict session=%s assistant=%s evicted=%s",
+        session_id[:18], assistant_id or "-", evicted,
+    )
+    return jsonify({"evicted": evicted})
+
+
 @app.route('/api/runtime/channels/max/bindings')
 def runtime_max_channel_bindings():
     """Return active MAX-channel bindings for the mgp-max-bridge.
