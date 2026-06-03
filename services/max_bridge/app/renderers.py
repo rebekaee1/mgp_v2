@@ -295,6 +295,39 @@ def render_final_menu_text() -> str:
     return "Что дальше? 🌴"
 
 
+# Payload sent (as a normal user message) when the client taps the subscription
+# button. It is matched by system_prompt.md (subscription block) which then calls
+# ``subscribe_tours`` — no callback handler needed, same mechanism as the menu.
+SUBSCRIPTION_BUTTON_PAYLOAD = (
+    "Хочу подписаться на мониторинг — пишите, когда появится подходящий "
+    "или подешевеет тур"
+)
+
+
+def render_subscription_keyboard() -> dict[str, Any]:
+    """Single ``message``-type button «🔔 Подписаться на мониторинг».
+
+    Rendered (by the webhook) only when the backend sets ``offer_subscription``
+    — i.e. at the hesitation moment for a pilot tenant with budget >= threshold.
+    Tapping it sends ``SUBSCRIPTION_BUTTON_PAYLOAD`` through the normal chat
+    pipeline, which triggers ``subscribe_tours``.
+    """
+    return {
+        "type": "inline_keyboard",
+        "payload": {
+            "buttons": [
+                [
+                    {
+                        "type": "message",
+                        "text": "🔔 Подписаться на мониторинг",
+                        "payload": SUBSCRIPTION_BUTTON_PAYLOAD,
+                    }
+                ]
+            ]
+        },
+    }
+
+
 def render_welcome_after_reset() -> str:
     """One-shot reply sent after a user-triggered session reset.
 

@@ -50,6 +50,7 @@ from .observability import new_correlation_id
 from .renderers import (
     render_final_menu_keyboard,
     render_final_menu_text,
+    render_subscription_keyboard,
     render_tour_card_caption,
     render_tour_card_keyboard,
 )
@@ -556,6 +557,14 @@ async def _process_message(
             crm=chat_response.crm_submitted,
         )
 
+        # Feature 2: deterministic subscription button at the hesitation moment.
+        # Backend flagged offer_subscription; attach the button to the reply (only
+        # when this turn has no new tour cards — a hesitation turn never searches).
+        subscription_keyboard = None
+        if chat_response.offer_subscription and not chat_response.tour_cards:
+            subscription_keyboard = render_subscription_keyboard()
+            log.info("subscription_button_attached")
+
         async with MaxApiClient(
             base_url=settings.max_api_base_url,
             bot_token=tenant.bot_token,
@@ -567,6 +576,7 @@ async def _process_message(
                 user_id=user_id,
                 reply=chat_response.reply,
                 log=log,
+                final_keyboard=subscription_keyboard,
             )
             if chat_response.tour_cards and settings.max_render_tour_cards:
                 await _send_tour_cards(
@@ -594,23 +604,36 @@ async def _send_reply_chunks(
     user_id: int,
     reply: str,
     log: structlog.stdlib.BoundLogger,
+    final_keyboard: Optional[dict[str, Any]] = None,
 ) -> None:
     chunks = split_for_max(reply)
     if not chunks:
         log.warning("empty_reply_from_backend")
         return
+    total = len(chunks)
     for i, chunk in enumerate(chunks, start=1):
+        # Attach the inline keyboard (e.g. the subscription button) to the LAST
+        # chunk so it sits under the assistant's final sentence.
+        attach = final_keyboard if (i == total and final_keyboard is not None) else None
         try:
-            await max_client.send_text(
-                chat_id=chat_id,
-                user_id=user_id if chat_id is None else None,
-                text=chunk,
-            )
+            if attach is not None:
+                await max_client.send_message(
+                    chat_id=chat_id,
+                    user_id=user_id if chat_id is None else None,
+                    text=chunk,
+                    attachments=[attach],
+                )
+            else:
+                await max_client.send_text(
+                    chat_id=chat_id,
+                    user_id=user_id if chat_id is None else None,
+                    text=chunk,
+                )
         except MaxApiError as exc:
             log.error(
                 "max_send_failed",
                 chunk_index=i,
-                chunks_total=len(chunks),
+                chunks_total=total,
                 status=exc.status_code,
                 code=exc.code,
                 message=exc.message,

@@ -2193,11 +2193,20 @@ def chat_v1():
 
         _mark_assistant_responded(session_id)
 
+        # Feature 2: deterministic "🔔 Подписаться на мониторинг" button.
+        # Backend decides (knows budget + gating + hesitation) so the bridge
+        # only renders the button at the right moment for the right tenant.
+        try:
+            _offer_sub = handler.should_offer_subscription_button(message)
+        except Exception:
+            _offer_sub = False
+
         return jsonify({
             'reply': reply,
             'tour_cards': tour_cards,
             'conversation_id': conversation_id,
-            'crm_submitted': bool(getattr(handler, '_crm_submitted', None))
+            'crm_submitted': bool(getattr(handler, '_crm_submitted', None)),
+            'offer_subscription': bool(_offer_sub)
         })
 
     except Exception as e:

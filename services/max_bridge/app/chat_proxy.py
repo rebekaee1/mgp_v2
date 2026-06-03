@@ -32,6 +32,7 @@ class ChatResponse:
     tour_cards: list[dict[str, Any]] = field(default_factory=list)
     conversation_id: Optional[str] = None
     crm_submitted: bool = False
+    offer_subscription: bool = False
     raw: dict[str, Any] = field(default_factory=dict)
 
 
@@ -126,5 +127,6 @@ class ChatProxy:
             tour_cards=list(payload.get("tour_cards") or []),
             conversation_id=payload.get("conversation_id"),
             crm_submitted=bool(payload.get("crm_submitted")),
+            offer_subscription=bool(payload.get("offer_subscription")),
             raw=payload,
         )
