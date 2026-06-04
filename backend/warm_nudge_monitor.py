@@ -46,6 +46,7 @@ import subscription_store as ST
 # после пилота сюда добавится AnyTour). Для остальных джоб ничего не делает.
 WARM_NUDGE_ASSISTANT_IDS = {
     "593471b7-42da-4ae0-8499-904dcedd6a4b",  # «Навылет! AI» (mgp-tour MAX, тест/пилот)
+    "64fea0d3-2605-4c4c-be67-62258ebfa7a9",  # AnyTour (Павел)
 }
 
 MIN_BUDGET = 200000            # премиум-гейт (как у кнопки подписки)

@@ -113,6 +113,8 @@ _SUBSCRIPTION_ALLOWED_ASSISTANT_IDS = {
     "593471b7-42da-4ae0-8499-904dcedd6a4b",
     # Локальный mgp-tour (для разработки)
     "d1327f41-3c31-4776-9f80-f22cde9bd579",
+    # AnyTour (Павел) — продовая раскатка подписки/мониторинга
+    "64fea0d3-2605-4c4c-be67-62258ebfa7a9",
 }
 
 # Минимальный бюджет (₽), с которого имеет смысл предлагать подписку.
@@ -1736,6 +1738,9 @@ def _map_hot_tour_to_card(tour_data: dict, booking_base_url: str = None,
         "image_url": tour_data.get("picturelink"),
         "hotel_link": hotel_link,
         "id": str(tourid or ""),
+        # Коды для логики подписки/мониторинга (выживают в БД и cold-restore).
+        "hotelcode": str(tour_data.get("hotelcode") or ""),
+        "region_id": str(tour_data.get("regioncode") or tour_data.get("hotelregioncode") or ""),
         "departure_city": tour_data.get("departurename") or "Москва",
         "is_hotel_only": False,
         "flight_included": True,
@@ -2162,6 +2167,10 @@ class YandexGPTHandler:
         # Коды регионов из восстановленных карточек (cold-restore) — fallback для
         # гео-скоупа подписки, оформленной после evict (когда _results_pool пуст).
         self._restored_region_codes: list = []
+        # Контекст подписки из ГОРЯЩИХ туров (get_hot_tours идёт отдельным путём и
+        # НЕ заполняет _last_search_params/_results_pool). Заполняется при показе
+        # горящих, чтобы subscribe_tours мог оформить подписку и из них.
+        self._hot_subscribe_ctx: Optional[Dict] = None
         self._upsell_budget: Optional[int] = None  # UPSELL-вилка: исходный бюджет клиента
         self._russia_no_region_hint: bool = False
         self._original_requested_meal: Optional[int] = None
@@ -6265,6 +6274,39 @@ class YandexGPTHandler:
                 if _cid:
                     self._booking_cards_cache[_cid] = _c
             logger.info("🎴 Built %d hot tour cards for frontend", len(self._pending_tour_cards))
+
+            # ── Контекст для подписки из горящих (subscribe_tours) ──
+            # get_hot_tours идёт отдельным путём; чтобы можно было оформить подписку
+            # из горящих, сохраняем критерии + показанные отели в _hot_subscribe_ctx
+            # и _tourid_map (НЕ трогаем _last_search_params/_results_pool — отдельный поток).
+            self._tourid_map = {}
+            _hot_regions, _hot_seen = [], []
+            for _i, _t in enumerate(simplified, 1):
+                _tid = str(_t.get("tourid") or "").strip()
+                _hc = str(_t.get("hotelcode") or "").strip()
+                _rc = str(_t.get("regioncode") or "").strip()
+                if _tid:
+                    self._tourid_map[_i] = {
+                        "tourid": _tid, "hotelcode": _hc or None,
+                        "hotelname": _t.get("hotelname") or "",
+                    }
+                if _hc and _hc not in _hot_seen:
+                    _hot_seen.append(_hc)
+                if _rc and _rc not in _hot_regions:
+                    _hot_regions.append(_rc)
+            _hc_raw = args.get("country") or args.get("countries")
+            _hot_country = _safe_int(str(_hc_raw).split(",")[0]) if _hc_raw else None
+            self._hot_subscribe_ctx = {
+                "_country": _hot_country,
+                "_regions": args.get("regions") or (",".join(_hot_regions) if _hot_regions else None),
+                "departure": args.get("city"),
+                "datefrom": args.get("datefrom"),
+                "dateto": args.get("dateto"),
+                "stars": args.get("stars"),
+                "adults": _adults_hot,
+                "child": _children_hot,
+                "seen_codes": _hot_seen or None,
+            }
             
             # ── Сокращённые данные для AI (без цен/дат/звёзд — они на карточках) ──
             ai_tours = []
@@ -6713,17 +6755,21 @@ class YandexGPTHandler:
         (gated to enabled tenants + MAX channel). Criteria come straight from the
         last successful search cache, so no extra Tourvisor call is needed.
         """
+        # Источник критериев: обычный поиск (_last_search_params) ИЛИ горящие
+        # (_hot_subscribe_ctx). Берём тот, где есть страна.
         sp = self._last_search_params or {}
-        if not sp or not sp.get("_country"):
+        hot_ctx = getattr(self, "_hot_subscribe_ctx", None) or {}
+        src = sp if sp.get("_country") else hot_ctx
+        if not src or not src.get("_country"):
             return {
                 "status": "error",
-                "message": ("Сначала выполни поиск туров (search_tours) — без него не из чего "
-                            "формировать подписку. Сначала подбери варианты, потом предлагай уведомления."),
+                "message": ("Сначала выполни поиск туров (search_tours или get_hot_tours) — без "
+                            "него не из чего формировать подписку. Сначала подбери варианты."),
             }
 
         dest_text = (args.get("dest_text") or "").strip()
         budget = (_safe_int(args.get("budget"))
-                  or _safe_int(sp.get("priceto"))
+                  or _safe_int(src.get("priceto"))
                   or self._user_stated_budget)
 
         seen_codes: List[str] = []
@@ -6731,10 +6777,12 @@ class YandexGPTHandler:
             hc = v.get("hotelcode")
             if hc and str(hc) not in seen_codes:
                 seen_codes.append(str(hc))
+        if not seen_codes and src.get("seen_codes"):
+            seen_codes = [str(c) for c in src["seen_codes"]]
 
         baseline = (self._last_search_result or {}).get("min_price")
-        child_ages = [sp[k] for k in ("childage1", "childage2", "childage3")
-                      if sp.get(k) is not None]
+        child_ages = [src[k] for k in ("childage1", "childage2", "childage3")
+                      if src.get(k) is not None]
 
         # ── Гео-скоуп подписки ──
         # 1) Явный регион из поиска (клиент искал «Анталию/Сиде») — используем как есть.
@@ -6742,25 +6790,25 @@ class YandexGPTHandler:
         #    чтобы монитор не искал по всей стране и не подсовывал Стамбул пляжнику.
         # 3) Если клиент подписался на конкретный отель/сеть — резолвим hotel_codes
         #    из подборки по имени (тогда монитор сужается до отеля/сети).
-        regions = (sp.get("_regions")
+        regions = (src.get("_regions")
                    or _infer_regions_from_pool(self._results_pool, self._results_pool_offset or 5)
                    or (",".join(getattr(self, "_restored_region_codes", []) or []) or None))
         hotel_codes = _resolve_hotel_codes(
             self._results_pool, self._tourid_map, args.get("hotel"))
 
         self._pending_subscription = {
-            "departure": sp.get("departure"),
-            "country": sp.get("_country"),
+            "departure": src.get("departure"),
+            "country": src.get("_country"),
             "regions": regions,
             "dest_text": dest_text or None,
-            "date_from": sp.get("datefrom"),
-            "date_to": sp.get("dateto"),
-            "nights_from": sp.get("nightsfrom"),
-            "nights_to": sp.get("nightsto"),
-            "adults": sp.get("adults"),
-            "children": sp.get("child"),
+            "date_from": src.get("datefrom"),
+            "date_to": src.get("dateto"),
+            "nights_from": src.get("nightsfrom"),
+            "nights_to": src.get("nightsto"),
+            "adults": src.get("adults"),
+            "children": src.get("child"),
             "child_ages": child_ages or None,
-            "min_stars": _safe_int(sp.get("stars")),
+            "min_stars": _safe_int(src.get("stars")),
             "budget": budget,
             "hotel_codes": hotel_codes,
             "hotel_name": (args.get("hotel") or "").strip() or None,
@@ -6768,12 +6816,12 @@ class YandexGPTHandler:
             "seen_codes": seen_codes or None,
         }
         logger.info(
-            "🔔 SUBSCRIBE geo: regions=%s hotel_codes=%s (explicit_region=%s)",
-            regions, hotel_codes, bool(sp.get("_regions")),
+            "🔔 SUBSCRIBE geo: regions=%s hotel_codes=%s (explicit_region=%s, hot=%s)",
+            regions, hotel_codes, bool(src.get("_regions")), src is hot_ctx,
         )
         logger.info(
             "🔔 SUBSCRIBE intent: country=%s dest=%s budget=%s stars=%s seen=%d baseline=%s",
-            sp.get("_country"), dest_text, budget, sp.get("stars"),
+            src.get("_country"), dest_text, budget, src.get("stars"),
             len(seen_codes), baseline,
         )
         return {

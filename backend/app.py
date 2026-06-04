@@ -544,6 +544,7 @@ def _restore_handler_from_db(handler, session_id: str, assistant_id: str = None)
                 _SUB_HINT_TENANTS = {
                     "593471b7-42da-4ae0-8499-904dcedd6a4b",  # mgp-tour (тест/пилот)
                     "d1327f41-3c31-4776-9f80-f22cde9bd579",  # локальный mgp-tour
+                    "64fea0d3-2605-4c4c-be67-62258ebfa7a9",  # AnyTour (Павел)
                 }
                 if str(getattr(conv, "assistant_id", "")) in _SUB_HINT_TENANTS:
                     from models import TourSubscription

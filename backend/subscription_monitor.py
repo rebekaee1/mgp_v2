@@ -363,9 +363,18 @@ async def run(args) -> int:
     return 0
 
 
+# Тенанты с включённой подпиской — монитор обрабатывает их все (если не задан
+# --assistant-id). Старт — тест-бот; после раскатки добавлен AnyTour (Павел).
+SUBSCRIPTION_ASSISTANT_IDS = [
+    "593471b7-42da-4ae0-8499-904dcedd6a4b",  # «Навылет! AI» (тест/пилот)
+    "64fea0d3-2605-4c4c-be67-62258ebfa7a9",  # AnyTour (Павел)
+]
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--assistant-id", default=TEST_ASSISTANT_ID)
+    ap.add_argument("--assistant-id", default=None,
+                    help="один тенант; по умолчанию — все из SUBSCRIPTION_ASSISTANT_IDS")
     ap.add_argument("--send", action="store_true", help="actually send (else dry-run)")
     ap.add_argument("--ignore-timing", action="store_true",
                     help="bypass quiet/cadence/window (testing)")
@@ -375,7 +384,16 @@ def main() -> int:
     ap.add_argument("--throttle-sec", type=float, default=2.0)
     ap.add_argument("--samples", type=int, default=6)
     args = ap.parse_args()
-    return asyncio.run(run(args))
+    aids = [args.assistant_id] if args.assistant_id else list(SUBSCRIPTION_ASSISTANT_IDS)
+    rc = 0
+    for _aid in aids:
+        args.assistant_id = _aid
+        try:
+            rc = asyncio.run(run(args)) or rc
+        except Exception as e:  # noqa: BLE001 — один тенант не должен валить остальных
+            log(f"MONITOR ERROR assistant={_aid}: {e}")
+            rc = 1
+    return rc
 
 
 if __name__ == "__main__":
