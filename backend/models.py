@@ -195,6 +195,12 @@ class Conversation(Base):
     last_active_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow, onupdate=_utcnow
     )
+    # Feature «тёплый добив»: когда отправили проактивный нудж после молчания
+    # клиента на подборке (NULL = ещё не добивали). Гарантирует «один раз за
+    # диалог». Тенант-агностично; столбец nullable, существующие строки = NULL.
+    warm_nudge_sent_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
 
     assistant: Mapped[Optional["Assistant"]] = relationship(
         back_populates="conversations"
