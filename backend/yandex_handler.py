@@ -135,17 +135,17 @@ _SUBSCRIPTION_PROMPT_BLOCK = """\
 - «подумаю» (с причиной) → уточни, что обдумать; если назвал цену/отель/даты → отрабатывай ПО НЕЙ.
 ⛔ На ШАГЕ 1 НЕ предлагай ни менеджера, ни мониторинг — сначала помоги. НИКОГДА не начинай ответ с «могу передать менеджеру».
 
-ШАГ 2 — оффер мониторинга уместен ТОЛЬКО когда клиент реально «встаёт и уходит» или расплывчато колеблется повторно:
+ШАГ 2 — оффер мониторинга уместен ТОЛЬКО когда клиент реально «встаёт и уходит» или колеблется ПОВТОРНО (т.е. ты УЖЕ один раз отработал возражение/переподобрал, а он всё равно не решается):
 - клиент ЯВНО уходит/на паузу: «вернусь позже», «позже», «потом напишу», «не сейчас» → дай ДВОЙНОЙ оффер сразу;
-- расплывчатое «подумаю / посоветуюсь» БЕЗ конкретики ПОВТОРНО (2-й раз) → дай ДВОЙНОЙ оффер;
+- «подумаю / посоветуюсь» ПОСЛЕ уже отработанного возражения (напр. сначала было «дорого» — ты присоединился/переподобрал, теперь он «подумаю») ИЛИ повторное «подумаю» → дай ДВОЙНОЙ оффер;
 - клиент отказался («нет, спасибо», «не надо») → ОДИН раз мягко предложи только мониторинг («могу просто послеживать и написать, если появится выгодный вариант — ничего делать не нужно»), без повторов.
 ДВОЙНОЙ оффер (выбор за клиентом):
 «Понимаю! Могу передать ваш контакт менеджеру (перезвонит и поможет оформить), либо подписать вас на мониторинг — буду следить за турами по вашему запросу и напишу сюда, как появится более выгодный/подходящий вариант (кнопка ниже). Что удобнее?»
-⛔ НЕ предлагай мониторинг на возражение по ЦЕНЕ/качеству/конкретике — это ШАГ 1 (отработка).
+⛔ На ПЕРВОЕ возражение по ЦЕНЕ/качеству/конкретике мониторинг НЕ предлагай — это ШАГ 1 (сначала отработай).
 
 ### Условия для ШАГА 2
-Только когда: был показ туров (search_tours) И бюджет ≥ 200 000 ₽ И клиент ещё не оставил контакт / не готов бронировать.
-Бюджет < 200 000 ₽ → мониторинг НЕ предлагай, веди как обычно (менеджер). Отработку возражения (ШАГ 1) это НЕ отменяет — она нужна всегда.
+Только когда: был показ туров (search_tours) И клиент называл бюджет ≥ 200 000 ₽ хотя бы раз (даже если потом торгуется ниже — он всё равно премиум-лид) И клиент ещё не оставил контакт / не готов бронировать.
+Если клиент НИ РАЗУ не называл бюджет ≥ 200 000 ₽ → мониторинг НЕ предлагай, веди как обычно (менеджер). Отработку возражения (ШАГ 1) это НЕ отменяет — она нужна всегда.
 
 ### Оформление подписки
 - Клиент выбрал мониторинг («да», «подписку», «следить», нажал кнопку «🔔 Подписаться на мониторинг») → вызови subscribe_tours с dest_text (направление в винительном падеже, напр. «Турцию»); конкретный отель — в hotel. После вызова тепло подтверди своими словами, БЕЗ перечисления критериев списком.
@@ -174,6 +174,15 @@ _SUB_LEAVE_RE = re.compile(
 )
 # THINK — расплывчатое колебание → оффер только со 2-го раза (1-й = отработка).
 _SUB_THINK_RE = re.compile(r"(?:подума|посоветова|обдума)", re.IGNORECASE)
+# RELUCTANCE — подмножество HANDLE: ценовые/доверительные «тормоза» (БЕЗ уточнений
+# по отелю/датам/звёздам — те считаем активным шопингом, а не колебанием).
+# Нужен, чтобы отработанное ценовое возражение засчитывалось как «раунд колебания»:
+# «дорого» (помогли) → затем «подумаю» = 2-е колебание → оффер уместен.
+_SUB_RELUCTANCE_RE = re.compile(
+    r"(?:дорог|дешевл|подешев|бюджет|не по карман|подорож|\bцен[аыуе]|"
+    r"рассрочк|кредит|обман|подвох|развод|опасн|страшн|\bвойн)",
+    re.IGNORECASE,
+)
 # DECLINE — отказ → ОДИН мягкий оффер (без повторов).
 _SUB_DECLINE_RE = re.compile(
     r"(?:нет,?\s*спасибо|не\s*надо|не\s*нужно|передума|спасибо,?\s*не\b|больше не\b)",
@@ -185,6 +194,76 @@ _SUB_OFFER_MARK_RE = re.compile(
     r"следить за турами по вашему|буду следить за турами)",
     re.IGNORECASE,
 )
+
+
+def _subscription_reveal_order(scored, lead_code, seen_codes):
+    """Порядок индексов ``scored`` для «reveal» ответа на тизер подписки.
+
+    Бизнес-правило (согласовано): на «да» показываем ЛИД-отель из тизера первым,
+    затем варианты, которых клиент ЕЩЁ НЕ ВИДЕЛ; уже показанные (seen_codes) —
+    только как запас, если новых меньше трёх (чтобы не показать пустую/из 1
+    карточки подборку). ``scored`` — список кортежей, где item[2] — словарь отеля
+    с ``hotelcode``. Возвращает список индексов в ``scored`` (≤ 5).
+    """
+    lead_code = str(lead_code) if lead_code else ""
+    seen = {str(c) for c in (seen_codes or set())}
+    lead, fresh, seen_other = [], [], []
+    for i, item in enumerate(scored):
+        hotel = item[2] if len(item) > 2 else {}
+        code = str((hotel or {}).get("hotelcode") or "")
+        if lead_code and code == lead_code:
+            lead.append(i)
+        elif code in seen:
+            seen_other.append(i)
+        else:
+            fresh.append(i)
+    order = lead + fresh
+    if len(order) < 3:
+        order = order + seen_other
+    return order[:5]
+
+
+def _infer_regions_from_pool(results_pool, limit=5):
+    """Distinct region codes of the shown подборки (in order, ≤ limit hotels).
+
+    Позволяет подписке, оформленной при поиске «по стране» (без региона),
+    авто-сузиться до курортов, которые клиент РЕАЛЬНО видел — иначе монитор ищет
+    по всей стране и подсовывает нерелевантные городские отели (Стамбул пляжнику).
+    Возвращает строку «code1,code2» или None.
+    """
+    out = []
+    for item in (results_pool or [])[:max(int(limit or 0), 1)]:
+        hotel = item[2] if len(item) > 2 else {}
+        code = str((hotel or {}).get("regioncode") or "").strip()
+        if code and code not in out:
+            out.append(code)
+    return ",".join(out) if out else None
+
+
+def _resolve_hotel_codes(results_pool, tourid_map, hotel_arg):
+    """Сопоставить имя отеля/сети (`hotel` из subscribe_tours) с hotelcode(ами)
+    из показанной подборки, чтобы монитор сузился до этого отеля/сети.
+
+    Подстрочное совпадение в обе стороны: 'Rixos' (сеть) поймает все Rixos-* в
+    подборке, полное имя — конкретный отель. Возвращает список кодов или None.
+    """
+    name = (hotel_arg or "").strip().lower()
+    if not name:
+        return None
+    codes = []
+
+    def _try(hname, hcode):
+        hn = str(hname or "").lower()
+        hc = str(hcode or "").strip()
+        if hc and hn and (name in hn or hn in name) and hc not in codes:
+            codes.append(hc)
+
+    for item in (results_pool or []):
+        hotel = item[2] if len(item) > 2 else {}
+        _try((hotel or {}).get("hotelname"), (hotel or {}).get("hotelcode"))
+    for v in (tourid_map or {}).values():
+        _try(v.get("hotelname"), v.get("hotelcode"))
+    return codes or None
 
 _MGP_OFFICES_CACHE: Optional[List[Dict]] = None
 
@@ -2066,6 +2145,16 @@ class YandexGPTHandler:
         # и используется как fallback для пропущенных параметров.
         self._last_search_params: Dict = {}
         self._user_stated_budget: Optional[int] = None
+        # Пиковый (максимальный) названный бюджет за диалог. Клиент мог открыть на
+        # 200к и торговаться вниз — для гейта подписки он всё равно премиум-лид.
+        self._peak_stated_budget: Optional[int] = None
+        # «Reveal» подписки: одноразовый контекст ответа на тизер мониторинга.
+        # Когда выставлены (в cold-restore из активной подписки) — следующий
+        # search_tours покажет ЛИД-отель из тизера первым, исключит уже показанные
+        # отели и опустит пол до цены тизера. Сбрасываются после одной выдачи.
+        self._sub_reveal_lead_code: Optional[str] = None
+        self._sub_reveal_seen_codes: set = set()
+        self._sub_reveal_price_floor: Optional[int] = None
         self._upsell_budget: Optional[int] = None  # UPSELL-вилка: исходный бюджет клиента
         self._russia_no_region_hint: bool = False
         self._original_requested_meal: Optional[int] = None
@@ -2205,6 +2294,12 @@ class YandexGPTHandler:
         _floor = int(_orig_priceto * _ratio)
         if _orig_priceto - _floor < _min_window:
             _floor = max(_orig_priceto - _min_window, 0)
+        # Subscription reveal: опускаем пол до цены тизера, иначе gated 0.90 floor
+        # отсекает рекламированный отель (тизер обещал его — он обязан попасть).
+        _rev_floor = getattr(self, "_sub_reveal_price_floor", None)
+        if _rev_floor and _floor > int(_rev_floor):
+            logger.info("🔔 SUB-REVEAL floor cap: pricefrom %s → %s", _floor, int(_rev_floor))
+            _floor = int(_rev_floor)
         args["pricefrom"] = _floor
         self._budget_floor_meta = {
             "original_priceto": _orig_priceto,
@@ -2791,7 +2886,12 @@ class YandexGPTHandler:
                 return False
             if not (getattr(self, "_last_search_result", None) or getattr(self, "_tourid_map", None)):
                 return False
-            budget = getattr(self, "_user_stated_budget", None)
+            # Гейт по бюджету: берём ПИКОВЫЙ названный бюджет, а не последний.
+            # Клиент мог открыть на 200к и торговаться вниз до 180к — он всё равно
+            # премиум-лид, подписку предлагать уместно (иначе она «уплывает» под
+            # порог при первом же торге по цене).
+            budget = (getattr(self, "_peak_stated_budget", None)
+                      or getattr(self, "_user_stated_budget", None))
             if not budget:
                 lsp = getattr(self, "_last_search_params", None) or {}
                 budget = _safe_int(lsp.get("priceto"), None)
@@ -2817,18 +2917,22 @@ class YandexGPTHandler:
             if _SUB_LEAVE_RE.search(norm) or _SUB_DECLINE_RE.search(norm):
                 return True
 
-            # Расплывчатое «подумаю» → только со 2-го раза (1-й = отработка).
+            # Расплывчатое «подумаю» → оффер со 2-го КОЛЕБАНИЯ (1-е = отработка).
+            # Колебанием считаем не только «подумаю/уйду», но и отработанное
+            # ценовое/доверительное возражение (дорого/рассрочка/«страшно»…):
+            # клиент уже раз притормозил, мы помогли — и если он всё равно
+            # «подумаю», самое время предложить мониторинг. Уточнения по
+            # отелю/датам/звёздам НЕ считаем (это активный шопинг, а не уход).
             if _SUB_THINK_RE.search(norm):
-                think_signals = 0
+                rounds = 0
                 for _m in hist:
                     if not isinstance(_m, dict) or _m.get("role") != "user":
                         continue
                     _c = (_m.get("content") or "").lower().replace("ё", "е")
-                    if _SUB_HANDLE_RE.search(_c):
-                        continue  # actionable — не считаем за «подумаю»
-                    if _SUB_THINK_RE.search(_c) or _SUB_LEAVE_RE.search(_c):
-                        think_signals += 1
-                return think_signals >= 2
+                    if (_SUB_THINK_RE.search(_c) or _SUB_LEAVE_RE.search(_c)
+                            or _SUB_RELUCTANCE_RE.search(_c)):
+                        rounds += 1
+                return rounds >= 2
             return False
         except Exception:
             logger.debug("should_offer_subscription_button failed", exc_info=True)
@@ -4337,6 +4441,11 @@ class YandexGPTHandler:
                 # При UPSELL-вилке priceto уже раздут до budget×1.3 — для
                 # предупреждений/партиции храним ИСХОДНЫЙ бюджет клиента.
                 self._user_stated_budget = getattr(self, "_upsell_budget", None) or int(args["priceto"])
+                if self._user_stated_budget:
+                    self._peak_stated_budget = max(
+                        getattr(self, "_peak_stated_budget", None) or 0,
+                        int(self._user_stated_budget),
+                    )
             
             # ── Fix C2: Сохраняем параметры успешного поиска в кэш ──
             self._last_search_params = {
@@ -5164,35 +5273,56 @@ class YandexGPTHandler:
                 _scored_hotels.sort(key=lambda x: x[1])
                 logger.info("💰 PRICE SORT: %d hotels sorted by price (budget specified)", len(_scored_hotels))
             
-            # ── Уровень 3: tiered selection by hotel rating ──
-            _RATING_TIERS = [4.3, 4.0, 3.8, 0]
-            _selected = []
-            _seen_idx = set()
-            _tier_counts = []
-            for _threshold in _RATING_TIERS:
-                _before = len(_selected)
-                if _before >= 5:
-                    break
-                for _idx, _item in enumerate(_scored_hotels):
-                    if _idx in _seen_idx:
-                        continue
-                    _hr = _safe_float(_item[2].get("hotelrating"), 0)
-                    if _hr >= _threshold or _threshold == 0:
-                        _selected.append(_item)
-                        _seen_idx.add(_idx)
-                        if len(_selected) >= 5:
-                            break
-                _tier_counts.append(len(_selected) - _before)
-            logger.info(
-                "⭐ RATING TIERS: %s from tiers 4.3+/4.0+/3.8+/other (total %d scored)",
-                _tier_counts, len(_scored_hotels)
-            )
+            # ── Subscription reveal: ответ на тизер мониторинга ──
+            # ЛИД-отель из тизера первым + НОВЫЕ варианты (исключая уже показанные
+            # клиенту). Заменяет рейтинговый отбор ТОЛЬКО в этом одноразовом
+            # контексте; обычный поиск идёт прежним путём (else). Фикс «показал те
+            # же варианты» + «тизер ≠ подборка».
+            if getattr(self, "_sub_reveal_lead_code", None) or getattr(self, "_sub_reveal_seen_codes", None):
+                _sel_idx = _subscription_reveal_order(
+                    _scored_hotels, self._sub_reveal_lead_code, self._sub_reveal_seen_codes)
+                _selected = [_scored_hotels[i] for i in _sel_idx]
+                _seen_idx = set(_sel_idx)
+                _upsell_meta = None
+                logger.info(
+                    "🔔 SUB-REVEAL select: lead=%s exclude_seen=%d → %d cards (idx=%s)",
+                    self._sub_reveal_lead_code, len(self._sub_reveal_seen_codes or []),
+                    len(_selected), _sel_idx,
+                )
+                # one-shot: сбрасываем флаги reveal после одной выдачи
+                self._sub_reveal_lead_code = None
+                self._sub_reveal_seen_codes = set()
+                self._sub_reveal_price_floor = None
+            else:
+                # ── Уровень 3: tiered selection by hotel rating ──
+                _RATING_TIERS = [4.3, 4.0, 3.8, 0]
+                _selected = []
+                _seen_idx = set()
+                _tier_counts = []
+                for _threshold in _RATING_TIERS:
+                    _before = len(_selected)
+                    if _before >= 5:
+                        break
+                    for _idx, _item in enumerate(_scored_hotels):
+                        if _idx in _seen_idx:
+                            continue
+                        _hr = _safe_float(_item[2].get("hotelrating"), 0)
+                        if _hr >= _threshold or _threshold == 0:
+                            _selected.append(_item)
+                            _seen_idx.add(_idx)
+                            if len(_selected) >= 5:
+                                break
+                    _tier_counts.append(len(_selected) - _before)
+                logger.info(
+                    "⭐ RATING TIERS: %s from tiers 4.3+/4.0+/3.8+/other (total %d scored)",
+                    _tier_counts, len(_scored_hotels)
+                )
 
-            # ── UPSELL-вилка: гарантируем 1 карточку «чуть дороже, но лучше» ──
-            # (идея Павла). Только при заданном бюджете и наличии достойного
-            # варианта выше бюджета (в пределах +headroom). seen_idx обновляется
-            # внутри, чтобы апселл-отель не задвоился в _remaining.
-            _upsell_meta = self._inject_upsell_card(_selected, _scored_hotels, _seen_idx)
+                # ── UPSELL-вилка: гарантируем 1 карточку «чуть дороже, но лучше» ──
+                # (идея Павла). Только при заданном бюджете и наличии достойного
+                # варианта выше бюджета (в пределах +headroom). seen_idx обновляется
+                # внутри, чтобы апселл-отель не задвоился в _remaining.
+                _upsell_meta = self._inject_upsell_card(_selected, _scored_hotels, _seen_idx)
 
             # ── Пул: первые 5 (tiered) + остальные в порядке сортировки ──
             _remaining = [item for _idx, item in enumerate(_scored_hotels) if _idx not in _seen_idx]
@@ -6599,10 +6729,21 @@ class YandexGPTHandler:
         child_ages = [sp[k] for k in ("childage1", "childage2", "childage3")
                       if sp.get(k) is not None]
 
+        # ── Гео-скоуп подписки ──
+        # 1) Явный регион из поиска (клиент искал «Анталию/Сиде») — используем как есть.
+        # 2) Иначе выводим регионы из показанной подборки (курорты, что клиент видел),
+        #    чтобы монитор не искал по всей стране и не подсовывал Стамбул пляжнику.
+        # 3) Если клиент подписался на конкретный отель/сеть — резолвим hotel_codes
+        #    из подборки по имени (тогда монитор сужается до отеля/сети).
+        regions = sp.get("_regions") or _infer_regions_from_pool(
+            self._results_pool, self._results_pool_offset or 5)
+        hotel_codes = _resolve_hotel_codes(
+            self._results_pool, self._tourid_map, args.get("hotel"))
+
         self._pending_subscription = {
             "departure": sp.get("departure"),
             "country": sp.get("_country"),
-            "regions": sp.get("_regions"),
+            "regions": regions,
             "dest_text": dest_text or None,
             "date_from": sp.get("datefrom"),
             "date_to": sp.get("dateto"),
@@ -6613,10 +6754,15 @@ class YandexGPTHandler:
             "child_ages": child_ages or None,
             "min_stars": _safe_int(sp.get("stars")),
             "budget": budget,
+            "hotel_codes": hotel_codes,
             "hotel_name": (args.get("hotel") or "").strip() or None,
             "baseline_price": baseline,
             "seen_codes": seen_codes or None,
         }
+        logger.info(
+            "🔔 SUBSCRIBE geo: regions=%s hotel_codes=%s (explicit_region=%s)",
+            regions, hotel_codes, bool(sp.get("_regions")),
+        )
         logger.info(
             "🔔 SUBSCRIBE intent: country=%s dest=%s budget=%s stars=%s seen=%d baseline=%s",
             sp.get("_country"), dest_text, budget, sp.get("stars"),

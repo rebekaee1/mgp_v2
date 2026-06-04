@@ -557,6 +557,23 @@ def _restore_handler_from_db(handler, session_id: str, assistant_id: str = None)
                             f"варианты — выдача та же по качеству, что и в обычном поиске."
                         )
                         handler._pinned_context = (getattr(handler, "_pinned_context", "") or "") + _hint
+                        # ── Reveal-флаги: бэкенд сам поставит ЛИД-отель из тизера
+                        # первым и исключит уже показанные отели (фикс «показал те
+                        # же варианты» / «тизер ≠ подборка»). Одноразовые. ──
+                        try:
+                            if _sub.last_notified_hotelcode:
+                                handler._sub_reveal_lead_code = str(_sub.last_notified_hotelcode)
+                            _seen = {str(c) for c in (_sub.seen_codes or [])}
+                            for _batch in card_batches:
+                                for _card in _batch:
+                                    _hc = _card.get("hotelcode")
+                                    if _hc:
+                                        _seen.add(str(_hc))
+                            handler._sub_reveal_seen_codes = _seen
+                            if _sub.last_notified_price:
+                                handler._sub_reveal_price_floor = int(_sub.last_notified_price)
+                        except Exception:
+                            logger.debug("Ф.2 sub-reveal flags failed", exc_info=True)
             except Exception:
                 logger.debug("Ф.2 subscription pinned-context hint failed", exc_info=True)
 
@@ -1010,6 +1027,7 @@ def _persist_pending_subscription(db, conv, pend: dict) -> None:
         child_ages=pend.get("child_ages"),
         min_stars=pend.get("min_stars"),
         budget=pend.get("budget"),
+        hotel_codes=pend.get("hotel_codes"),
         hotel_name=pend.get("hotel_name"),
         baseline_price=pend.get("baseline_price"),
         seen_codes=pend.get("seen_codes"),
