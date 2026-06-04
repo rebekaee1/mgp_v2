@@ -475,7 +475,8 @@ def _restore_handler_from_db(handler, session_id: str, assistant_id: str = None)
             if latest_tour_cards:
                 handler._tourid_map = {}
                 for idx, card in enumerate(latest_tour_cards, 1):
-                    tour_id = str(card.get("tourid") or "").strip()
+                    # Карточка хранит tourid в поле "id"; "tourid" — на случай старого формата.
+                    tour_id = str(card.get("tourid") or card.get("id") or "").strip()
                     if not tour_id:
                         continue
                     handler._tourid_map[idx] = {
@@ -483,6 +484,14 @@ def _restore_handler_from_db(handler, session_id: str, assistant_id: str = None)
                         "hotelcode": card.get("hotelcode"),
                         "hotelname": card.get("hotel_name") or card.get("hotelname") or "",
                     }
+                # Гео-скоуп для подписки ПОСЛЕ evict (тёплый добив/тизер): _results_pool
+                # при cold-restore пуст, поэтому коды регионов берём из карточек.
+                _restored_rc = []
+                for card in latest_tour_cards:
+                    _rc = str(card.get("region_id") or "").strip()
+                    if _rc and _rc not in _restored_rc:
+                        _restored_rc.append(_rc)
+                handler._restored_region_codes = _restored_rc
 
                 if getattr(handler, "_tourid_map", None) and hasattr(handler, "_pinned_context"):
                     lines = ["[КОНТЕКСТ: текущие показанные туры]"]

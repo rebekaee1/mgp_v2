@@ -1647,6 +1647,10 @@ def _map_hotel_to_card(hotel: dict, departure_city: str = "Москва", adults
         "image_url": hotel.get("picturelink"),
         "hotel_link": hotel_link,
         "id": str(tourid or ""),
+        # Коды для логики подписки/мониторинга (выживают в БД и при cold-restore):
+        # hotelcode — для seen_codes/дедупа, region_id — для гео-скоупа подписки.
+        "hotelcode": str(hotel.get("hotelcode") or ""),
+        "region_id": str(hotel.get("regioncode") or ""),
         "departure_city": departure_city,
         "is_hotel_only": is_no_flight,
         "flight_included": not is_no_flight,
@@ -2155,6 +2159,9 @@ class YandexGPTHandler:
         self._sub_reveal_lead_code: Optional[str] = None
         self._sub_reveal_seen_codes: set = set()
         self._sub_reveal_price_floor: Optional[int] = None
+        # Коды регионов из восстановленных карточек (cold-restore) — fallback для
+        # гео-скоупа подписки, оформленной после evict (когда _results_pool пуст).
+        self._restored_region_codes: list = []
         self._upsell_budget: Optional[int] = None  # UPSELL-вилка: исходный бюджет клиента
         self._russia_no_region_hint: bool = False
         self._original_requested_meal: Optional[int] = None
@@ -6735,8 +6742,9 @@ class YandexGPTHandler:
         #    чтобы монитор не искал по всей стране и не подсовывал Стамбул пляжнику.
         # 3) Если клиент подписался на конкретный отель/сеть — резолвим hotel_codes
         #    из подборки по имени (тогда монитор сужается до отеля/сети).
-        regions = sp.get("_regions") or _infer_regions_from_pool(
-            self._results_pool, self._results_pool_offset or 5)
+        regions = (sp.get("_regions")
+                   or _infer_regions_from_pool(self._results_pool, self._results_pool_offset or 5)
+                   or (",".join(getattr(self, "_restored_region_codes", []) or []) or None))
         hotel_codes = _resolve_hotel_codes(
             self._results_pool, self._tourid_map, args.get("hotel"))
 
