@@ -1093,6 +1093,24 @@ def _check_cascade_slots(full_history: List[Dict], args: Dict, is_follow_up: boo
     has_stars = any(re.search(p, user_text) for p in stars_patterns)
     has_meal = any(re.search(p, user_text) for p in meal_patterns)
     has_brand = any(re.search(p, user_text) for p in hotel_brand_patterns)
+
+    # Fix A (BUG-1): засчитываем звёздность/питание из АРГУМЕНТОВ вызова, если модель
+    # уже их извлекла из реплик клиента ("4 и выше" → stars:4), даже когда текстовая
+    # регулярка формулировку не поймала. Зеркалит доверие к аргументам в
+    # _args_have_all_slots (выше) — только ОСЛАБЛЯЕТ гейт, новых блокировок не создаёт.
+    # Без этого короткий тур (nights<3, escape-hatch выключен) + терсный ввод → петля
+    # повторных search_tours (см. аудит 2026-06: ОАЭ/Стамбул/короткие выезды).
+    try:
+        if int(_st) > 0:
+            has_stars = True
+    except (TypeError, ValueError):
+        pass
+    try:
+        if int(_ml) > 0:
+            has_meal = True
+    except (TypeError, ValueError):
+        pass
+
     
     # Если бренд/отель обнаружен в тексте, проверяем: не вернул ли get_dictionaries пустой результат?
     # Если отель НЕ найден в каталоге TourVisor — QC НЕ должен быть автоматически пройден,
