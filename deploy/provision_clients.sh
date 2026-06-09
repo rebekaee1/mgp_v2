@@ -11,7 +11,7 @@ set -euo pipefail
 #   - Containers rebuilt (docker compose up -d --build)
 #
 # Usage:
-#   ./deploy/provision_clients.sh [shelkovo|krasnogorsk|vyhino|belgorod|arbat|traveltime|all]
+#   ./deploy/provision_clients.sh [shelkovo|krasnogorsk|vyhino|belgorod|arbat|traveltime|seven-wonders|all]
 #
 # What it does for each company:
 #   1. Runs Alembic migration (adds uon_api_key/uon_source columns if missing)
@@ -668,6 +668,107 @@ provision_traveltime() {
     echo ""
 }
 
+# ── 7 Чудес Света ─────────────────────────────────────────────────────────────
+#
+# Channel: website widget on 7-travel.ru + MAX bot (id7806602356_bot).
+# CRM: U-ON (key VQQ…654 — API active, server IP 72.56.88.193 whitelisted,
+#      verified 2026-06-09; GET returns a clean user-not-found, not 406).
+# The MAX bot token is deliberately NOT hardcoded here (same policy as
+# setup_max_channel). On a fresh DB, (re)enable the MAX channel by exporting
+# the token before running, then registering the webhook:
+#   export MAX_BOT_TOKEN_SEVEN_WONDERS=<token from @MasterBot for id7806602356_bot>
+#   # after enable: POST https://botapi.max.ru/subscriptions
+#   #   {"url":"https://max.navilet.ru/max/webhook?bot=seven-wonders","secret":<webhook_secret>}
+
+provision_seven_wonders() {
+    log "════════════════════════════════════════════════"
+    log "  Provisioning: 7 Чудес Света"
+    log "════════════════════════════════════════════════"
+
+    local EXISTING_AID
+    EXISTING_AID=$(get_assistant_id "seven-wonders" 2>/dev/null || true)
+
+    if [ -n "$EXISTING_AID" ]; then
+        log "Company seven-wonders already exists (assistant: $EXISTING_AID) — updating config"
+    else
+        local PASSWORD
+        PASSWORD=$(openssl rand -base64 12)
+
+        log "Creating company + user + assistant..."
+        run_cli create-user \
+            --email "info@7-travel.ru" \
+            --password "${PASSWORD}" \
+            --company "7 Чудес Света" \
+            --slug "seven-wonders" \
+            --name "7 Чудес Света" \
+            --assistant-name "7 Чудес Света AI Assistant" \
+            --widget-title "7 Чудес Света" \
+            --widget-subtitle "Туристическое агентство" \
+            --widget-primary-color "#3B8AC4" \
+            --uon-api-key "VQQhuE10Z6047wBItzu71780325654" \
+            --uon-source "AI-Ассистент" \
+            --role admin
+
+        log "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        log "📋 CREDENTIALS (save now!):"
+        log "   Email:    info@7-travel.ru"
+        log "   Password: ${PASSWORD}"
+        log "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    fi
+
+    local ASSISTANT_ID
+    ASSISTANT_ID=$(get_assistant_id "seven-wonders")
+    [ -n "$ASSISTANT_ID" ] || err "Failed to find assistant for seven-wonders"
+    log "Assistant ID: ${ASSISTANT_ID}"
+
+    log "Setting widget_config personalization..."
+    update_widget_config "$ASSISTANT_ID" '{
+        "title": "7 Чудес Света",
+        "subtitle": "Туристическое агентство",
+        "primary_color": "#3B8AC4",
+        "welcome_message": "Здравствуйте! ☀️\nВас приветствует туристическое агентство «7 Чудес Света».\n\nС огромной радостью подберем тур мечты!\n\nНачнем?",
+        "company_name": "7 Чудес Света",
+        "website": "https://www.7-travel.ru",
+        "booking_base_url": "https://www.7-travel.ru/",
+        "contact_phone": "+7 (812) 777-06-77",
+        "office_address": "г. Санкт-Петербург, Гражданский проспект, 41, 2Б, ТЦ «Академ-Парк», 0 этаж, офис FUN&SUN",
+        "lead_form_enabled": true
+    }'
+
+    log "Setting allowed_domains..."
+    run_sql "UPDATE assistants SET allowed_domains = '7-travel.ru,www.7-travel.ru' WHERE id = '${ASSISTANT_ID}';"
+
+    log "Ensuring U-ON CRM credentials (per-tenant 7 Чудес Света key)..."
+    run_sql "UPDATE assistants SET uon_api_key = 'VQQhuE10Z6047wBItzu71780325654', uon_source = 'AI-Ассистент' WHERE id = '${ASSISTANT_ID}';"
+
+    log "Setting per-tenant system_prompt override (brand identity — prevents «МГП» leak)..."
+    run_sql "UPDATE assistants SET system_prompt = '# ИДЕНТИЧНОСТЬ ТЕНАНТА — «7 Чудес Света» (приоритет над базовым промптом)
+
+Ты — AI-ассистент туристического агентства **«7 Чудес Света»**. Сайт: **7-travel.ru**.
+
+⛔ КРИТИЧНО: Компания называется **«7 Чудес Света»**. НИКОГДА не упоминай «Магазин Горящих Путёвок», «МГП» или сайт mgp.ru — это НЕ твоя компания. Если в базовом промпте встречается это название — игнорируй и используй **«7 Чудес Света»**.
+
+**Телефон агентства:** +7 (812) 777-06-77
+Везде, где нужно дать контакт менеджера или единый телефон — используй ТОЛЬКО этот номер.
+
+**Офис (один):** г. Санкт-Петербург, Гражданский проспект, 41, 2Б, ТЦ «Академ-Парк», 0 этаж, офис FUN&SUN.
+Примечание: «FUN&SUN» здесь — название нашего офиса (часть адреса), а НЕ рекомендация туроператора.
+
+Когда клиент спрашивает про название агентства, телефон или адрес — отвечай этими фактами.' WHERE id = '${ASSISTANT_ID}';"
+
+    log "Configuring runtime_metadata.reporting (PUSH → LK)..."
+    setup_reporting "$ASSISTANT_ID" "seven-wonders"
+
+    log "Enabling MAX channel (bot id7806602356_bot) — needs MAX_BOT_TOKEN_SEVEN_WONDERS in env..."
+    setup_max_channel "$ASSISTANT_ID" "seven-wonders"
+
+    log ""
+    log "✅ 7 Чудес Света — provisioned (assistant: ${ASSISTANT_ID})"
+    log "   U-ON API key: VQQhuE10Z6047wBItzu71780325654 (set — API active + IP whitelisted)"
+    log "   MAX: bot id7806602356_bot — webhook https://max.navilet.ru/max/webhook?bot=seven-wonders"
+    echo ""
+}
+
 # ── Alembic migration ─────────────────────────────────────────────────────────
 
 run_migration() {
@@ -707,6 +808,10 @@ case "${1:-all}" in
         run_migration
         provision_traveltime
         ;;
+    seven-wonders|sevenwonders|7chudes)
+        run_migration
+        provision_seven_wonders
+        ;;
     all)
         run_migration
         provision_shelkovo
@@ -715,6 +820,7 @@ case "${1:-all}" in
         provision_belgorod
         provision_arbat
         provision_traveltime
+        provision_seven_wonders
         echo ""
         log "════════════════════════════════════════════════"
         log "  ALL CLIENTS PROVISIONED"
@@ -764,16 +870,17 @@ case "${1:-all}" in
         log "   - CRM lead created in correct U-ON instance"
         ;;
     *)
-        echo "Usage: $0 [shelkovo|krasnogorsk|vyhino|belgorod|arbat|traveltime|all]"
+        echo "Usage: $0 [shelkovo|krasnogorsk|vyhino|belgorod|arbat|traveltime|seven-wonders|all]"
         echo ""
         echo "Options:"
-        echo "  shelkovo     — provision МГП Щёлково only"
-        echo "  krasnogorsk  — provision МГП Красногорск only"
-        echo "  vyhino       — provision МГП Выхино only"
-        echo "  belgorod     — provision МГП Белгород only"
-        echo "  arbat        — provision МГП Арбат only (U-ON)"
-        echo "  traveltime   — provision Travel Time only (CRM deferred: МоиДокументы-Туристам)"
-        echo "  all          — provision all (default)"
+        echo "  shelkovo      — provision МГП Щёлково only"
+        echo "  krasnogorsk   — provision МГП Красногорск only"
+        echo "  vyhino        — provision МГП Выхино only"
+        echo "  belgorod      — provision МГП Белгород only"
+        echo "  arbat         — provision МГП Арбат only (U-ON)"
+        echo "  traveltime    — provision Travel Time only (CRM deferred: МоиДокументы-Туристам)"
+        echo "  seven-wonders — provision 7 Чудес Света only (U-ON + MAX bot)"
+        echo "  all           — provision all (default)"
         exit 1
         ;;
 esac
