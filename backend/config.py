@@ -89,6 +89,23 @@ class Settings(BaseSettings):
     runtime_provisioning_callback_max_attempts: int = 3
     runtime_provisioning_callback_backoff_seconds: int = 2
 
+    # --- Manager handoff (вход менеджера в чат, MAX) ---
+    # Глобальный рубильник + allow-list ассистентов (CSV). По умолчанию ВЫКЛ:
+    # пока operator_handoff_enabled=false ИЛИ assistant_id не в allow-list ИЛИ
+    # канал не в operator_handoff_channels — фича полностью инертна (ноль влияния
+    # на остальные диалоги/тенанты). Включаем только на тест-ассистенте 593471b7.
+    operator_handoff_enabled: bool = False
+    operator_handoff_assistant_ids: str = ""          # CSV allow-list assistant_id
+    operator_handoff_channels: str = "max"            # CSV каналов (старт: только max)
+    operator_handoff_resume_minutes: int = 10         # авто-возврат к ИИ после тишины
+    # Секрет back-channel LK→MGP (заголовок X-MGP-Service-Token на /api/runtime/
+    # operator/*). На стороне ЛК тот же VALUE лежит как MGP_OPERATOR_TOKEN.
+    operator_handoff_token: str = ""
+    # База MAX Bot API для прямой отправки операторского сообщения клиенту
+    # (бэкенд берёт bot_token из runtime_metadata.channels.max). Совпадает с
+    # MAX_API_BASE_URL моста.
+    max_api_base_url: str = "https://botapi.max.ru"
+
     # --- Rate Limiting ---
     rate_limit_per_ip: int = 30
     rate_limit_per_session: int = 10

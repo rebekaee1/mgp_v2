@@ -555,7 +555,15 @@ async def _process_message(
             reply_len=len(chat_response.reply),
             cards=len(chat_response.tour_cards),
             crm=chat_response.crm_submitted,
+            suppressed=getattr(chat_response, "suppressed", False),
         )
+
+        # Manager-handoff: диалог в operator_mode (менеджер за рулём) — backend
+        # подавил ответ ИИ и переслал входящее менеджеру (operator_inbound).
+        # Мост НЕ шлёт клиенту ничего (ни текст, ни карточки, ни кнопки).
+        if getattr(chat_response, "suppressed", False):
+            log.info("reply_suppressed_operator_mode")
+            return
 
         # Feature 2: deterministic subscription button at the hesitation moment.
         # Backend flagged offer_subscription; attach the button to the reply (only

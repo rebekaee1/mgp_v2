@@ -33,6 +33,10 @@ class ChatResponse:
     conversation_id: Optional[str] = None
     crm_submitted: bool = False
     offer_subscription: bool = False
+    # Manager-handoff: backend выставляет suppressed=True, когда диалог в
+    # operator_mode (менеджер за рулём) — ИИ не отвечает, мост НЕ шлёт клиенту
+    # ничего (ни текст, ни карточки). Старый backend поле не присылает → False.
+    suppressed: bool = False
     raw: dict[str, Any] = field(default_factory=dict)
 
 
@@ -128,5 +132,6 @@ class ChatProxy:
             conversation_id=payload.get("conversation_id"),
             crm_submitted=bool(payload.get("crm_submitted")),
             offer_subscription=bool(payload.get("offer_subscription")),
+            suppressed=bool(payload.get("suppressed")),
             raw=payload,
         )

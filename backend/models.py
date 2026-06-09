@@ -201,6 +201,28 @@ class Conversation(Base):
     warm_nudge_sent_at: Mapped[Optional[datetime]] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+    # ── Manager-handoff (вход менеджера в чат, MAX) — все аддитивные ──
+    # operator_mode=True ⇒ ИИ на паузе, отвечает менеджер. Фича включается
+    # пер-тенант (allow-list) + только channel='max'; по умолчанию инертна.
+    operator_mode: Mapped[bool] = mapped_column(
+        Boolean, default=False, nullable=False, server_default="false"
+    )
+    operator_mode_since: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    # Последняя активность оператора (отправка сообщения/перехват) — точка
+    # отсчёта для авто-возврата к ИИ (10 мин молчания менеджера).
+    operator_last_activity_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    # none | requested | operator | returned
+    handoff_state: Mapped[str] = mapped_column(
+        String(16), default="none", nullable=False, server_default="none"
+    )
+    # book_click | booking_intent | phrase | contact | manual
+    handoff_reason: Mapped[Optional[str]] = mapped_column(String(24), nullable=True)
+    # Кто за рулём (имя/идентификатор менеджера) — для баннера в ЛК.
+    operator_actor: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
 
     assistant: Mapped[Optional["Assistant"]] = relationship(
         back_populates="conversations"

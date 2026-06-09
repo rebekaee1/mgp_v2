@@ -1322,6 +1322,13 @@ def _log_chat_to_db(session_id: str, user_message: str, reply: str,
                 if check_conversation_booking_intent(user_texts):
                     conv.has_booking_intent = True
 
+            # ── Manager-handoff: детект триггера на этом ходе (MAX, пер-тенант) ──
+            # Жёсткий (фраза/контакт) → пауза ИИ + анонс (репликой этого хода) +
+            # manager_alert; мягкий (booking_intent) → только manager_alert.
+            # Инертно, пока handoff_enabled()==False. Не блокирует логирование.
+            if conv is not None:
+                _maybe_trigger_handoff(db, conv, user_message)
+
             if api_calls_log:
                 try:
                     from models import ApiCall
@@ -1881,6 +1888,16 @@ def _mark_booking_click(session_id: str, tourid: str, dest: str) -> None:
                 "🔖 BOOKING-CLICK: session=%s tourid=%s → tour_clicks=%d, has_booking_intent=True",
                 session_id[:8], tourid, conv.tour_clicks,
             )
+            # Manager-handoff: клик «Забронировать» — жёсткий триггер (если фича
+            # включена для тенанта+канала). Ставит operator_mode + manager_alert.
+            try:
+                import manager_handoff as MH
+                _apply_handoff_trigger(
+                    db, conv, MH.REASON_BOOK_CLICK,
+                    "Клиент нажал «Забронировать» по туру",
+                )
+            except Exception:
+                logger.warning("booking-click handoff trigger failed (non-blocking)", exc_info=True)
             # Re-emit snapshot to LK so the click is reflected there even though
             # it lands after the last chat message. Idempotent on the LK side
             # (event_id is unique); LK takes max() on tour_clicks.
@@ -1898,6 +1915,127 @@ def _mark_booking_click(session_id: str, tourid: str, dest: str) -> None:
                     )
     except Exception:
         logger.exception("booking click DB update failed (non-blocking)")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Manager-handoff (вход менеджера в чат, MAX). Всё инертно, пока
+# manager_handoff.handoff_enabled() == False (флаг OFF / не в allow-list /
+# канал != max). Логика в backend/manager_handoff.py; события — dialog_sender.
+# ─────────────────────────────────────────────────────────────────────────────
+def _apply_handoff_trigger(db, conv, reason: str, preview: str) -> bool:
+    """Перевести диалог в handoff (requested) и поднять manager_alert.
+
+    Идемпотентно: requested ставится один раз; повторно — только эскалация
+    soft→hard (operator_mode=True). Любая осечка/исключение → False (без влияния
+    на основной поток). Включается ТОЛЬКО при handoff_enabled.
+    """
+    try:
+        import manager_handoff as MH
+        if conv is None or getattr(conv, "assistant_id", None) is None:
+            return False
+        if not MH.handoff_enabled(str(conv.assistant_id), getattr(conv, "channel", None)):
+            return False
+        if conv.operator_mode:
+            return False  # менеджер уже за рулём
+        state = conv.handoff_state or MH.STATE_NONE
+        hard = MH.is_hard(reason)
+        if not (state == MH.STATE_NONE or (state == MH.STATE_REQUESTED and hard)):
+            return False
+        from datetime import datetime as _dt, timezone as _tz
+        now = _dt.now(_tz.utc)
+        conv.handoff_state = MH.STATE_REQUESTED
+        conv.handoff_reason = reason
+        if hard:
+            conv.operator_mode = True
+            conv.operator_mode_since = now
+            conv.operator_last_activity_at = now
+        conv.last_active_at = now
+        db.flush()
+        from dialog_sender import enqueue_manager_alert
+        enqueue_manager_alert(
+            db, conversation_id=conv.id, assistant_id=conv.assistant_id,
+            reason=reason, preview=preview,
+        )
+        logger.info(
+            "🤝 HANDOFF session=%s reason=%s hard=%s operator_mode=%s",
+            (conv.session_id or "")[:8], reason, hard, conv.operator_mode,
+        )
+        return True
+    except Exception:
+        logger.warning("handoff trigger apply failed (non-blocking)", exc_info=True)
+        return False
+
+
+def _maybe_trigger_handoff(db, conv, user_message: str) -> None:
+    """Детект триггера из реплики клиента (фраза/контакт/booking_intent)."""
+    try:
+        import manager_handoff as MH
+        if conv is None:
+            return
+        reason = MH.classify_user_trigger(
+            user_message or "", booking_intent=bool(conv.has_booking_intent)
+        )
+        if reason is None:
+            return
+        _apply_handoff_trigger(db, conv, reason, MH.alert_preview(user_message or ""))
+    except Exception:
+        logger.warning("handoff trigger detect failed (non-blocking)", exc_info=True)
+
+
+def _maybe_operator_inbound(session_id: str, message: str,
+                            assistant_id: str, channel: str) -> bool:
+    """Гейт: если диалог в operator_mode (менеджер за рулём) — НЕ зовём ИИ.
+
+    Сохраняем входящее сообщение клиента (role='user'), поднимаем событие
+    operator_inbound в ЛК и возвращаем True (chat_v1 ответит suppressed). Если
+    фича выключена / диалог не в operator-режиме — возвращаем False (обычный
+    поток ИИ). Любое исключение → False (fail-open в сторону обычного потока).
+    """
+    try:
+        import manager_handoff as MH
+        if not MH.handoff_enabled(assistant_id, channel):
+            return False
+        from database import get_db, is_db_available
+        if not is_db_available():
+            return False
+        from models import Conversation, Message
+        from datetime import datetime as _dt, timezone as _tz
+        with get_db() as db:
+            if db is None:
+                return False
+            conv = db.query(Conversation).filter(
+                Conversation.session_id == session_id
+            ).first()
+            if conv is None or not conv.operator_mode:
+                return False
+            now = _dt.now(_tz.utc)
+            msg = Message(conversation_id=conv.id, role="user", content=message)
+            db.add(msg)
+            conv.message_count = (conv.message_count or 0) + 1
+            conv.last_active_at = now
+            db.flush()  # получить msg.id для remote_id
+            if conv.assistant_id is not None:
+                try:
+                    from dialog_sender import enqueue_operator_inbound
+                    enqueue_operator_inbound(
+                        db, conversation_id=conv.id, assistant_id=conv.assistant_id,
+                        message_id=msg.id, role="user", content=message, created_at=now,
+                    )
+                except Exception:
+                    logger.warning(
+                        "operator_inbound enqueue failed conv=%s", conv.id, exc_info=True
+                    )
+            logger.info(
+                "⏸️ OPERATOR-MODE: ИИ подавлен для session=%s (менеджер за рулём)",
+                session_id[:8],
+            )
+            return True
+    except Exception:
+        logger.warning(
+            "operator inbound gate failed (non-blocking) session=%s",
+            session_id[:8], exc_info=True,
+        )
+        return False
 
 
 @app.route('/go')
@@ -1926,6 +2064,189 @@ def booking_redirect():
 
     _mark_booking_click(sid, tourid, dest)
     return redirect(dest, code=302)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Operator back-channel (LK → MGP): ответ менеджера клиенту в MAX + перехват/возврат.
+# Строгая аутентификация по X-MGP-Service-Token == settings.operator_handoff_token
+# (НЕ зависит от runtime_service_auth_mode=monitor: эти ручки шлют реальным
+# клиентам, поэтому проверка всегда жёсткая). Контракт: docs/handoff/
+# MANAGER_HANDOFF_CONTRACT.md §4.
+# ─────────────────────────────────────────────────────────────────────────────
+def _operator_backchannel_authorized() -> bool:
+    from config import settings
+    token = (getattr(settings, "operator_handoff_token", "") or "").strip()
+    if not token:
+        return False  # фича не сконфигурирована → 503 у вызывающего
+    got = (request.headers.get("X-MGP-Service-Token") or "").strip()
+    return bool(got) and hmac.compare_digest(got, token)
+
+
+def _max_send_text(bot_token: str, chat_id, text: str) -> tuple:
+    """Прямая отправка текста клиенту в MAX (bot_token из runtime_metadata).
+
+    Возвращает (ok, error). Plain-text (без markdown) — менеджер пишет как есть.
+    """
+    import httpx
+    from config import settings
+    base = (getattr(settings, "max_api_base_url", "") or "https://botapi.max.ru").rstrip("/")
+    try:
+        with httpx.Client(timeout=15.0, headers={"Authorization": bot_token}) as client:
+            resp = client.post(
+                f"{base}/messages",
+                params={"chat_id": int(chat_id)},
+                json={"text": text},
+            )
+        if 200 <= resp.status_code < 300:
+            return True, ""
+        return False, f"http_{resp.status_code}"
+    except Exception as exc:
+        return False, str(exc)[:200]
+
+
+def _operator_actor_str(operator) -> str:
+    if isinstance(operator, dict):
+        return (str(operator.get("name") or operator.get("id") or "")).strip()[:64]
+    return ""
+
+
+@app.route('/api/runtime/operator/message', methods=['POST'])
+def runtime_operator_message():
+    """Ответ менеджера клиенту в MAX (от бота). Пишет role='operator' в диалог."""
+    from config import settings
+    if not (settings.operator_handoff_token or "").strip():
+        return jsonify({'status': 'error', 'error': 'operator_handoff_not_configured'}), 503
+    if not _operator_backchannel_authorized():
+        return jsonify({'status': 'error', 'error': 'unauthorized'}), 401
+
+    data = request.json or {}
+    conversation_id = str(data.get('conversation_id') or '').strip()
+    text = (data.get('text') or '').strip()
+    operator = data.get('operator') or {}
+    if not conversation_id or not text:
+        return jsonify({'status': 'error', 'error': 'bad_request'}), 400
+    if len(text) > _MAX_MESSAGE_LENGTH:
+        return jsonify({'status': 'error', 'error': 'text_too_long'}), 400
+
+    from database import get_db, is_db_available
+    if not is_db_available():
+        return jsonify({'status': 'error', 'error': 'db_unavailable'}), 503
+    from models import Conversation, Assistant, Message
+    import manager_handoff as MH
+    from datetime import datetime as _dt, timezone as _tz
+
+    with get_db() as db:
+        if db is None:
+            return jsonify({'status': 'error', 'error': 'db_unavailable'}), 503
+        try:
+            conv = db.get(Conversation, uuid.UUID(conversation_id))
+        except (ValueError, AttributeError, TypeError):
+            conv = None
+        if conv is None:
+            return jsonify({'status': 'error', 'error': 'conversation_not_found'}), 404
+        if not MH.handoff_enabled(str(conv.assistant_id), getattr(conv, 'channel', None)):
+            return jsonify({'status': 'error', 'error': 'handoff_disabled'}), 403
+        if (getattr(conv, 'channel', '') or '') != 'max':
+            return jsonify({'status': 'error', 'error': 'unsupported_channel'}), 409
+        chat_id = getattr(conv, 'external_chat_id', None)
+        if not chat_id:
+            return jsonify({'status': 'error', 'error': 'no_external_chat_id'}), 422
+        assistant = db.get(Assistant, conv.assistant_id) if conv.assistant_id else None
+        bot_token = None
+        if assistant is not None:
+            bot_token = (
+                ((assistant.runtime_metadata or {}).get('channels', {}) or {})
+                .get('max', {}) or {}
+            ).get('bot_token')
+        if not bot_token:
+            return jsonify({'status': 'error', 'error': 'no_bot_token'}), 409
+
+        ok, err = _max_send_text(bot_token, chat_id, text)
+        if not ok:
+            logger.warning("operator-message MAX send failed conv=%s err=%s", conv.id, err)
+            return jsonify({'status': 'error', 'error': 'max_send_failed', 'detail': err}), 502
+
+        now = _dt.now(_tz.utc)
+        msg = Message(conversation_id=conv.id, role='operator', content=text)
+        db.add(msg)
+        conv.message_count = (conv.message_count or 0) + 1
+        conv.operator_last_activity_at = now
+        conv.last_active_at = now
+        actor = _operator_actor_str(operator)
+        if actor:
+            conv.operator_actor = actor
+        # Ответ менеджера = он за рулём: фиксируем operator-режим (idempotent).
+        if not conv.operator_mode:
+            conv.operator_mode = True
+            conv.operator_mode_since = conv.operator_mode_since or now
+        conv.handoff_state = MH.STATE_OPERATOR
+        db.flush()
+        logger.info("📨 OPERATOR→CLIENT session=%s actor=%s len=%d",
+                    (conv.session_id or "")[:8], actor or "?", len(text))
+        return jsonify({'status': 'sent', 'message_id': msg.id,
+                        'remote_id': msg.id, 'delivered': True})
+
+
+@app.route('/api/runtime/operator/handoff', methods=['POST'])
+def runtime_operator_handoff():
+    """Перехват (take) / возврат боту (return) со стороны менеджера в ЛК."""
+    from config import settings
+    if not (settings.operator_handoff_token or "").strip():
+        return jsonify({'status': 'error', 'error': 'operator_handoff_not_configured'}), 503
+    if not _operator_backchannel_authorized():
+        return jsonify({'status': 'error', 'error': 'unauthorized'}), 401
+
+    data = request.json or {}
+    conversation_id = str(data.get('conversation_id') or '').strip()
+    action = (data.get('action') or '').strip().lower()
+    operator = data.get('operator') or {}
+    if not conversation_id or action not in ('take', 'return'):
+        return jsonify({'status': 'error', 'error': 'bad_request'}), 400
+
+    from database import get_db, is_db_available
+    if not is_db_available():
+        return jsonify({'status': 'error', 'error': 'db_unavailable'}), 503
+    from models import Conversation
+    import manager_handoff as MH
+    from datetime import datetime as _dt, timezone as _tz
+
+    with get_db() as db:
+        if db is None:
+            return jsonify({'status': 'error', 'error': 'db_unavailable'}), 503
+        try:
+            conv = db.get(Conversation, uuid.UUID(conversation_id))
+        except (ValueError, AttributeError, TypeError):
+            conv = None
+        if conv is None:
+            return jsonify({'status': 'error', 'error': 'conversation_not_found'}), 404
+        if not MH.handoff_enabled(str(conv.assistant_id), getattr(conv, 'channel', None)):
+            return jsonify({'status': 'error', 'error': 'handoff_disabled'}), 403
+
+        now = _dt.now(_tz.utc)
+        if action == 'take':
+            conv.operator_mode = True
+            conv.operator_mode_since = now
+            conv.operator_last_activity_at = now
+            conv.handoff_state = MH.STATE_OPERATOR
+            actor = _operator_actor_str(operator)
+            if actor:
+                conv.operator_actor = actor
+        else:  # return
+            conv.operator_mode = False
+            conv.handoff_state = MH.STATE_RETURNED
+        conv.last_active_at = now
+        db.flush()
+        # Эхо состояния в ЛК через обычный снапшот.
+        if conv.assistant_id is not None:
+            try:
+                from dialog_sender import enqueue_conversation_snapshot
+                enqueue_conversation_snapshot(db, conversation_id=conv.id, assistant_id=conv.assistant_id)
+            except Exception:
+                logger.warning("handoff snapshot enqueue failed conv=%s", conv.id, exc_info=True)
+        logger.info("🤝 OPERATOR-HANDOFF session=%s action=%s operator_mode=%s",
+                    (conv.session_id or "")[:8], action, conv.operator_mode)
+        return jsonify({'status': 'ok', 'operator_mode': conv.operator_mode,
+                        'handoff_state': conv.handoff_state})
 
 
 @app.route('/api/chat', methods=['POST'])
@@ -2138,6 +2459,20 @@ def chat_v1():
         handler._lead_info = lead_info
 
     try:
+        # ── Manager-handoff gate ──────────────────────────────────────────
+        # Если менеджер за рулём (operator_mode), ИИ НЕ отвечает: входящее
+        # клиента сохраняется и уходит менеджеру (operator_inbound), клиенту
+        # ничего не шлём (мост видит suppressed). Инертно, пока фича выключена
+        # / диалог не в operator-режиме (тогда False → обычный поток ниже).
+        if _maybe_operator_inbound(session_id, message, assistant_id, channel_hdr):
+            return jsonify({
+                'reply': '',
+                'tour_cards': [],
+                'conversation_id': conversation_id,
+                'operator_mode': True,
+                'suppressed': True,
+            })
+
         _hist_before = len(handler.full_history)
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)

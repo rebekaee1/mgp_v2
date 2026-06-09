@@ -314,6 +314,162 @@ def _fit_snapshot_payload(payload: dict[str, Any]) -> dict[str, Any]:
     return current
 
 
+def _handoff_fields(conversation: Conversation) -> dict[str, Any]:
+    """Manager-handoff поля для блока ``conversation`` (контракт §2).
+
+    getattr — для совместимости со схемой БД до миграции ``p6q7r8s9t0u``
+    (старый MGP вернёт дефолты, ЛК-приёмник это переживёт).
+    """
+    return {
+        "operator_mode": bool(getattr(conversation, "operator_mode", False) or False),
+        "handoff_state": getattr(conversation, "handoff_state", None) or "none",
+        "handoff_reason": getattr(conversation, "handoff_reason", None),
+        "operator_mode_since": _to_iso_or_none(
+            getattr(conversation, "operator_mode_since", None)
+        ),
+        "operator_actor": getattr(conversation, "operator_actor", None),
+    }
+
+
+def _event_conversation_block(
+    assistant: Assistant, conversation: Conversation
+) -> dict[str, Any]:
+    """Облегчённый блок ``conversation`` для событий handoff (alert/inbound).
+
+    Содержит идентификацию + маршрутизацию + handoff-состояние. Полную историю
+    ЛК уже имеет из ``conversation_snapshot``; здесь — то, что нужно для upsert
+    диалога и баннера/маршрутизации уведомления.
+    """
+    block = {
+        "id": str(conversation.id),
+        "assistant_id": str(assistant.id),
+        "session_id": conversation.session_id,
+        "status": conversation.status,
+        "message_count": conversation.message_count,
+        "has_booking_intent": bool(conversation.has_booking_intent),
+        "tour_clicks": int(getattr(conversation, "tour_clicks", 0) or 0),
+        "started_at": _iso(conversation.started_at),
+        "last_active_at": _iso(conversation.last_active_at),
+        "channel": getattr(conversation, "channel", "widget") or "widget",
+        "external_user_id": getattr(conversation, "external_user_id", None),
+        "external_first_name": getattr(conversation, "external_first_name", None),
+        "external_last_name": getattr(conversation, "external_last_name", None),
+        "external_user_name": getattr(conversation, "external_user_name", None),
+        "external_chat_id": getattr(conversation, "external_chat_id", None),
+    }
+    block.update(_handoff_fields(conversation))
+    return block
+
+
+def enqueue_manager_alert(
+    db,
+    conversation_id: uuid.UUID,
+    assistant_id: uuid.UUID,
+    *,
+    reason: str,
+    preview: str = "",
+) -> Optional[str]:
+    """Поставить в outbox событие ``manager_alert`` (нужен менеджер).
+
+    Доставляется тем же ``_deliver_outbox_event`` (generic по event_type). Если
+    reporting у ассистента выключен — событие осядет как ``failed`` (как и снапшот),
+    влияния на остальной поток нет.
+    """
+    assistant = db.get(Assistant, assistant_id)
+    conversation = db.get(Conversation, conversation_id)
+    if assistant is None or conversation is None:
+        return None
+    reporting = _runtime_reporting_config(assistant.runtime_metadata)
+    if reporting.get("mode") != "batch_snapshot":
+        logger.debug(
+            "manager_alert skipped conversation=%s reason=reporting_disabled", conversation_id
+        )
+        return None
+    occurred_at = _utcnow()
+    payload = {
+        "contract_version": _CONTRACT_VERSION,
+        "event_type": "manager_alert",
+        "assistant_id": str(assistant.id),
+        "conversation_id": str(conversation.id),
+        "occurred_at": _iso(occurred_at),
+        "conversation": _event_conversation_block(assistant, conversation),
+        "alert": {
+            "reason": reason,
+            "severity": "hot",
+            "preview": (preview or "")[:200],
+            "requested_at": _iso(occurred_at),
+            "deep_link": f"/conversations/{conversation.id}?src=alert",
+        },
+    }
+    event_id = f"{conversation.id}:alert:{uuid.uuid4().hex}"
+    db.add(RuntimeEventOutbox(
+        assistant_id=assistant.id,
+        conversation_id=conversation.id,
+        event_id=event_id,
+        event_type="manager_alert",
+        status="pending",
+        payload=payload,
+        next_retry_at=_utcnow(),
+    ))
+    logger.info(
+        "manager_alert queued assistant=%s conversation=%s reason=%s event_id=%s",
+        assistant.id, conversation.id, reason, event_id,
+    )
+    return event_id
+
+
+def enqueue_operator_inbound(
+    db,
+    conversation_id: uuid.UUID,
+    assistant_id: uuid.UUID,
+    *,
+    message_id: int,
+    role: str,
+    content: str,
+    created_at: Optional[datetime] = None,
+) -> Optional[str]:
+    """Поставить в outbox событие ``operator_inbound`` (входящее клиента при
+    активном операторе). Дедуп на стороне ЛК по ``(conversation_id, remote_id)``.
+    """
+    assistant = db.get(Assistant, assistant_id)
+    conversation = db.get(Conversation, conversation_id)
+    if assistant is None or conversation is None:
+        return None
+    reporting = _runtime_reporting_config(assistant.runtime_metadata)
+    if reporting.get("mode") != "batch_snapshot":
+        return None
+    occurred_at = created_at or _utcnow()
+    payload = {
+        "contract_version": _CONTRACT_VERSION,
+        "event_type": "operator_inbound",
+        "assistant_id": str(assistant.id),
+        "conversation_id": str(conversation.id),
+        "occurred_at": _iso(occurred_at),
+        "conversation": _event_conversation_block(assistant, conversation),
+        "message": {
+            "remote_id": message_id,
+            "role": role,
+            "content": _compact_message_content(content, role, 0),
+            "created_at": _iso(occurred_at),
+        },
+    }
+    event_id = f"{conversation.id}:inbound:{message_id}:{uuid.uuid4().hex[:8]}"
+    db.add(RuntimeEventOutbox(
+        assistant_id=assistant.id,
+        conversation_id=conversation.id,
+        event_id=event_id,
+        event_type="operator_inbound",
+        status="pending",
+        payload=payload,
+        next_retry_at=_utcnow(),
+    ))
+    logger.info(
+        "operator_inbound queued assistant=%s conversation=%s msg=%s event_id=%s",
+        assistant.id, conversation.id, message_id, event_id,
+    )
+    return event_id
+
+
 def _build_snapshot_payload(
     assistant: Assistant,
     conversation: Conversation,
@@ -365,6 +521,12 @@ def _build_snapshot_payload(
             "external_last_name": getattr(conversation, "external_last_name", None),
             "external_user_name": getattr(conversation, "external_user_name", None),
             "external_chat_id": getattr(conversation, "external_chat_id", None),
+            # ── Manager-handoff (added 2026-06-09) — мутабельные поля состояния
+            # перехвата. Старые потребители ЛК игнорируют незнакомые ключи; новые
+            # читают их для баннера «Менеджер за рулём». См.
+            # docs/handoff/MANAGER_HANDOFF_CONTRACT.md §2. getattr — для совместимости
+            # с БД до миграции p6q7r8s9t0u.
+            **_handoff_fields(conversation),
         },
         "messages": [_serialize_message(item) for item in messages],
         "tour_searches": [_serialize_tour_search(item) for item in tour_searches],

@@ -123,6 +123,21 @@ def _job_dialog_sender():
         logger.exception("dialog_sender job failed")
 
 
+def _job_operator_resume():
+    """Manager-handoff: авто-возврат к ИИ после тишины менеджера (≥N мин).
+
+    Самогейтится: если operator_handoff_enabled=false / allow-list пуст —
+    мгновенно возвращает 0. Без влияния на остальные диалоги/тенанты.
+    """
+    try:
+        from operator_resume_monitor import run_operator_resume_once
+        resumed = run_operator_resume_once()
+        if resumed:
+            logger.info("operator_resume returned %d dialog(s) to AI", resumed)
+    except Exception:
+        logger.exception("operator_resume job failed")
+
+
 def _is_main_process() -> bool:
     """With Gunicorn pre-fork, only the FIRST worker (or the dev server) should run the scheduler.
     Uses a file lock so that only one process wins."""
@@ -196,6 +211,18 @@ def init_scheduler(app=None):
         )
     else:
         logger.info("Dialog sender disabled (RUNTIME_DIALOG_SENDER_ENABLED=false)")
+
+    # Manager-handoff: авто-возврат к ИИ (job самогейтится по флагу, поэтому
+    # регистрируем всегда — при выключенной фиче он почти бесплатен).
+    _scheduler.add_job(
+        _job_operator_resume,
+        trigger=IntervalTrigger(seconds=60),
+        id="operator_resume",
+        name="Manager-handoff auto-resume to AI",
+        replace_existing=True,
+        max_instances=1,
+    )
+    logger.info("Operator-resume job scheduled: every 60 sec (self-gated by flag)")
 
     _scheduler.start()
     logger.info("Scheduler started with %d jobs", len(_scheduler.get_jobs()))
