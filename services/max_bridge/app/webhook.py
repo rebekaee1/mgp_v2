@@ -601,6 +601,19 @@ async def _process_message(
                     "tour_cards_disabled_by_flag",
                     count=len(chat_response.tour_cards),
                 )
+
+            # Manager-handoff: одноразовый анонс «менеджер подключается».
+            # Шлём ПОСЛЕ обычного ответа и карточек, отдельным сообщением, чтобы
+            # клиент сначала увидел ответ ИИ, а затем — что подключается менеджер.
+            if chat_response.handoff_announce:
+                await _send_reply_chunks(
+                    max_client=max_client,
+                    chat_id=chat_id,
+                    user_id=user_id,
+                    reply=chat_response.handoff_announce,
+                    log=log,
+                )
+                log.info("handoff_announce_sent")
     except Exception:
         log.exception("webhook_processing_failed")
 

@@ -37,6 +37,11 @@ class ChatResponse:
     # operator_mode (менеджер за рулём) — ИИ не отвечает, мост НЕ шлёт клиенту
     # ничего (ни текст, ни карточки). Старый backend поле не присылает → False.
     suppressed: bool = False
+    # Manager-handoff: одноразовый анонс клиенту «менеджер подключается».
+    # Backend присылает текст, когда жёсткий триггер (фраза/контакт) только что
+    # поставил ИИ на паузу на ЭТОМ ходе. Мост отправляет его ОТДЕЛЬНЫМ сообщением
+    # ПОСЛЕ обычного ответа ИИ, чтобы не нарушить порядок. Старый backend → "".
+    handoff_announce: str = ""
     raw: dict[str, Any] = field(default_factory=dict)
 
 
@@ -133,5 +138,6 @@ class ChatProxy:
             crm_submitted=bool(payload.get("crm_submitted")),
             offer_subscription=bool(payload.get("offer_subscription")),
             suppressed=bool(payload.get("suppressed")),
+            handoff_announce=str(payload.get("handoff_announce") or ""),
             raw=payload,
         )

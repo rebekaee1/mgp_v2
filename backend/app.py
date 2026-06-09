@@ -1892,10 +1892,15 @@ def _mark_booking_click(session_id: str, tourid: str, dest: str) -> None:
             # включена для тенанта+канала). Ставит operator_mode + manager_alert.
             try:
                 import manager_handoff as MH
-                _apply_handoff_trigger(
+                _engaged = _apply_handoff_trigger(
                     db, conv, MH.REASON_BOOK_CLICK,
                     "Клиент нажал «Забронировать» по туру",
                 )
+                # Клик не порождает ответа ИИ — анонс «менеджер подключается»
+                # отправляем клиенту напрямую (best-effort, только при свежем
+                # переходе в operator_mode).
+                if _engaged:
+                    _announce_to_client(db, conv)
             except Exception:
                 logger.warning("booking-click handoff trigger failed (non-blocking)", exc_info=True)
             # Re-emit snapshot to LK so the click is reflected there even though
@@ -1977,7 +1982,19 @@ def _maybe_trigger_handoff(db, conv, user_message: str) -> None:
         )
         if reason is None:
             return
-        _apply_handoff_trigger(db, conv, reason, MH.alert_preview(user_message or ""))
+        engaged = _apply_handoff_trigger(db, conv, reason, MH.alert_preview(user_message or ""))
+        # Жёсткий триггер только что поставил ИИ на паузу на ЭТОМ ходе → один раз
+        # анонсируем клиенту подключение менеджера. На чат-пути ИИ ещё отвечает
+        # этим ходом, поэтому анонс должен прийти ПОСЛЕ ответа: помечаем флаг в
+        # request-scope (g), а chat_v1 кладёт текст в handoff_announce — мост
+        # отправит его отдельным сообщением после ответа ИИ.
+        if engaged and MH.is_hard(reason):
+            try:
+                from flask import has_request_context
+                if has_request_context():
+                    g._handoff_announce = MH.ANNOUNCE_TEXT
+            except Exception:
+                pass
     except Exception:
         logger.warning("handoff trigger detect failed (non-blocking)", exc_info=True)
 
@@ -2104,6 +2121,40 @@ def _max_send_text(bot_token: str, chat_id, text: str) -> tuple:
         return False, str(exc)[:200]
 
 
+def _announce_to_client(db, conv) -> bool:
+    """Best-effort: отправить клиенту анонс «менеджер подключается» в MAX.
+
+    Используется на путях, где НЕТ ответа ИИ в полёте (клик «Забронировать» и
+    ручной перехват из ЛК), поэтому анонс уходит сразу, не нарушая порядок. Для
+    чат-пути (фраза/контакт) анонс шлёт мост ПОСЛЕ ответа ИИ (handoff_announce).
+    Только channel='max' с известными bot_token+chat_id. Любая осечка → False.
+    """
+    try:
+        import manager_handoff as MH
+        from models import Assistant
+        if conv is None or (getattr(conv, 'channel', '') or '') != 'max':
+            return False
+        chat_id = getattr(conv, 'external_chat_id', None)
+        if not chat_id:
+            return False
+        assistant = db.get(Assistant, conv.assistant_id) if conv.assistant_id else None
+        bot_token = None
+        if assistant is not None:
+            bot_token = (
+                ((assistant.runtime_metadata or {}).get('channels', {}) or {})
+                .get('max', {}) or {}
+            ).get('bot_token')
+        if not bot_token:
+            return False
+        ok, _err = _max_send_text(bot_token, chat_id, MH.ANNOUNCE_TEXT)
+        if ok:
+            logger.info("📣 HANDOFF-ANNOUNCE sent session=%s", (conv.session_id or "")[:8])
+        return ok
+    except Exception:
+        logger.warning("handoff announce send failed (non-blocking)", exc_info=True)
+        return False
+
+
 def _operator_actor_str(operator) -> str:
     if isinstance(operator, dict):
         return (str(operator.get("name") or operator.get("id") or "")).strip()[:64]
@@ -2223,7 +2274,9 @@ def runtime_operator_handoff():
             return jsonify({'status': 'error', 'error': 'handoff_disabled'}), 403
 
         now = _dt.now(_tz.utc)
+        _announce_take = False
         if action == 'take':
+            _announce_take = not bool(conv.operator_mode)  # свежий перехват
             conv.operator_mode = True
             conv.operator_mode_since = now
             conv.operator_last_activity_at = now
@@ -2236,6 +2289,10 @@ def runtime_operator_handoff():
             conv.handoff_state = MH.STATE_RETURNED
         conv.last_active_at = now
         db.flush()
+        # Ручной перехват без предшествующего триггера — клиент ещё не получал
+        # анонса; вежливо сообщаем, что подключается менеджер (один раз).
+        if _announce_take:
+            _announce_to_client(db, conv)
         # Эхо состояния в ЛК через обычный снапшот.
         if conv.assistant_id is not None:
             try:
@@ -2611,13 +2668,19 @@ def chat_v1():
         except Exception:
             _offer_sub = False
 
-        return jsonify({
+        _resp = {
             'reply': reply,
             'tour_cards': tour_cards,
             'conversation_id': conversation_id,
             'crm_submitted': bool(getattr(handler, '_crm_submitted', None)),
             'offer_subscription': bool(_offer_sub)
-        })
+        }
+        # Manager-handoff: если на этом ходе жёсткий триггер поставил ИИ на паузу,
+        # просим мост отправить клиенту анонс «менеджер подключается» ПОСЛЕ ответа.
+        _announce = getattr(g, '_handoff_announce', '')
+        if _announce:
+            _resp['handoff_announce'] = _announce
+        return jsonify(_resp)
 
     except Exception as e:
         logger.exception("[v1] chat error session_id=%s", session_id)
