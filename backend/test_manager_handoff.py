@@ -82,5 +82,19 @@ def test_resume_seconds():
 
 def test_texts_no_emoji_for_client():
     mh = _load()
-    for txt in (mh.ANNOUNCE_TEXT, mh.RESUME_INVITE_TEXT):
+    for txt in (
+        mh.ANNOUNCE_TEXT, mh.RESUME_INVITE_TEXT,
+        mh.ACK_MANAGER_NOTIFIED, mh.ACK_MANAGER_NOTIFIED_ASK_PHONE,
+        mh.OPERATOR_JOINED_TEXT,
+    ):
         assert txt and not any(ord(c) > 0x2600 for c in txt), "клиентский текст без эмодзи"
+
+
+def test_request_ack_text_contact_aware():
+    mh = _load()
+    # контакт уже есть → не просим телефон
+    assert mh.request_ack_text(True) == mh.ACK_MANAGER_NOTIFIED
+    assert "телефон" not in mh.request_ack_text(True).lower()
+    # контакта нет → мягко просим номер
+    assert mh.request_ack_text(False) == mh.ACK_MANAGER_NOTIFIED_ASK_PHONE
+    assert "телефон" in mh.request_ack_text(False).lower()

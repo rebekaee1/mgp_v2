@@ -1889,18 +1889,20 @@ def _mark_booking_click(session_id: str, tourid: str, dest: str) -> None:
                 session_id[:8], tourid, conv.tour_clicks,
             )
             # Manager-handoff: клик «Забронировать» — жёсткий триггер (если фича
-            # включена для тенанта+канала). Ставит operator_mode + manager_alert.
+            # включена для тенанта+канала). Шлёт manager_alert; ИИ НЕ паузится
+            # (модель v2) — клиенту уходит заверение «менеджер уведомлён».
             try:
                 import manager_handoff as MH
-                _engaged = _apply_handoff_trigger(
+                _should_ack = _apply_handoff_trigger(
                     db, conv, MH.REASON_BOOK_CLICK,
                     "Клиент нажал «Забронировать» по туру",
                 )
-                # Клик не порождает ответа ИИ — анонс «менеджер подключается»
-                # отправляем клиенту напрямую (best-effort, только при свежем
-                # переходе в operator_mode).
-                if _engaged:
-                    _announce_to_client(db, conv)
+                # Клик не порождает ответа ИИ — заверение «менеджер уведомлён»
+                # отправляем клиенту напрямую (best-effort). Если контакта ещё
+                # нет — мягко просим телефон, чтобы лид не потерялся.
+                if _should_ack:
+                    _contact_known = _conv_has_contact(db, conv)
+                    _send_client_text(db, conv, MH.request_ack_text(_contact_known))
             except Exception:
                 logger.warning("booking-click handoff trigger failed (non-blocking)", exc_info=True)
             # Re-emit snapshot to LK so the click is reflected there even though
@@ -1927,12 +1929,36 @@ def _mark_booking_click(session_id: str, tourid: str, dest: str) -> None:
 # manager_handoff.handoff_enabled() == False (флаг OFF / не в allow-list /
 # канал != max). Логика в backend/manager_handoff.py; события — dialog_sender.
 # ─────────────────────────────────────────────────────────────────────────────
+def _conv_has_contact(db, conv) -> bool:
+    """Был ли в диалоге оставлен телефон РФ (любое сообщение клиента).
+
+    Используется для выбора текста заверения: если контакт уже есть — не просим
+    номер повторно. Best-effort; любая осечка → False (тогда мягко попросим номер).
+    """
+    try:
+        import manager_handoff as MH
+        from models import Message
+        rows = db.query(Message.content).filter(
+            Message.conversation_id == conv.id, Message.role == "user",
+        ).all()
+        return any(MH.has_contact(r[0] or "") for r in rows)
+    except Exception:
+        return False
+
+
 def _apply_handoff_trigger(db, conv, reason: str, preview: str) -> bool:
     """Перевести диалог в handoff (requested) и поднять manager_alert.
 
-    Идемпотентно: requested ставится один раз; повторно — только эскалация
-    soft→hard (operator_mode=True). Любая осечка/исключение → False (без влияния
-    на основной поток). Включается ТОЛЬКО при handoff_enabled.
+    Модель v2 (2026-06-10): триггер НЕ ставит ИИ на паузу — operator_mode НЕ
+    трогаем (пауза наступает только при реальном заходе менеджера через ручки
+    operator/*). Здесь лишь: ставим handoff_state='requested', шлём manager_alert
+    менеджеру ОДИН раз за цикл (из none/returned) и решаем, нужно ли отправить
+    клиенту заверение.
+
+    Возвращает **should_ack** — True, если этому (жёсткому) триггеру положено
+    клиентское заверение «менеджер уведомлён» (book_click/phrase/contact/manual).
+    Soft (booking_intent) → False (только тихий алерт). Любая осечка → False.
+    Включается ТОЛЬКО при handoff_enabled.
     """
     try:
         import manager_handoff as MH
@@ -1941,31 +1967,38 @@ def _apply_handoff_trigger(db, conv, reason: str, preview: str) -> bool:
         if not MH.handoff_enabled(str(conv.assistant_id), getattr(conv, "channel", None)):
             return False
         if conv.operator_mode:
-            return False  # менеджер уже за рулём
+            return False  # менеджер уже реально за рулём — не алертим и не «акаем»
         state = conv.handoff_state or MH.STATE_NONE
+        prev_reason = conv.handoff_reason
         hard = MH.is_hard(reason)
-        if not (state == MH.STATE_NONE or (state == MH.STATE_REQUESTED and hard)):
+        fresh_cycle = state in (MH.STATE_NONE, MH.STATE_RETURNED)
+        # Эскалация: тихий soft-алерт уже был (requested), теперь пришёл жёсткий
+        # сигнал → клиента надо заверить, но повторный алерт менеджеру НЕ шлём.
+        soft_to_hard = (state == MH.STATE_REQUESTED and not MH.is_hard(prev_reason) and hard)
+        if not (fresh_cycle or soft_to_hard):
             return False
         from datetime import datetime as _dt, timezone as _tz
         now = _dt.now(_tz.utc)
         conv.handoff_state = MH.STATE_REQUESTED
         conv.handoff_reason = reason
-        if hard:
-            conv.operator_mode = True
-            conv.operator_mode_since = now
-            conv.operator_last_activity_at = now
         conv.last_active_at = now
         db.flush()
-        from dialog_sender import enqueue_manager_alert
-        enqueue_manager_alert(
-            db, conversation_id=conv.id, assistant_id=conv.assistant_id,
-            reason=reason, preview=preview,
-        )
-        logger.info(
-            "🤝 HANDOFF session=%s reason=%s hard=%s operator_mode=%s",
-            (conv.session_id or "")[:8], reason, hard, conv.operator_mode,
-        )
-        return True
+        if fresh_cycle:
+            from dialog_sender import enqueue_manager_alert
+            enqueue_manager_alert(
+                db, conversation_id=conv.id, assistant_id=conv.assistant_id,
+                reason=reason, preview=preview,
+            )
+            logger.info(
+                "🤝 HANDOFF-ALERT session=%s reason=%s (ИИ продолжает, operator_mode=%s)",
+                (conv.session_id or "")[:8], reason, conv.operator_mode,
+            )
+        else:
+            logger.info(
+                "🤝 HANDOFF-ESCALATE session=%s %s→%s (без повторного алерта)",
+                (conv.session_id or "")[:8], prev_reason, reason,
+            )
+        return hard
     except Exception:
         logger.warning("handoff trigger apply failed (non-blocking)", exc_info=True)
         return False
@@ -1982,17 +2015,17 @@ def _maybe_trigger_handoff(db, conv, user_message: str) -> None:
         )
         if reason is None:
             return
-        engaged = _apply_handoff_trigger(db, conv, reason, MH.alert_preview(user_message or ""))
-        # Жёсткий триггер только что поставил ИИ на паузу на ЭТОМ ходе → один раз
-        # анонсируем клиенту подключение менеджера. На чат-пути ИИ ещё отвечает
-        # этим ходом, поэтому анонс должен прийти ПОСЛЕ ответа: помечаем флаг в
-        # request-scope (g), а chat_v1 кладёт текст в handoff_announce — мост
-        # отправит его отдельным сообщением после ответа ИИ.
-        if engaged and MH.is_hard(reason):
+        should_ack = _apply_handoff_trigger(db, conv, reason, MH.alert_preview(user_message or ""))
+        # Модель v2: ИИ НЕ паузится. На жёсткий триггер (should_ack=True) кладём в
+        # request-scope (g) клиентское заверение «менеджер уведомлён» — мост
+        # отправит его ОТДЕЛЬНЫМ сообщением ПОСЛЕ ответа ИИ (handoff_announce).
+        # booking_intent (soft) → только тихий алерт, без текста клиенту.
+        if should_ack:
             try:
                 from flask import has_request_context
                 if has_request_context():
-                    g._handoff_announce = MH.ANNOUNCE_TEXT
+                    contact_known = (reason == MH.REASON_CONTACT) or _conv_has_contact(db, conv)
+                    g._handoff_announce = MH.request_ack_text(contact_known)
             except Exception:
                 pass
     except Exception:
@@ -2050,6 +2083,79 @@ def _maybe_operator_inbound(session_id: str, message: str,
     except Exception:
         logger.warning(
             "operator inbound gate failed (non-blocking) session=%s",
+            session_id[:8], exc_info=True,
+        )
+        return False
+
+
+def _operator_took_over_during_turn(session_id: str, message: str,
+                                    assistant_id: str, channel: str) -> bool:
+    """«Поздняя отмена»: менеджер РЕАЛЬНО зашёл (operator_mode стал True), пока
+    ИИ генерировал ответ на этом ходе.
+
+    Тогда ответ ИИ НЕ отправляем и НЕ персистим (без фантомного сообщения):
+    входящее клиента сохраняем как operator_inbound (менеджер увидит его в ЛК)
+    и эвиктим in-memory handler — чтобы при возврате к ИИ память поднялась из БД
+    чисто, без неотправленного хода. Возвращает True, если перехват случился
+    (тогда chat_v1 ответит suppressed). Инертно, пока фича выключена / диалог не
+    в operator-режиме. Любое исключение → False (fail-open в обычный поток).
+    """
+    try:
+        import manager_handoff as MH
+        if not MH.handoff_enabled(assistant_id, channel):
+            return False
+        from database import get_db, is_db_available
+        if not is_db_available():
+            return False
+        from models import Conversation, Message
+        from datetime import datetime as _dt, timezone as _tz
+        with get_db() as db:
+            if db is None:
+                return False
+            conv = db.query(Conversation).filter(
+                Conversation.session_id == session_id
+            ).first()
+            if conv is None or not conv.operator_mode:
+                return False  # перехвата не было — обычный поток (ответ ИИ уйдёт)
+            now = _dt.now(_tz.utc)
+            msg = Message(conversation_id=conv.id, role="user", content=message)
+            db.add(msg)
+            conv.message_count = (conv.message_count or 0) + 1
+            conv.last_active_at = now
+            db.flush()  # msg.id → remote_id
+            if conv.assistant_id is not None:
+                try:
+                    from dialog_sender import enqueue_operator_inbound
+                    enqueue_operator_inbound(
+                        db, conversation_id=conv.id, assistant_id=conv.assistant_id,
+                        message_id=msg.id, role="user", content=message, created_at=now,
+                    )
+                except Exception:
+                    logger.warning(
+                        "late-cancel operator_inbound enqueue failed conv=%s", conv.id,
+                        exc_info=True,
+                    )
+        # Эвикт in-memory handler (вне db-контекста) — следующий ход / возврат к
+        # ИИ поднимет историю из БД без неотправленного ответа.
+        try:
+            cache_key = _session_cache_key(session_id, assistant_id)
+            with _handlers_lock:
+                info = _handlers.pop(cache_key, None)
+            if info is not None:
+                try:
+                    info["handler"].close_sync()
+                except Exception:
+                    logger.debug("late-cancel close_sync failed", exc_info=True)
+        except Exception:
+            logger.debug("late-cancel evict failed session=%s", session_id[:8], exc_info=True)
+        logger.info(
+            "🛑 AI-REPLY DROPPED: оператор перехватил во время генерации session=%s",
+            session_id[:8],
+        )
+        return True
+    except Exception:
+        logger.warning(
+            "late-cancel check failed (non-blocking) session=%s",
             session_id[:8], exc_info=True,
         )
         return False
@@ -2121,18 +2227,20 @@ def _max_send_text(bot_token: str, chat_id, text: str) -> tuple:
         return False, str(exc)[:200]
 
 
-def _announce_to_client(db, conv) -> bool:
-    """Best-effort: отправить клиенту анонс «менеджер подключается» в MAX.
+def _send_client_text(db, conv, text: str) -> bool:
+    """Best-effort: отправить клиенту произвольный текст в MAX (handoff).
 
-    Используется на путях, где НЕТ ответа ИИ в полёте (клик «Забронировать» и
-    ручной перехват из ЛК), поэтому анонс уходит сразу, не нарушая порядок. Для
-    чат-пути (фраза/контакт) анонс шлёт мост ПОСЛЕ ответа ИИ (handoff_announce).
-    Только channel='max' с известными bot_token+chat_id. Любая осечка → False.
+    Используется на путях, где НЕТ ответа ИИ в полёте: клик «Забронировать»
+    (заверение request_ack_text) и реальный перехват из ЛК (OPERATOR_JOINED_TEXT).
+    Текст уходит сразу, не нарушая порядок. Для чат-пути (фраза/контакт) заверение
+    шлёт мост ПОСЛЕ ответа ИИ (handoff_announce). Только channel='max' с известными
+    bot_token+chat_id. Любая осечка → False.
     """
     try:
-        import manager_handoff as MH
         from models import Assistant
         if conv is None or (getattr(conv, 'channel', '') or '') != 'max':
+            return False
+        if not text:
             return False
         chat_id = getattr(conv, 'external_chat_id', None)
         if not chat_id:
@@ -2146,12 +2254,12 @@ def _announce_to_client(db, conv) -> bool:
             ).get('bot_token')
         if not bot_token:
             return False
-        ok, _err = _max_send_text(bot_token, chat_id, MH.ANNOUNCE_TEXT)
+        ok, _err = _max_send_text(bot_token, chat_id, text)
         if ok:
-            logger.info("📣 HANDOFF-ANNOUNCE sent session=%s", (conv.session_id or "")[:8])
+            logger.info("📣 HANDOFF-CLIENT-MSG sent session=%s len=%d", (conv.session_id or "")[:8], len(text))
         return ok
     except Exception:
-        logger.warning("handoff announce send failed (non-blocking)", exc_info=True)
+        logger.warning("handoff client message send failed (non-blocking)", exc_info=True)
         return False
 
 
@@ -2289,10 +2397,12 @@ def runtime_operator_handoff():
             conv.handoff_state = MH.STATE_RETURNED
         conv.last_active_at = now
         db.flush()
-        # Ручной перехват без предшествующего триггера — клиент ещё не получал
-        # анонса; вежливо сообщаем, что подключается менеджер (один раз).
+        # Реальный заход менеджера (перехват) — сообщаем клиенту один раз, что
+        # менеджер уже в чате (момент паузы ИИ). На /operator/message не дублируем:
+        # там за «вход» говорит само сообщение менеджера.
         if _announce_take:
-            _announce_to_client(db, conv)
+            import manager_handoff as MH
+            _send_client_text(db, conv, MH.OPERATOR_JOINED_TEXT)
         # Эхо состояния в ЛК через обычный снапшот.
         if conv.assistant_id is not None:
             try:
@@ -2536,6 +2646,20 @@ def chat_v1():
         reply = loop.run_until_complete(handler.chat(message))
         loop.close()
         _new_entries = handler.full_history[_hist_before:]
+
+        # ── Manager-handoff «поздняя отмена» ──────────────────────────────
+        # Менеджер мог РЕАЛЬНО зайти (operator_mode), ПОКА ИИ генерировал ответ.
+        # Тогда ответ ИИ не отправляем и не персистим: входящее клиента уходит
+        # менеджеру (operator_inbound), handler эвиктится. Клиент увидит только
+        # сообщение менеджера. Инертно, пока фича выключена / нет перехвата.
+        if _operator_took_over_during_turn(session_id, message, assistant_id, channel_hdr):
+            return jsonify({
+                'reply': '',
+                'tour_cards': [],
+                'conversation_id': conversation_id,
+                'operator_mode': True,
+                'suppressed': True,
+            })
 
         # ── Per-tenant feminine-persona output filter ──────────────────────
         # When the tenant has ``widget_config.feminine_persona = true`` we
