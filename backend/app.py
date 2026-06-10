@@ -1888,21 +1888,15 @@ def _mark_booking_click(session_id: str, tourid: str, dest: str) -> None:
                 "🔖 BOOKING-CLICK: session=%s tourid=%s → tour_clicks=%d, has_booking_intent=True",
                 session_id[:8], tourid, conv.tour_clicks,
             )
-            # Manager-handoff: клик «Забронировать» — жёсткий триггер (если фича
-            # включена для тенанта+канала). Шлёт manager_alert; ИИ НЕ паузится
-            # (модель v2) — клиенту уходит заверение «менеджер уведомлён».
+            # Manager-handoff: клик «Забронировать» — триггер (если фича включена
+            # для тенанта+канала). Модель v2.1: тихий manager_alert в ЛК; клиенту
+            # НИЧЕГО не пишем, ИИ НЕ паузится — диалог продолжается как обычно.
             try:
                 import manager_handoff as MH
-                _should_ack = _apply_handoff_trigger(
+                _apply_handoff_trigger(
                     db, conv, MH.REASON_BOOK_CLICK,
                     "Клиент нажал «Забронировать» по туру",
                 )
-                # Клик не порождает ответа ИИ — заверение «менеджер уведомлён»
-                # отправляем клиенту напрямую (best-effort). Если контакта ещё
-                # нет — мягко просим телефон, чтобы лид не потерялся.
-                if _should_ack:
-                    _contact_known = _conv_has_contact(db, conv)
-                    _send_client_text(db, conv, MH.request_ack_text(_contact_known))
             except Exception:
                 logger.warning("booking-click handoff trigger failed (non-blocking)", exc_info=True)
             # Re-emit snapshot to LK so the click is reflected there even though
@@ -1929,23 +1923,6 @@ def _mark_booking_click(session_id: str, tourid: str, dest: str) -> None:
 # manager_handoff.handoff_enabled() == False (флаг OFF / не в allow-list /
 # канал != max). Логика в backend/manager_handoff.py; события — dialog_sender.
 # ─────────────────────────────────────────────────────────────────────────────
-def _conv_has_contact(db, conv) -> bool:
-    """Был ли в диалоге оставлен телефон РФ (любое сообщение клиента).
-
-    Используется для выбора текста заверения: если контакт уже есть — не просим
-    номер повторно. Best-effort; любая осечка → False (тогда мягко попросим номер).
-    """
-    try:
-        import manager_handoff as MH
-        from models import Message
-        rows = db.query(Message.content).filter(
-            Message.conversation_id == conv.id, Message.role == "user",
-        ).all()
-        return any(MH.has_contact(r[0] or "") for r in rows)
-    except Exception:
-        return False
-
-
 def _apply_handoff_trigger(db, conv, reason: str, preview: str) -> bool:
     """Перевести диалог в handoff (requested) и поднять manager_alert.
 
@@ -2015,19 +1992,11 @@ def _maybe_trigger_handoff(db, conv, user_message: str) -> None:
         )
         if reason is None:
             return
-        should_ack = _apply_handoff_trigger(db, conv, reason, MH.alert_preview(user_message or ""))
-        # Модель v2: ИИ НЕ паузится. На жёсткий триггер (should_ack=True) кладём в
-        # request-scope (g) клиентское заверение «менеджер уведомлён» — мост
-        # отправит его ОТДЕЛЬНЫМ сообщением ПОСЛЕ ответа ИИ (handoff_announce).
-        # booking_intent (soft) → только тихий алерт, без текста клиенту.
-        if should_ack:
-            try:
-                from flask import has_request_context
-                if has_request_context():
-                    contact_known = (reason == MH.REASON_CONTACT) or _conv_has_contact(db, conv)
-                    g._handoff_announce = MH.request_ack_text(contact_known)
-            except Exception:
-                pass
+        # Модель v2.1: тихо уведомляем менеджера (alert в ЛК внутри). Клиенту
+        # НИЧЕГО не шлём — никакого «передал менеджеру»: ИИ продолжает диалог
+        # как обычно; захват телефона/лида — штатным поведением при бронировании.
+        # Пауза ИИ и сообщение клиенту — только при РЕАЛЬНОМ заходе менеджера.
+        _apply_handoff_trigger(db, conv, reason, MH.alert_preview(user_message or ""))
     except Exception:
         logger.warning("handoff trigger detect failed (non-blocking)", exc_info=True)
 
@@ -2230,11 +2199,9 @@ def _max_send_text(bot_token: str, chat_id, text: str) -> tuple:
 def _send_client_text(db, conv, text: str) -> bool:
     """Best-effort: отправить клиенту произвольный текст в MAX (handoff).
 
-    Используется на путях, где НЕТ ответа ИИ в полёте: клик «Забронировать»
-    (заверение request_ack_text) и реальный перехват из ЛК (OPERATOR_JOINED_TEXT).
-    Текст уходит сразу, не нарушая порядок. Для чат-пути (фраза/контакт) заверение
-    шлёт мост ПОСЛЕ ответа ИИ (handoff_announce). Только channel='max' с известными
-    bot_token+chat_id. Любая осечка → False.
+    Модель v2.1: используется ТОЛЬКО для уведомления о реальном заходе менеджера
+    (OPERATOR_JOINED_TEXT на `/operator/handoff take`). На триггерах клиенту ничего
+    не шлём. Только channel='max' с известными bot_token+chat_id. Любая осечка → False.
     """
     try:
         from models import Assistant
