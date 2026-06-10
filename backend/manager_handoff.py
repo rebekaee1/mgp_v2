@@ -115,8 +115,12 @@ def _split_csv(raw: str) -> list[str]:
 def handoff_enabled(assistant_id: Optional[str], channel: Optional[str]) -> bool:
     """Активна ли фича для данного (assistant_id, channel).
 
-    True только если: глобальный флаг ON И assistant_id ∈ allow-list И канал
-    разрешён. Любая осечка → False (фича инертна). Никаких исключений наружу.
+    Гейт по каналам (раздельно MAX и widget):
+      • глобальный флаг ON И канал ∈ operator_handoff_channels;
+      • канал MAX     → assistant_id ∈ operator_handoff_assistant_ids;
+      • канал widget  → operator_handoff_widget_all_tenants (все виджеты) ИЛИ
+                        assistant_id ∈ operator_handoff_widget_assistant_ids.
+    Любая осечка → False (фича инертна). Никаких исключений наружу.
     """
     try:
         from config import settings
@@ -126,13 +130,18 @@ def handoff_enabled(assistant_id: Optional[str], channel: Optional[str]) -> bool
         return False
     if not assistant_id:
         return False
-    allow = set(_split_csv(getattr(settings, "operator_handoff_assistant_ids", "")))
-    if str(assistant_id) not in allow:
-        return False
+    ch = (channel or "widget").strip().lower()
     channels = set(_split_csv(getattr(settings, "operator_handoff_channels", "max"))) or {"max"}
-    if (channel or "widget").strip().lower() not in channels:
+    if ch not in channels:
         return False
-    return True
+    if ch == "widget":
+        if bool(getattr(settings, "operator_handoff_widget_all_tenants", False)):
+            return True
+        widget_allow = set(_split_csv(getattr(settings, "operator_handoff_widget_assistant_ids", "")))
+        return str(assistant_id) in widget_allow
+    # MAX (и любой иной канал из списка) — основной allow-list
+    allow = set(_split_csv(getattr(settings, "operator_handoff_assistant_ids", "")))
+    return str(assistant_id) in allow
 
 
 def resume_after_seconds() -> int:

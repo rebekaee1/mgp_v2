@@ -604,7 +604,9 @@ def _restore_handler_from_db(handler, session_id: str, assistant_id: str = None)
         return False
 
 
-def _build_conversation_history_payload(db, assistant_id: str, conversation_id: str) -> dict:
+def _build_conversation_history_payload(
+    db, assistant_id: str, conversation_id: str, after_id: int = None
+) -> dict:
     from models import Conversation, Message
 
     assistant_uuid = _assistant_uuid_or_none(assistant_id)
@@ -628,24 +630,38 @@ def _build_conversation_history_payload(db, assistant_id: str, conversation_id: 
 
     visible = []
     for row in rows:
-        if row.role not in ("user", "assistant"):
+        # ``operator`` добавлен (2026-06-10, widget-handoff): реплики менеджера
+        # должны доезжать до виджета через поллинг. Старый фронт их игнорирует,
+        # пока handoff для виджета выключен (operator-сообщений просто нет).
+        if row.role not in ("user", "assistant", "operator"):
             continue
         content = (row.content or "").strip()
         tour_cards = list(row.tour_cards or [])
-        if row.role == "assistant" and not content and not tour_cards:
+        if row.role in ("assistant", "operator") and not content and not tour_cards:
             continue
         if row.role == "user" and not content:
             continue
         visible.append({
+            "id": row.id,
             "role": row.role,
             "content": content,
             "tour_cards": tour_cards,
             "created_at": row.created_at.isoformat() if row.created_at else None,
         })
 
+    # Инкрементальный поллинг: только сообщения новее after_id. Иначе — хвост 50.
+    if after_id is not None:
+        messages = [m for m in visible if (m.get("id") or 0) > after_id]
+    else:
+        messages = visible[-50:]
+
     return {
         "conversation_id": conversation_id,
-        "messages": visible[-50:],
+        "messages": messages,
+        # Состояние handoff для баннера/режима поллинга в виджете (widget-handoff).
+        "operator_mode": bool(getattr(conv, "operator_mode", False) or False),
+        "handoff_state": getattr(conv, "handoff_state", None) or "none",
+        "operator_actor": getattr(conv, "operator_actor", None),
     }
 
 
@@ -2272,25 +2288,31 @@ def runtime_operator_message():
             return jsonify({'status': 'error', 'error': 'conversation_not_found'}), 404
         if not MH.handoff_enabled(str(conv.assistant_id), getattr(conv, 'channel', None)):
             return jsonify({'status': 'error', 'error': 'handoff_disabled'}), 403
-        if (getattr(conv, 'channel', '') or '') != 'max':
+        channel = (getattr(conv, 'channel', '') or '').strip().lower()
+        if channel == 'max':
+            # MAX: реально отправляем сообщение клиенту через Bot API тенанта.
+            chat_id = getattr(conv, 'external_chat_id', None)
+            if not chat_id:
+                return jsonify({'status': 'error', 'error': 'no_external_chat_id'}), 422
+            assistant = db.get(Assistant, conv.assistant_id) if conv.assistant_id else None
+            bot_token = None
+            if assistant is not None:
+                bot_token = (
+                    ((assistant.runtime_metadata or {}).get('channels', {}) or {})
+                    .get('max', {}) or {}
+                ).get('bot_token')
+            if not bot_token:
+                return jsonify({'status': 'error', 'error': 'no_bot_token'}), 409
+            ok, err = _max_send_text(bot_token, chat_id, text)
+            if not ok:
+                logger.warning("operator-message MAX send failed conv=%s err=%s", conv.id, err)
+                return jsonify({'status': 'error', 'error': 'max_send_failed', 'detail': err}), 502
+        elif channel == 'widget':
+            # Widget: внешней отправки нет — сообщение менеджера доставляется
+            # записью в БД, виджет забирает его поллингом /api/runtime/history.
+            pass
+        else:
             return jsonify({'status': 'error', 'error': 'unsupported_channel'}), 409
-        chat_id = getattr(conv, 'external_chat_id', None)
-        if not chat_id:
-            return jsonify({'status': 'error', 'error': 'no_external_chat_id'}), 422
-        assistant = db.get(Assistant, conv.assistant_id) if conv.assistant_id else None
-        bot_token = None
-        if assistant is not None:
-            bot_token = (
-                ((assistant.runtime_metadata or {}).get('channels', {}) or {})
-                .get('max', {}) or {}
-            ).get('bot_token')
-        if not bot_token:
-            return jsonify({'status': 'error', 'error': 'no_bot_token'}), 409
-
-        ok, err = _max_send_text(bot_token, chat_id, text)
-        if not ok:
-            logger.warning("operator-message MAX send failed conv=%s err=%s", conv.id, err)
-            return jsonify({'status': 'error', 'error': 'max_send_failed', 'detail': err}), 502
 
         now = _dt.now(_tz.utc)
         msg = Message(conversation_id=conv.id, role='operator', content=text)
@@ -3055,7 +3077,14 @@ def runtime_metadata():
 
 @app.route('/api/runtime/history')
 def runtime_history():
-    """Internal runtime conversation history for widget restoration."""
+    """Internal runtime conversation history for widget restoration + polling.
+
+    Поддерживает инкрементальный поллинг виджета: ``?after_id=<int>`` возвращает
+    только сообщения с id больше указанного (для дешёвого опроса при handoff).
+    Без ``after_id`` — последние сообщения (полное восстановление, как раньше).
+    Ответ также несёт состояние handoff (operator_mode/handoff_state/operator_actor),
+    чтобы виджет показал баннер «С вами менеджер» и включил частый поллинг.
+    """
     _init_infrastructure()
     from database import get_db
 
@@ -3067,10 +3096,18 @@ def runtime_history():
     if not conversation_id:
         return jsonify({"conversation_id": "", "messages": []})
 
+    after_id_raw = (request.args.get("after_id") or "").strip()
+    try:
+        after_id = int(after_id_raw) if after_id_raw else None
+    except (TypeError, ValueError):
+        after_id = None
+
     with get_db() as db:
         if db is None:
             return jsonify({"conversation_id": conversation_id, "messages": []}), 503
-        return jsonify(_build_conversation_history_payload(db, assistant_id, conversation_id))
+        return jsonify(_build_conversation_history_payload(
+            db, assistant_id, conversation_id, after_id=after_id,
+        ))
 
 
 @app.route('/api/runtime/status')

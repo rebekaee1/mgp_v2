@@ -57,18 +57,22 @@ def _max_send_text(bot_token: str, chat_id, text: str) -> bool:
 
 
 def run_operator_resume_once() -> int:
-    """Один проход авто-возврата. Возвращает число возвращённых к ИИ диалогов."""
+    """Один проход авто-возврата. Возвращает число возвращённых к ИИ диалогов.
+
+    Канал-независимо (2026-06-10, widget-handoff): обрабатываем диалоги в
+    operator_mode по всем включённым каналам. Доставка «снова на связи»:
+    MAX — через Bot API; widget — записью в БД (виджет заберёт поллингом).
+    Гейт — пер-диалог через MH.handoff_enabled (учитывает раздельные allow-list
+    для MAX и widget + флаг «все виджеты»).
+    """
     from config import settings
     if not bool(getattr(settings, "operator_handoff_enabled", False)):
         return 0
-    allow = [a.strip() for a in (settings.operator_handoff_assistant_ids or "").split(",") if a.strip()]
-    if not allow:
-        return 0
-    try:
-        aids = [uuid.UUID(a) for a in allow]
-    except ValueError:
-        logger.warning("operator_resume: bad assistant_id in allow-list")
-        return 0
+    enabled_channels = [
+        c.strip().lower()
+        for c in (getattr(settings, "operator_handoff_channels", "max") or "max").split(",")
+        if c.strip()
+    ] or ["max"]
 
     from database import get_db, is_db_available
     if not is_db_available():
@@ -87,12 +91,14 @@ def run_operator_resume_once() -> int:
             db.query(Conversation)
             .filter(
                 Conversation.operator_mode.is_(True),
-                Conversation.assistant_id.in_(aids),
-                Conversation.channel == "max",
+                Conversation.channel.in_(enabled_channels),
             )
             .all()
         )
         for conv in convs:
+            # Гейт фичи (канал-зависимый): только разрешённые ассистенты/каналы.
+            if not MH.handoff_enabled(str(conv.assistant_id), getattr(conv, "channel", None)):
+                continue
             base = _aware(conv.operator_last_activity_at) or _aware(conv.operator_mode_since)
             if base is None:
                 continue
@@ -105,17 +111,23 @@ def run_operator_resume_once() -> int:
             conv.handoff_state = MH.STATE_RETURNED
             conv.last_active_at = now
 
-            chat_id = conv.external_chat_id
-            assistant = db.get(Assistant, conv.assistant_id) if conv.assistant_id else None
-            token = _bot_token(assistant) if assistant else None
+            channel = (getattr(conv, "channel", "") or "").strip().lower()
             sent = False
-            if token and chat_id:
-                sent = _max_send_text(token, chat_id, MH.RESUME_INVITE_TEXT)
-                if sent:
-                    db.add(Message(
-                        conversation_id=conv.id, role="assistant", content=MH.RESUME_INVITE_TEXT
-                    ))
-                    conv.message_count = (conv.message_count or 0) + 1
+            if channel == "max":
+                chat_id = conv.external_chat_id
+                assistant = db.get(Assistant, conv.assistant_id) if conv.assistant_id else None
+                token = _bot_token(assistant) if assistant else None
+                if token and chat_id:
+                    sent = _max_send_text(token, chat_id, MH.RESUME_INVITE_TEXT)
+            elif channel == "widget":
+                # Внешней отправки нет — текст доставляется записью в БД (поллинг).
+                sent = True
+
+            if sent:
+                db.add(Message(
+                    conversation_id=conv.id, role="assistant", content=MH.RESUME_INVITE_TEXT
+                ))
+                conv.message_count = (conv.message_count or 0) + 1
 
             if conv.assistant_id is not None:
                 try:
@@ -128,8 +140,8 @@ def run_operator_resume_once() -> int:
 
             resumed += 1
             logger.info(
-                "↩️ AI-RESUME session=%s elapsed=%.0fs invite_sent=%s",
-                (conv.session_id or "")[:8], elapsed, sent,
+                "↩️ AI-RESUME session=%s channel=%s elapsed=%.0fs invite_sent=%s",
+                (conv.session_id or "")[:8], channel, elapsed, sent,
             )
 
     return resumed

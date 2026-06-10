@@ -95,9 +95,18 @@ class Settings(BaseSettings):
     # канал не в operator_handoff_channels — фича полностью инертна (ноль влияния
     # на остальные диалоги/тенанты). Включаем только на тест-ассистенте 593471b7.
     operator_handoff_enabled: bool = False
-    operator_handoff_assistant_ids: str = ""          # CSV allow-list assistant_id
+    operator_handoff_assistant_ids: str = ""          # CSV allow-list assistant_id (канал MAX)
     operator_handoff_channels: str = "max"            # CSV каналов (старт: только max)
     operator_handoff_resume_minutes: int = 10         # авто-возврат к ИИ после тишины
+    # --- Widget-handoff (вход менеджера в чат на сайте) ---
+    # Канал 'widget' гейтится отдельно от MAX:
+    #   • operator_handoff_widget_all_tenants=true → фича для ВСЕХ виджет-ассистентов
+    #     (финальная раскатка «на всех, у кого есть виджет»);
+    #   • иначе — точечный allow-list для виджета (обкатка, напр. МГП основной офис).
+    # Канал должен также присутствовать в operator_handoff_channels. По умолчанию
+    # widget полностью ВЫКЛ (channels=max), поэтому фича инертна для всех виджетов.
+    operator_handoff_widget_all_tenants: bool = False
+    operator_handoff_widget_assistant_ids: str = ""   # CSV allow-list assistant_id (канал widget)
     # Секрет back-channel LK→MGP (заголовок X-MGP-Service-Token на /api/runtime/
     # operator/*). На стороне ЛК тот же VALUE лежит как MGP_OPERATOR_TOKEN.
     operator_handoff_token: str = ""
