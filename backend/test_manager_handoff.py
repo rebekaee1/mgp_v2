@@ -64,6 +64,32 @@ def test_trigger_classification():
     assert mh.classify_user_trigger("просто смотрю") is None
 
 
+def test_manager_request_robust_to_insertions():
+    # v3.1: литеральный матч ломался вставками («соедините МЕНЯ с менеджером»)
+    # — прод-кейс e2e-v3-1781164867 (2026-06-11). Теперь регэксп-пары устойчивы.
+    mh = _load(enabled=True, allow=AID)
+    positives = (
+        "Соедините меня с менеджером",
+        "Соедините нас с менеджером",
+        "соедините меня пожалуйста с менеджером",
+        "Соедините меня с менеджером, хочу проконсультироваться",
+        "свяжите меня с менеджером",
+        "позовите мне менеджера",
+        "можно поговорить с вашим менеджером",
+        "переведите меня на менеджера",
+        "дайте мне менеджера",
+        "можно менеджера",
+        "хочу поговорить с живым человеком",
+    )
+    for t in positives:
+        assert mh.classify_user_trigger(t) == mh.REASON_MANAGER_REQUEST, t
+    # упоминание менеджера ≠ просьба (ложные срабатывания)
+    for t in ("менеджер вчера мне уже звонил",
+              "расскажите подробнее про второй отель",
+              "какая погода в Турции в июле"):
+        assert mh.classify_user_trigger(t) is None, t
+
+
 def test_priority_order():
     mh = _load(enabled=True, allow=AID)
     # manager_request > contact > booking
