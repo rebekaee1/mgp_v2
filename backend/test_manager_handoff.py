@@ -9,7 +9,7 @@ import types
 
 
 def _load(enabled=False, allow="", channels="max", resume=10,
-          widget_all=False, widget_allow=""):
+          widget_all=False, widget_allow="", max_all=False):
     cfg = types.ModuleType("config")
 
     class S:
@@ -19,6 +19,7 @@ def _load(enabled=False, allow="", channels="max", resume=10,
         operator_handoff_resume_minutes = resume
         operator_handoff_widget_all_tenants = widget_all
         operator_handoff_widget_assistant_ids = widget_allow
+        operator_handoff_max_all_tenants = max_all
 
     cfg.settings = S()
     sys.modules["config"] = cfg
@@ -156,6 +157,20 @@ def test_max_unaffected_by_widget_flags():
     mh = _load(enabled=True, allow=AID, channels="max,widget", widget_all=True)
     assert mh.handoff_enabled(AID, "max") is True
     assert mh.handoff_enabled(AID, "widget") is True
+
+
+def test_max_all_tenants():
+    # «на всех» для MAX: любой ассистент проходит без allow-list
+    mh = _load(enabled=True, channels="max,widget", max_all=True)
+    assert mh.handoff_enabled(AID, "max") is True
+    assert mh.handoff_enabled("any-other-uuid", "max") is True
+    assert mh.handoff_enabled(AID, "widget") is False  # widget по своим флагам (выкл)
+    # выключено глобально → инертно даже с max_all
+    mh = _load(enabled=False, max_all=True)
+    assert mh.handoff_enabled(AID, "max") is False
+    # канал не в списке → инертно
+    mh = _load(enabled=True, channels="widget", max_all=True)
+    assert mh.handoff_enabled(AID, "max") is False
 
 
 def test_request_ack_text_contact_aware():

@@ -165,9 +165,10 @@ def _split_csv(raw: str) -> list[str]:
 def handoff_enabled(assistant_id: Optional[str], channel: Optional[str]) -> bool:
     """Активна ли фича для данного (assistant_id, channel).
 
-    Гейт по каналам (раздельно MAX и widget):
+    Гейт по каналам (раздельно MAX и widget, симметрично):
       • глобальный флаг ON И канал ∈ operator_handoff_channels;
-      • канал MAX     → assistant_id ∈ operator_handoff_assistant_ids;
+      • канал MAX     → operator_handoff_max_all_tenants (все MAX-боты) ИЛИ
+                        assistant_id ∈ operator_handoff_assistant_ids;
       • канал widget  → operator_handoff_widget_all_tenants (все виджеты) ИЛИ
                         assistant_id ∈ operator_handoff_widget_assistant_ids.
     Любая осечка → False (фича инертна). Никаких исключений наружу.
@@ -189,7 +190,9 @@ def handoff_enabled(assistant_id: Optional[str], channel: Optional[str]) -> bool
             return True
         widget_allow = set(_split_csv(getattr(settings, "operator_handoff_widget_assistant_ids", "")))
         return str(assistant_id) in widget_allow
-    # MAX (и любой иной канал из списка) — основной allow-list
+    # MAX (и любой иной канал из списка): «все» ИЛИ основной allow-list
+    if bool(getattr(settings, "operator_handoff_max_all_tenants", False)):
+        return True
     allow = set(_split_csv(getattr(settings, "operator_handoff_assistant_ids", "")))
     return str(assistant_id) in allow
 

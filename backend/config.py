@@ -107,6 +107,9 @@ class Settings(BaseSettings):
     # widget полностью ВЫКЛ (channels=max), поэтому фича инертна для всех виджетов.
     operator_handoff_widget_all_tenants: bool = False
     operator_handoff_widget_assistant_ids: str = ""   # CSV allow-list assistant_id (канал widget)
+    # Канал MAX «на всех»: true → handoff для ВСЕХ MAX-ассистентов (новые тенанты
+    # подхватываются автоматически); false → точечный operator_handoff_assistant_ids.
+    operator_handoff_max_all_tenants: bool = False
     # Секрет back-channel LK→MGP (заголовок X-MGP-Service-Token на /api/runtime/
     # operator/*). На стороне ЛК тот же VALUE лежит как MGP_OPERATOR_TOKEN.
     operator_handoff_token: str = ""
