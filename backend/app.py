@@ -1904,17 +1904,10 @@ def _mark_booking_click(session_id: str, tourid: str, dest: str) -> None:
                 "🔖 BOOKING-CLICK: session=%s tourid=%s → tour_clicks=%d, has_booking_intent=True",
                 session_id[:8], tourid, conv.tour_clicks,
             )
-            # Manager-handoff: клик «Забронировать» — триггер (если фича включена
-            # для тенанта+канала). Модель v2.1: тихий manager_alert в ЛК; клиенту
-            # НИЧЕГО не пишем, ИИ НЕ паузится — диалог продолжается как обычно.
-            try:
-                import manager_handoff as MH
-                _apply_handoff_trigger(
-                    db, conv, MH.REASON_BOOK_CLICK,
-                    "Клиент нажал «Забронировать» по туру",
-                )
-            except Exception:
-                logger.warning("booking-click handoff trigger failed (non-blocking)", exc_info=True)
+            # Manager-handoff v3: клик «Забронировать» БОЛЬШЕ НЕ уведомляет менеджера
+            # (по решению — кнопка ≠ явный сигнал; это только трекинг воронки
+            # tour_clicks выше). Уведомления шлём лишь на явные текстовые сигналы
+            # (просьба менеджера / бронь / контакт) — см. _maybe_trigger_handoff.
             # Re-emit snapshot to LK so the click is reflected there even though
             # it lands after the last chat message. Idempotent on the LK side
             # (event_id is unique); LK takes max() on tour_clicks.
@@ -1940,18 +1933,15 @@ def _mark_booking_click(session_id: str, tourid: str, dest: str) -> None:
 # канал != max). Логика в backend/manager_handoff.py; события — dialog_sender.
 # ─────────────────────────────────────────────────────────────────────────────
 def _apply_handoff_trigger(db, conv, reason: str, preview: str) -> bool:
-    """Перевести диалог в handoff (requested) и поднять manager_alert.
+    """Перевести диалог в handoff (requested) и поднять manager_alert (v3).
 
-    Модель v2 (2026-06-10): триггер НЕ ставит ИИ на паузу — operator_mode НЕ
-    трогаем (пауза наступает только при реальном заходе менеджера через ручки
-    operator/*). Здесь лишь: ставим handoff_state='requested', шлём manager_alert
-    менеджеру ОДИН раз за цикл (из none/returned) и решаем, нужно ли отправить
-    клиенту заверение.
-
-    Возвращает **should_ack** — True, если этому (жёсткому) триггеру положено
-    клиентское заверение «менеджер уведомлён» (book_click/phrase/contact/manual).
-    Soft (booking_intent) → False (только тихий алерт). Любая осечка → False.
-    Включается ТОЛЬКО при handoff_enabled.
+    Триггер НЕ ставит ИИ на паузу (operator_mode не трогаем — пауза только при
+    реальном заходе менеджера через ручки operator/*). Шлём manager_alert ОДИН
+    раз за цикл (из none/returned). Если в рамках уже поднятого цикла пришла
+    БОЛЕЕ приоритетная причина (manager_request > contact > booking) — обновляем
+    handoff_reason без повторного алерта (ЛК увидит апгрейд через снапшот).
+    Возвращает True, если что-то изменилось. Любая осечка → False. Только при
+    handoff_enabled.
     """
     try:
         import manager_handoff as MH
@@ -1960,15 +1950,15 @@ def _apply_handoff_trigger(db, conv, reason: str, preview: str) -> bool:
         if not MH.handoff_enabled(str(conv.assistant_id), getattr(conv, "channel", None)):
             return False
         if conv.operator_mode:
-            return False  # менеджер уже реально за рулём — не алертим и не «акаем»
+            return False  # менеджер уже реально за рулём — не дёргаем
         state = conv.handoff_state or MH.STATE_NONE
         prev_reason = conv.handoff_reason
-        hard = MH.is_hard(reason)
         fresh_cycle = state in (MH.STATE_NONE, MH.STATE_RETURNED)
-        # Эскалация: тихий soft-алерт уже был (requested), теперь пришёл жёсткий
-        # сигнал → клиента надо заверить, но повторный алерт менеджеру НЕ шлём.
-        soft_to_hard = (state == MH.STATE_REQUESTED and not MH.is_hard(prev_reason) and hard)
-        if not (fresh_cycle or soft_to_hard):
+        upgrade = (
+            state == MH.STATE_REQUESTED
+            and MH.reason_priority(reason) > MH.reason_priority(prev_reason)
+        )
+        if not (fresh_cycle or upgrade):
             return False
         from datetime import datetime as _dt, timezone as _tz
         now = _dt.now(_tz.utc)
@@ -1983,35 +1973,32 @@ def _apply_handoff_trigger(db, conv, reason: str, preview: str) -> bool:
                 reason=reason, preview=preview,
             )
             logger.info(
-                "🤝 HANDOFF-ALERT session=%s reason=%s (ИИ продолжает, operator_mode=%s)",
-                (conv.session_id or "")[:8], reason, conv.operator_mode,
+                "🤝 HANDOFF-ALERT session=%s reason=%s (ИИ продолжает)",
+                (conv.session_id or "")[:8], reason,
             )
         else:
             logger.info(
-                "🤝 HANDOFF-ESCALATE session=%s %s→%s (без повторного алерта)",
+                "🤝 HANDOFF-UPGRADE session=%s %s→%s (без повторного алерта)",
                 (conv.session_id or "")[:8], prev_reason, reason,
             )
-        return hard
+        return True
     except Exception:
         logger.warning("handoff trigger apply failed (non-blocking)", exc_info=True)
         return False
 
 
 def _maybe_trigger_handoff(db, conv, user_message: str) -> None:
-    """Детект триггера из реплики клиента (фраза/контакт/booking_intent)."""
+    """Детект триггера из реплики клиента (v3: manager_request / booking / contact)."""
     try:
         import manager_handoff as MH
         if conv is None:
             return
-        reason = MH.classify_user_trigger(
-            user_message or "", booking_intent=bool(conv.has_booking_intent)
-        )
+        reason = MH.classify_user_trigger(user_message or "")
         if reason is None:
             return
-        # Модель v2.1: тихо уведомляем менеджера (alert в ЛК внутри). Клиенту
-        # НИЧЕГО не шлём — никакого «передал менеджеру»: ИИ продолжает диалог
-        # как обычно; захват телефона/лида — штатным поведением при бронировании.
-        # Пауза ИИ и сообщение клиенту — только при РЕАЛЬНОМ заходе менеджера.
+        # v3: тихо уведомляем менеджера (alert в ЛК внутри). Клиенту НИЧЕГО
+        # системного не шлём — ответ формирует ИИ по промпту (контакт-first).
+        # Пауза ИИ — только при реальном заходе менеджера.
         _apply_handoff_trigger(db, conv, reason, MH.alert_preview(user_message or ""))
     except Exception:
         logger.warning("handoff trigger detect failed (non-blocking)", exc_info=True)

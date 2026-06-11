@@ -10,8 +10,9 @@
 
 Контракт значений (см. docs/handoff/MANAGER_HANDOFF_CONTRACT.md):
   handoff_state : none | requested | operator | returned
-  handoff_reason: book_click | booking_intent | phrase | contact | manual
-  operator_mode : bool (true ⇒ ИИ на паузе)
+  handoff_reason: manager_request | booking | contact | manual  (v3; book_click/
+                  booking_intent/phrase — deprecated, не триггерят)
+  operator_mode : bool (true ⇒ ИИ на паузе, только при реальном заходе менеджера)
 """
 from __future__ import annotations
 
@@ -24,21 +25,33 @@ STATE_REQUESTED = "requested"
 STATE_OPERATOR = "operator"
 STATE_RETURNED = "returned"
 
+# v3 (2026-06-11): причины уведомления, раздельные для приоритизации в ЛК.
+REASON_MANAGER_REQUEST = "manager_request"   # клиент хочет человека/консультацию/бронь ЧЕРЕЗ менеджера
+REASON_BOOKING = "booking"                   # явное само-намерение брони (без упоминания менеджера)
+REASON_CONTACT = "contact"                   # оставил телефон
+REASON_MANUAL = "manual"                     # ручной перехват менеджером из ЛК
+# DEPRECATED (v1/v2): оставлены для обратной совместимости импортов. В v3 НЕ
+# триггерят: book_click — только трекинг воронки; широкий booking_intent убран.
 REASON_BOOK_CLICK = "book_click"
 REASON_BOOKING_INTENT = "booking_intent"
 REASON_PHRASE = "phrase"
-REASON_CONTACT = "contact"
-REASON_MANUAL = "manual"
 
-# Семантика триггеров (модель v2, 2026-06-10): НИ ОДИН триггер не ставит ИИ на
-# паузу — ИИ ПРОДОЛЖАЕТ вести диалог. Разница только в коммуникации клиенту:
-#   • «hard» (book_click/phrase/contact/manual) → manager_alert + клиенту шлём
-#     короткое заверение «менеджер уведомлён» (request_ack_text);
-#   • «soft» (booking_intent) → ТОЛЬКО manager_alert (тихо), без текста клиенту.
-# Пауза ИИ (operator_mode=True) наступает ИСКЛЮЧИТЕЛЬНО при РЕАЛЬНОМ заходе
-# менеджера: ручки /api/runtime/operator/handoff (take) | /operator/message.
-HARD_REASONS = frozenset({REASON_BOOK_CLICK, REASON_PHRASE, REASON_CONTACT, REASON_MANUAL})
-SOFT_REASONS = frozenset({REASON_BOOKING_INTENT})
+# Семантика v3: НИ ОДИН клиентский триггер не ставит ИИ на паузу — ИИ ПРОДОЛЖАЕТ
+# вести диалог; сообщение клиенту формирует промпт (контакт-first, без обещаний
+# времени). Уведомление менеджеру (manager_alert) шлётся на manager_request /
+# booking / contact. Пауза ИИ (operator_mode=True) — ИСКЛЮЧИТЕЛЬНО при РЕАЛЬНОМ
+# заходе менеджера (ручки /api/runtime/operator/*).
+ALERT_REASONS = frozenset({REASON_MANAGER_REQUEST, REASON_BOOKING, REASON_CONTACT})
+HARD_REASONS = frozenset({REASON_MANAGER_REQUEST, REASON_BOOKING, REASON_CONTACT, REASON_MANUAL})
+SOFT_REASONS = frozenset()
+
+# Приоритет причин (для апгрейда reason в рамках одного цикла, без повторного
+# алерта): просьба менеджера > контакт > бронь.
+REASON_PRIORITY = {REASON_MANAGER_REQUEST: 3, REASON_CONTACT: 2, REASON_BOOKING: 1}
+
+
+def reason_priority(reason: Optional[str]) -> int:
+    return REASON_PRIORITY.get(reason or "", 0)
 
 # DEPRECATED (модель v1): анонс при жёстком перехвате, когда ИИ сразу паузился.
 # Оставлен для обратной совместимости/тестов; в модели v2 НЕ используется —
@@ -84,23 +97,41 @@ RESUME_SYSTEM_HINT = (
     "менеджер свяжется для подтверждения. Кратко и по-человечески.]"
 )
 
-# ── Жёсткие фразы (явная готовность бронировать / просьба менеджера) ──
-# Подмножество _BOOKING_PHRASES из app.py: только то, что означает «оформляю сейчас»
-# или «дайте менеджера». Широкий has_booking_intent остаётся мягким триггером.
-_HARD_PHRASES = (
-    "забронировать", "хочу забронировать", "можно забронировать",
-    "как забронировать", "бронирую", "бронируем",
-    "оформить тур", "оформляем", "давайте оформим", "давай оформим",
-    "готов оформить", "готовы оформить", "хочу оформить",
-    "готов оплатить", "готовы оплатить", "хочу оплатить",
-    "беру этот", "берем этот", "берём этот", "хочу этот вариант",
+# ── Фразы-триггеры v3 ──
+# Раздельно: «нужен человек / консультация / бронь ЧЕРЕЗ менеджера»
+# (manager_request) и «само-намерение брони» (booking). book_click и широкий
+# has_booking_intent больше НЕ триггерят уведомление.
+_MANAGER_REQUEST_PHRASES = (
+    # прямая просьба человека
+    "дайте менеджера", "дай менеджера", "нужен менеджер", "нужен живой",
+    "хочу менеджера", "позовите менеджера", "позови менеджера", "вызовите менеджера",
     "контакт менеджера", "номер менеджера", "телефон менеджера",
-    "связаться с менеджером", "позвонить менеджеру", "дайте менеджера",
+    "связаться с менеджером", "позвонить менеджеру", "позвоните менеджеру",
     "переведите на менеджера", "переведи на менеджера",
-    "соедините с менеджером", "соедини с менеджером",
-    "пусть менеджер", "перезвоните",
+    "соедините с менеджером", "соедини с менеджером", "соедините с человеком",
+    "живой человек", "живого человека", "оператора", "позовите оператора",
+    "пусть менеджер", "перезвоните", "перезвонить мне", "пусть перезвонит",
+    # консультация с менеджером
+    "проконсультироваться с менеджером", "консультацию менеджера",
+    "консультация менеджера", "поговорить с менеджером", "пообщаться с менеджером",
+    "посоветоваться с менеджером", "обсудить с менеджером", "уточнить у менеджера",
+    # бронь/оформление ЧЕРЕЗ менеджера
+    "через менеджера", "менеджер оформит", "менеджер забронирует",
+    "менеджер поможет оформить",
 )
-_HARD_PHRASES_NORM = tuple(p.lower().replace("ё", "е") for p in _HARD_PHRASES)
+_BOOKING_PHRASES = (
+    "забронировать", "хочу забронировать", "можно забронировать",
+    "как забронировать", "бронирую", "бронируем", "забронируйте", "забронируй",
+    "оформить тур", "оформить", "оформляем", "давайте оформим", "давай оформим",
+    "готов оформить", "готовы оформить", "хочу оформить", "оформите",
+    "оформить первый", "оформить второй", "оформить этот",
+    "готов оплатить", "готовы оплатить", "хочу оплатить",
+    "беру этот", "берем этот", "берём этот", "беру первый", "беру второй",
+    "хочу этот вариант", "хочу первый вариант", "хочу второй вариант", "хочу этот",
+    "мне понравился первый вариант", "мне понравился этот вариант",
+)
+_MANAGER_REQUEST_PHRASES_NORM = tuple(p.lower().replace("ё", "е") for p in _MANAGER_REQUEST_PHRASES)
+_BOOKING_PHRASES_NORM = tuple(p.lower().replace("ё", "е") for p in _BOOKING_PHRASES)
 
 # Телефон РФ: 10–11 цифр, начинается на 7/8/9 (строго, чтобы не ловить длинные ID
 # из служебных блоков [ИСТОЧНИК:…]). Зеркалит логику leads-аудита.
@@ -169,24 +200,37 @@ def has_contact(text: str) -> bool:
     return False
 
 
-def has_hard_phrase(text: str) -> bool:
-    """Явная фраза «оформляю/дайте менеджера» (жёсткий триггер)."""
+def has_manager_request(text: str) -> bool:
+    """Клиент явно хочет человека: менеджер/оператор/консультация/через менеджера."""
     t = _clean(text).lower().replace("ё", "е")
-    return any(p in t for p in _HARD_PHRASES_NORM)
+    return any(p in t for p in _MANAGER_REQUEST_PHRASES_NORM)
 
 
-def classify_user_trigger(text: str, *, booking_intent: bool) -> Optional[str]:
-    """Классифицировать триггер из реплики клиента.
+def has_booking_phrase(text: str) -> bool:
+    """Явное само-намерение брони (без упоминания менеджера)."""
+    t = _clean(text).lower().replace("ё", "е")
+    return any(p in t for p in _BOOKING_PHRASES_NORM)
 
-    Приоритет: contact > phrase > booking_intent(мягкий). Возвращает reason или None.
-    `booking_intent` — результат существующего has_booking_intent (широкий).
+
+def has_hard_phrase(text: str) -> bool:
+    """Back-compat: любой явный триггер (просьба менеджера ИЛИ бронь)."""
+    return has_manager_request(text) or has_booking_phrase(text)
+
+
+def classify_user_trigger(text: str) -> Optional[str]:
+    """Классифицировать триггер из реплики клиента (v3).
+
+    Приоритет: manager_request > contact > booking. book_click и широкая
+    эвристика booking_intent больше НЕ триггерят. Возвращает reason или None.
+    «Оформить через менеджера» → manager_request (есть упоминание менеджера),
+    «хочу забронировать» → booking, «+79161234567» → contact.
     """
+    if has_manager_request(text):
+        return REASON_MANAGER_REQUEST
     if has_contact(text):
         return REASON_CONTACT
-    if has_hard_phrase(text):
-        return REASON_PHRASE
-    if booking_intent:
-        return REASON_BOOKING_INTENT
+    if has_booking_phrase(text):
+        return REASON_BOOKING
     return None
 
 

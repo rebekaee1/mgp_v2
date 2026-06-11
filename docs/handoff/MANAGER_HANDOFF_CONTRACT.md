@@ -60,9 +60,19 @@
 
 | Поле | Тип | Значения | Семантика |
 |---|---|---|---|
-| `operator_mode` | bool | `true`/`false` | **`true` ⇒ ИИ на паузе** (источник истины для UI-гейта) |
+| `operator_mode` | bool | `true`/`false` | **`true` ⇒ ИИ на паузе** (только при реальном заходе менеджера) |
 | `handoff_state` | enum | `none` \| `requested` \| `operator` \| `returned` | жизненный цикл |
-| `handoff_reason` | enum\|null | `book_click` \| `booking_intent` \| `phrase` \| `contact` \| `manual` | почему подняли |
+| `handoff_reason` | enum\|null | **v3:** `manager_request` \| `booking` \| `contact` \| `manual` | почему подняли |
+
+> **v3 (2026-06-11) — таксономия причин:** уведомление (`manager_alert`) шлётся
+> только на: `manager_request` (клиент хочет человека / консультацию / бронь
+> ЧЕРЕЗ менеджера), `booking` (явное само-намерение брони — текстом), `contact`
+> (оставил телефон). **Клик «Забронировать» (`book_click`) и широкая эвристика
+> (`booking_intent`) БОЛЬШЕ НЕ уведомляют** (book_click — только трекинг воронки).
+> Приоритет (для апгрейда reason в рамках цикла, без повторного пуша):
+> `manager_request` > `contact` > `booking`. Для ЛК: ярлыки —
+> `manager_request`→«Просит менеджера», `booking`→«Готов к брони»,
+> `contact`→«Оставил контакт», `manual`→«Ручной перехват».
 | `operator_mode_since` | ISO8601\|null | — | когда включился operator_mode |
 | `operator_actor` | str\|null | имя/идентификатор менеджера | кто за рулём (для баннера) |
 

@@ -97,7 +97,7 @@ class Settings(BaseSettings):
     operator_handoff_enabled: bool = False
     operator_handoff_assistant_ids: str = ""          # CSV allow-list assistant_id (канал MAX)
     operator_handoff_channels: str = "max"            # CSV каналов (старт: только max)
-    operator_handoff_resume_minutes: int = 10         # авто-возврат к ИИ после тишины
+    operator_handoff_resume_minutes: int = 30         # авто-возврат к ИИ после тишины менеджера (safety-net)
     # --- Widget-handoff (вход менеджера в чат на сайте) ---
     # Канал 'widget' гейтится отдельно от MAX:
     #   • operator_handoff_widget_all_tenants=true → фича для ВСЕХ виджет-ассистентов

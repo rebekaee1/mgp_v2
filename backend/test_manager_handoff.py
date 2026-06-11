@@ -47,19 +47,31 @@ def test_enabled_only_for_allowlisted_max():
 
 def test_trigger_classification():
     mh = _load(enabled=True, allow=AID)
-    assert mh.classify_user_trigger("Хочу забронировать", booking_intent=False) == mh.REASON_PHRASE
-    assert mh.classify_user_trigger("оформляем этот вариант", booking_intent=False) == mh.REASON_PHRASE
-    assert mh.classify_user_trigger("дайте номер менеджера", booking_intent=False) == mh.REASON_PHRASE
-    assert mh.classify_user_trigger("+7 916 123-45-67", booking_intent=False) == mh.REASON_CONTACT
-    assert mh.classify_user_trigger("8 916 123 45 67", booking_intent=False) == mh.REASON_CONTACT
-    assert mh.classify_user_trigger("смотрю варианты", booking_intent=True) == mh.REASON_BOOKING_INTENT
-    assert mh.classify_user_trigger("просто смотрю", booking_intent=False) is None
+    # booking — само-намерение брони (без упоминания менеджера)
+    assert mh.classify_user_trigger("Хочу забронировать") == mh.REASON_BOOKING
+    assert mh.classify_user_trigger("оформляем этот вариант") == mh.REASON_BOOKING
+    assert mh.classify_user_trigger("беру первый") == mh.REASON_BOOKING
+    # manager_request — нужен человек / консультация / бронь ЧЕРЕЗ менеджера
+    assert mh.classify_user_trigger("дайте номер менеджера") == mh.REASON_MANAGER_REQUEST
+    assert mh.classify_user_trigger("хочу проконсультироваться с менеджером") == mh.REASON_MANAGER_REQUEST
+    assert mh.classify_user_trigger("оформить через менеджера") == mh.REASON_MANAGER_REQUEST
+    assert mh.classify_user_trigger("соедините с человеком") == mh.REASON_MANAGER_REQUEST
+    # contact
+    assert mh.classify_user_trigger("+7 916 123-45-67") == mh.REASON_CONTACT
+    assert mh.classify_user_trigger("8 916 123 45 67") == mh.REASON_CONTACT
+    # широкая эвристика / просто интерес больше НЕ триггерит
+    assert mh.classify_user_trigger("смотрю варианты") is None
+    assert mh.classify_user_trigger("просто смотрю") is None
 
 
-def test_contact_priority_over_phrase():
+def test_priority_order():
     mh = _load(enabled=True, allow=AID)
-    # и телефон, и фраза → contact важнее
-    assert mh.classify_user_trigger("хочу забронировать, мой +79161234567", booking_intent=True) == mh.REASON_CONTACT
+    # manager_request > contact > booking
+    assert mh.classify_user_trigger("дайте менеджера, мой +79161234567") == mh.REASON_MANAGER_REQUEST
+    assert mh.classify_user_trigger("хочу забронировать, мой +79161234567") == mh.REASON_CONTACT
+    assert (mh.reason_priority(mh.REASON_MANAGER_REQUEST)
+            > mh.reason_priority(mh.REASON_CONTACT)
+            > mh.reason_priority(mh.REASON_BOOKING) > 0)
 
 
 def test_no_false_phone_from_long_ids():
@@ -68,13 +80,13 @@ def test_no_false_phone_from_long_ids():
     assert mh.has_contact("заказ 1234567890123456789") is False
 
 
-def test_hard_vs_soft():
+def test_alert_reasons():
     mh = _load(enabled=True, allow=AID)
-    assert mh.is_hard(mh.REASON_BOOK_CLICK)
-    assert mh.is_hard(mh.REASON_PHRASE)
-    assert mh.is_hard(mh.REASON_CONTACT)
-    assert mh.is_hard(mh.REASON_MANUAL)
-    assert not mh.is_hard(mh.REASON_BOOKING_INTENT)
+    for r in (mh.REASON_MANAGER_REQUEST, mh.REASON_BOOKING, mh.REASON_CONTACT):
+        assert r in mh.ALERT_REASONS
+    # широкая эвристика и клик кнопки больше не уведомляют
+    assert mh.REASON_BOOKING_INTENT not in mh.ALERT_REASONS
+    assert mh.REASON_BOOK_CLICK not in mh.ALERT_REASONS
 
 
 def test_resume_seconds():
