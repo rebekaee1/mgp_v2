@@ -118,6 +118,14 @@ class Settings(BaseSettings):
     # MAX_API_BASE_URL моста.
     max_api_base_url: str = "https://botapi.max.ru"
 
+    # --- Lead-catcher (режим «ловца лидов», пер-тенант) ---
+    # Точечный allow-list assistant_id (CSV). Пока assistant_id не в списке —
+    # режим полностью инертен (ноль влияния на остальные диалоги/тенанты):
+    #   • промпт собирается БЕЗ lead-catcher-блока (system_prompt.md не трогается);
+    #   • гейт каскада/умные дефолты/рекомендации в карточках — обычное поведение.
+    # Включаем только на AnyTour (64fea0d3-2605-4c4c-be67-62258ebfa7a9).
+    lead_catcher_assistant_ids: str = ""
+
     # --- Rate Limiting ---
     rate_limit_per_ip: int = 30
     rate_limit_per_session: int = 10

@@ -870,7 +870,8 @@ _DEPARTURE_PATTERNS = [
 ## LLM сам подставляет дефолты по стране при «любой/без разницы».
 
 
-def _check_cascade_slots(full_history: List[Dict], args: Dict, is_follow_up: bool = False) -> Tuple[bool, List[str]]:
+def _check_cascade_slots(full_history: List[Dict], args: Dict, is_follow_up: bool = False,
+                         lead_catcher: bool = False) -> Tuple[bool, List[str]]:
     """
     Проверяет, что клиент ЯВНО указал критичные слоты каскада:
       Слот 2 — город вылета
@@ -878,6 +879,11 @@ def _check_cascade_slots(full_history: List[Dict], args: Dict, is_follow_up: boo
       Слот 4 — состав путешественников
       Слот 5 — Quality Check (звёздность / питание) ИЛИ явный skip
     Возвращает (is_complete, missing_slots).
+
+    lead_catcher=True (пер-тенант режим «ловца лидов»): QC (звёздность/питание)
+    НЕ требуется — он заполняется умными дефолтами автоматически. Обязательными
+    остаются город вылета, даты и состав. На остальных тенантах (флаг False)
+    поведение не меняется.
     
     Синхронизировано с system_prompt.md § 0.0.2 / § 0.4
     
@@ -1143,7 +1149,10 @@ def _check_cascade_slots(full_history: List[Dict], args: Dict, is_follow_up: boo
     #   (Fix P3: бренд пропускает звёздность, но НЕ тип питания)
     quality_check_passed = (has_stars and has_meal) or has_skip or (has_brand and has_meal)
     
-    if not quality_check_passed:
+    # Lead-catcher: QC не обязателен — звёзды/питание подставляются умными
+    # дефолтами (см. apply_smart_defaults в search_tours). Не добавляем QC в
+    # missing, чтобы поиск не блокировался из-за отсутствия звёзд/питания.
+    if not quality_check_passed and not lead_catcher:
         # Проверяем: может быть модель уже задала вопрос о QC, 
         # а клиент ответил чем-то неожиданным — не блокируем повторно
         # Ищем в истории ассистента вопрос про звёздность/питание
@@ -2695,6 +2704,7 @@ class YandexGPTHandler:
             _cid = str(_c.get("id") or _c.get("tourid") or "")
             if _cid:
                 self._booking_cards_cache[_cid] = _c
+        self._apply_lead_catcher_recommendations()
         logger.info("🎴 Built %d tour cards from pool cache", len(self._pending_tour_cards))
 
         ai_hotels = []
@@ -3352,6 +3362,80 @@ class YandexGPTHandler:
             "_hint": _hint,
         }
 
+    def _is_lead_catcher(self) -> bool:
+        """Включён ли пер-тенант режим «ловца лидов» для текущего ассистента.
+
+        Гейт по allow-list `lead_catcher_assistant_ids`. Любая осечка → False
+        (режим инертен, базовое поведение). Наследуется в OpenAIHandler.
+        """
+        try:
+            import lead_catcher as _LC
+        except Exception:
+            try:
+                from backend import lead_catcher as _LC  # type: ignore
+            except Exception:
+                return False
+        try:
+            return _LC.is_lead_catcher(
+                str(getattr(self.runtime_config, "assistant_id", "") or "")
+            )
+        except Exception:
+            return False
+
+    def _apply_lead_catcher_recommendations(self) -> None:
+        """Добавить человеческую рекомендацию в каждую карточку (только lead-catcher).
+
+        Детерминированно, СТРОГО из фактов карточки + правил курортов. Инертно
+        для остальных тенантов (флаг выключен → метод сразу выходит).
+        """
+        if not self._is_lead_catcher():
+            return
+        try:
+            import lead_catcher as _LC
+        except Exception:
+            try:
+                from backend import lead_catcher as _LC  # type: ignore
+            except Exception:
+                return
+        for _c in (self._pending_tour_cards or []):
+            try:
+                _rec = _LC.build_recommendation(_c)
+            except Exception:
+                _rec = ""
+            if _rec:
+                _c["recommendation"] = _rec
+
+    def _lead_catcher_cards_hint(self, visible_count: int) -> str:
+        """Факт-выжимка по ПОКАЗАННЫМ карточкам + инструкция выделить 1-2 под запрос.
+
+        Только lead-catcher. Возвращает '' для остальных тенантов или если карточек
+        нет. Прокидывается в _result_hint у search_tours, чтобы ассистент мог
+        осознанно выделить лучшее под запрос (без выдумок и без дублирования карточек).
+        """
+        if not self._is_lead_catcher():
+            return ""
+        try:
+            _vc = int(visible_count or 0)
+        except (TypeError, ValueError):
+            _vc = 0
+        cards = (self._pending_tour_cards or [])[:_vc] if _vc > 0 else []
+        if not cards:
+            return ""
+        try:
+            import lead_catcher as _LC
+        except Exception:
+            try:
+                from backend import lead_catcher as _LC  # type: ignore
+            except Exception:
+                return ""
+        try:
+            digest = _LC.build_cards_digest(cards)
+        except Exception:
+            digest = ""
+        if not digest:
+            return ""
+        return f" {_LC.LEAD_CATCHER_CARDS_HINT}\nФАКТЫ ПО КАРТОЧКАМ (для тебя, не повторяй дословно):\n{digest}"
+
     def _load_system_prompt(self) -> str:
         """Load unified system prompt with per-tenant personalization.
 
@@ -3463,6 +3547,21 @@ class YandexGPTHandler:
         # тенантов; для остальных инструмент даже не загружен) ──
         if self._subscription_enabled():
             prompt = prompt + "\n\n" + _SUBSCRIPTION_PROMPT_BLOCK
+
+        # ── Lead-catcher: пер-тенант режим «ловца лидов» (только для allow-list) ──
+        # ПРЕПЕНД в самый верх итогового промпта → приоритет над §0.3/§3.5-§3.7
+        # базового промпта по части интейка и QC. system_prompt.md НЕ
+        # модифицируется: другие тенанты получают прежний промпт байт-в-байт.
+        if self._is_lead_catcher():
+            try:
+                import lead_catcher as _LC
+            except Exception:
+                from backend import lead_catcher as _LC  # type: ignore
+            prompt = _LC.LEAD_CATCHER_POLICY + "\n\n---\n\n" + prompt
+            logger.info(
+                "🎯 LEAD-CATCHER: prepended lead-catcher policy for assistant=%s",
+                getattr(self.runtime_config, "assistant_id", None),
+            )
 
         return prompt
     
@@ -4097,9 +4196,27 @@ class YandexGPTHandler:
                     )
                 }
 
+            # ── Lead-catcher: умные дефолты по стране (звёзды/питание) ──
+            # Заполняем ТОЛЬКО отсутствующие параметры (явный выбор клиента не
+            # трогаем). Делаем ДО проверки каскада, чтобы поиск шёл с разумными
+            # фильтрами, даже если мы не спрашивали QC. Инертно для остальных.
+            _lead_catcher = self._is_lead_catcher()
+            if _lead_catcher:
+                try:
+                    import lead_catcher as _LC
+                except Exception:
+                    from backend import lead_catcher as _LC  # type: ignore
+                _applied = _LC.apply_smart_defaults(args)
+                if _applied:
+                    logger.info("🎯 LEAD-CATCHER smart-defaults: %s", ", ".join(_applied))
+
             # ── Проверка полноты каскада (Fix 3B — блокирующая проверка) ──
             # Анализируем историю диалога, чтобы убедиться, что клиент ЯВНО указал критичные слоты
-            is_cascade_complete, missing_slots = _check_cascade_slots(self.full_history, args, is_follow_up=bool(self._last_search_params))
+            is_cascade_complete, missing_slots = _check_cascade_slots(
+                self.full_history, args,
+                is_follow_up=bool(self._last_search_params),
+                lead_catcher=_lead_catcher,
+            )
             
             if not is_cascade_complete:
                 self._metrics["cascade_incomplete_detections"] += 1
@@ -5467,6 +5584,7 @@ class YandexGPTHandler:
                 _cid = str(_c.get("id") or _c.get("tourid") or "")
                 if _cid:
                     self._booking_cards_cache[_cid] = _c
+            self._apply_lead_catcher_recommendations()
             logger.info("🎴 Built %d tour cards for frontend", len(self._pending_tour_cards))
             
             status = full_results.get("status", {})
@@ -5626,6 +5744,12 @@ class YandexGPTHandler:
                             f"{_req_stars}★+ были ограниченные варианты, добавлены отели с меньшей звёздностью.»"
                         )
                         logger.warning("⭐ STARS MISMATCH: requested=%d★+ but found %s", _req_stars, _actual_stars)
+
+            # ── Lead-catcher: факты по карточкам + «выдели 1-2 под запрос» ──
+            # Инертно для остальных тенантов (метод вернёт '').
+            _lc_hint = self._lead_catcher_cards_hint(_visible_count)
+            if _lc_hint:
+                _result_hint += _lc_hint
 
             return {
                 "hotels_found": status.get("hotelsfound", len(hotels)),
@@ -6355,6 +6479,7 @@ class YandexGPTHandler:
                 _cid = str(_c.get("id") or _c.get("tourid") or "")
                 if _cid:
                     self._booking_cards_cache[_cid] = _c
+            self._apply_lead_catcher_recommendations()
             logger.info("🎴 Built %d hot tour cards for frontend", len(self._pending_tour_cards))
 
             # ── Контекст для подписки из горящих (subscribe_tours) ──

@@ -251,6 +251,12 @@ def render_tour_card_caption(card: dict[str, Any]) -> str:
         lines.append(travel_line)
     if composition:
         lines.append(f"👥 {composition}")
+    # Lead-catcher: короткая человеческая рекомендация (факты из данных +
+    # правила курортов). Поле присутствует только для lead-catcher-тенантов;
+    # для остальных карточек ключа нет → строка не добавляется (инертно).
+    recommendation = _md_escape((card.get("recommendation") or "").strip())
+    if recommendation:
+        lines.append(f"💡 {recommendation}")
     if price_line:
         lines.append("")
         lines.append(price_line)
