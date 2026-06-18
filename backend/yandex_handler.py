@@ -870,6 +870,32 @@ _DEPARTURE_PATTERNS = [
 ## LLM сам подставляет дефолты по стране при «любой/без разницы».
 
 
+# Возраст ребёнка, ЯВНО названный клиентом в тексте. Два набора:
+#  • _BASE — ПРЕЖНИЕ паттерны (как в исходном коде); применяются для ВСЕХ
+#    тенантов, поведение не-lead-catcher не меняется.
+#  • _LC   — расширенные (фикс «ё», «годик/мес», и обобщённый «голый» возраст
+#    «5 лет»/«3 года»); применяются ТОЛЬКО в режиме lead-catcher, где возраст
+#    ОБЯЗАТЕЛЕН и мы полагаемся только на текст (ответ «5 лет» на наш вопрос).
+# Так фикс «не доверять подставленному childageN» включается строго для Павла,
+# а остальные ассистенты работают как раньше.
+_CHILDAGE_TEXT_PATTERNS_BASE = [
+    r'(?:ребен\w*|дет\w*|дочк\w*|сын\w*|малыш\w*)\s*(?:\d{1,2}\s*(?:лет|года?|мес))',
+    r'\d{1,2}\s*(?:лет|года?)\s*(?:ребен|дет|дочк|сын)',
+    r'(?:реб|ребёнок|ребенок)\s*\(\s*\d{1,2}',
+    r'реб?\s*\d{1,2}\s*лет',
+    r'\d+\s*(?:взр|в)\s*\+\s*(?:реб|р)?\s*\d{1,2}\s*(?:лет|г)',
+]
+_CHILDAGE_TEXT_PATTERNS_LC = _CHILDAGE_TEXT_PATTERNS_BASE + [
+    # «ребёнок 7 лет», «дочке 4 года», «малышу 8 мес» (учитываем «ё», годик/мес)
+    r'(?:реб[её]н\w*|дет\w*|дочк\w*|дочер\w*|сын\w*|малыш\w*)\s*(?:\d{1,2}\s*(?:лет|года?|годик\w*|мес))',
+    # «реб 7 лет», «р 5 лет» (+ «год»)
+    r'\bреб?\s*\d{1,2}\s*(?:лет|год)',
+    # обобщённо: проверка идёт ТОЛЬКО когда детей > 0, поэтому «5 лет»/«3 года»/
+    # «8 месяцев» в таком контексте трактуем как возраст ребёнка
+    r'\b\d{1,2}\s*(?:лет|года|годик\w*|месяц\w*|мес\b)',
+]
+
+
 def _check_cascade_slots(full_history: List[Dict], args: Dict, is_follow_up: bool = False,
                          lead_catcher: bool = False) -> Tuple[bool, List[str]]:
     """
@@ -911,7 +937,26 @@ def _check_cascade_slots(full_history: List[Dict], args: Dict, is_follow_up: boo
              or (_ml and isinstance(_ml, int) and _ml > 0))
     )
 
-    if _args_have_all_slots and is_follow_up:
+    # Lead-catcher (#1): возраст ребёнка нельзя «протащить» подставленным childageN.
+    # Если есть дети, но возраст НЕ назван клиентом в тексте — не доверяем ранним
+    # trust-проходам ниже (иначе search_tours уйдёт с выдуманным возрастом, и P9
+    # никогда не сработает). На остальных тенантах флаг всегда False (инертно).
+    _lc_child_age_block = False
+    if lead_catcher:
+        try:
+            _cc_early = int(args.get("child", 0))
+        except (ValueError, TypeError):
+            _cc_early = 0
+        if _cc_early > 0:
+            _early_user_text = " ".join(
+                m.get("content", "") for m in full_history
+                if m.get("role") == "user" and m.get("content")
+                and not m.get("content", "").startswith("Результаты")
+            ).lower()
+            if not any(re.search(p, _early_user_text) for p in _CHILDAGE_TEXT_PATTERNS_LC):
+                _lc_child_age_block = True
+
+    if _args_have_all_slots and is_follow_up and not _lc_child_age_block:
         return (True, [])
 
     # Trust model args when cascade has had enough dialogue turns (>=10 user+assistant msgs).
@@ -923,7 +968,7 @@ def _check_cascade_slots(full_history: List[Dict], args: Dict, is_follow_up: boo
                          and not m.get("content", "").startswith("Пожалуйста, продолжи")
                          and not m.get("content", "").startswith("Продолжи обработку")
                          and not m.get("content", "").startswith("Ответь клиенту"))
-    if _args_have_all_slots and _user_msg_count >= 5:
+    if _args_have_all_slots and _user_msg_count >= 5 and not _lc_child_age_block:
         logger.info("✅ CASCADE-TRUST: args have all slots + %d user messages — trusting model", _user_msg_count)
         return (True, [])
     
@@ -1039,19 +1084,19 @@ def _check_cascade_slots(full_history: List[Dict], args: Dict, is_follow_up: boo
     except (ValueError, TypeError):
         child_count = 0
     if child_count > 0:
-        has_childage = any(args.get(f"childage{i}") for i in [1, 2, 3])
-        if not has_childage:
-            # Проверяем, не указан ли возраст в тексте пользователя (например "ребёнок 7 лет")
-            childage_text_patterns = [
-                r'(?:ребен\w*|дет\w*|дочк\w*|сын\w*|малыш\w*)\s*(?:\d{1,2}\s*(?:лет|года?|мес))',
-                r'\d{1,2}\s*(?:лет|года?)\s*(?:ребен|дет|дочк|сын)',
-                r'(?:реб|ребёнок|ребенок)\s*\(\s*\d{1,2}',
-                r'реб?\s*\d{1,2}\s*лет',
-                r'\d+\s*(?:взр|в)\s*\+\s*(?:реб|р)?\s*\d{1,2}\s*(?:лет|г)',
-            ]
-            has_age_in_text = any(re.search(p, user_text) for p in childage_text_patterns)
-            if not has_age_in_text:
-                missing.append("возраст ребёнка")
+        has_age_in_args = any(args.get(f"childage{i}") for i in [1, 2, 3])
+        # Lead-catcher (#1): НЕ доверяем подставленному возрасту — модель не должна
+        # «придумывать» childageN; нужен ЯВНЫЙ возраст в тексте клиента (расширенные
+        # паттерны). На остальных тенантах поведение ПРЕЖНЕЕ: args ИЛИ текст по
+        # базовым паттернам.
+        if lead_catcher:
+            age_known = any(re.search(p, user_text) for p in _CHILDAGE_TEXT_PATTERNS_LC)
+        else:
+            age_known = has_age_in_args or any(
+                re.search(p, user_text) for p in _CHILDAGE_TEXT_PATTERNS_BASE
+            )
+        if not age_known:
+            missing.append("возраст ребёнка")
     
     # ─── Слот 5: Quality Check (звёздность + питание) ───
     # Проверяем: клиент ЯВНО указал stars/meal ИЛИ явно "скипнул" (любой/не важно/и т.д.)
@@ -2756,7 +2801,9 @@ class YandexGPTHandler:
             "Карточки с фото, ценами, датами, питанием, звёздами УЖЕ отображены фронтендом. "
             "НЕ перечисляй отели, цены, описания, даты, питание, звёзды в тексте! "
             "Напиши ТОЛЬКО краткий комментарий (1-2 предложения) и спроси клиента. "
-            "Добавь: «Окончательная стоимость — при оформлении тура.»"
+            + self._cards_price_disclaimer(
+                "Добавь: «Окончательная стоимость — при оформлении тура.»"
+            )
         )
         if _visible_count:
             _result_hint += (
@@ -3397,13 +3444,19 @@ class YandexGPTHandler:
                 from backend import lead_catcher as _LC  # type: ignore
             except Exception:
                 return
-        for _c in (self._pending_tour_cards or []):
-            try:
-                _rec = _LC.build_recommendation(_c)
-            except Exception:
-                _rec = ""
-            if _rec:
-                _c["recommendation"] = _rec
+        # Дедуп курортной ремарки: описание курорта показываем один раз —
+        # у первой карточки этого курорта (см. assign_recommendations).
+        try:
+            _LC.assign_recommendations(self._pending_tour_cards or [])
+        except Exception:
+            # фолбэк на пер-карточную сборку, если что-то пошло не так
+            for _c in (self._pending_tour_cards or []):
+                try:
+                    _rec = _LC.build_recommendation(_c)
+                except Exception:
+                    _rec = ""
+                if _rec:
+                    _c["recommendation"] = _rec
 
     def _lead_catcher_cards_hint(self, visible_count: int) -> str:
         """Факт-выжимка по ПОКАЗАННЫМ карточкам + инструкция выделить 1-2 под запрос.
@@ -3435,6 +3488,47 @@ class YandexGPTHandler:
         if not digest:
             return ""
         return f" {_LC.LEAD_CATCHER_CARDS_HINT}\nФАКТЫ ПО КАРТОЧКАМ (для тебя, не повторяй дословно):\n{digest}"
+
+    def _disclaimer_already_shown(self) -> bool:
+        """Был ли дисклеймер про окончательную стоимость уже произнесён в диалоге.
+
+        Детерминируем #4: сканируем ПРЕДЫДУЩИЕ ответы ассистента в истории.
+        Фразировка модели стабильна («окончательн… стоимость… при оформлении»),
+        т.к. её задаёт хинт. Любая осечка → False (покажем дисклеймер — безопасно).
+        """
+        try:
+            for m in (self.full_history or []):
+                if m.get("role") != "assistant":
+                    continue
+                t = (m.get("content") or "").lower()
+                if "окончательн" in t and ("оформлен" in t or "стоимост" in t):
+                    return True
+        except Exception:
+            return False
+        return False
+
+    def _cards_price_disclaimer(self, default_text: str) -> str:
+        """Фрагмент хинта про окончательную стоимость для подписи к карточкам.
+
+        Для lead-catcher (#4): дисклеймер ровно ОДИН раз за диалог. Решаем
+        ДЕТЕРМИНИРОВАННО по истории (а не «на усмотрение» модели): если фраза уже
+        звучала — явно велим НЕ повторять; иначе просим добавить один раз. Для
+        остальных тенантов возвращаем default_text без изменений (байт-в-байт).
+        """
+        if self._is_lead_catcher():
+            if self._disclaimer_already_shown():
+                return (
+                    "Дисклеймер про подтверждение окончательной стоимости при "
+                    "оформлении ты УЖЕ показывал в этом диалоге — НЕ повторяй его "
+                    "в этом ответе. Если клиент спрашивает точную стоимость — "
+                    "actualize_tour."
+                )
+            return (
+                "Добавь ОДНУ короткую фразу про подтверждение окончательной "
+                "стоимости менеджером при оформлении (это ПЕРВЫЙ раз за диалог). "
+                "Если клиент спрашивает точную стоимость — actualize_tour."
+            )
+        return default_text
 
     def _load_system_prompt(self) -> str:
         """Load unified system prompt with per-tenant personalization.
@@ -4248,6 +4342,7 @@ class YandexGPTHandler:
                     "даты/месяц вылета": "'В каком месяце планируете вылет?'",
                     "промежуток в месяце (начало/середина/конец)": "'В каком промежутке месяца планируете вылет — в начале, середине или конце?'",
                     "состав путешественников": "'Сколько взрослых едет и будут ли с вами дети?'",
+                    "возраст ребёнка": "'Подскажите, пожалуйста, возраст ребёнка (каждого из детей)? Это влияет на цену и подбор номера.'",
                     "категорию отеля и тип питания": "'Какую категорию отеля и тип питания предпочитаете?'",
                     "категорию отеля (звёздность)": "'Какой категории отель вы рассматриваете?'",
                     "тип питания": "'Какой тип питания предпочитаете?'",
@@ -5669,7 +5764,16 @@ class YandexGPTHandler:
             # выдача из ТОГО ЖЕ пула — в _serve_next_pool_batch. ──
             self._results_pool_offset = min(_visible_count, len(self._results_pool))
 
-            _result_hint = "Карточки с фото, ценами, датами, питанием, звёздами УЖЕ отображены фронтендом. НЕ перечисляй отели, цены, описания, даты, питание, звёзды в тексте! Напиши ТОЛЬКО краткий комментарий (1-2 предложения) и спроси клиента. Добавь: «Окончательная стоимость — при оформлении тура.» При оформлении возможны незначительные доплаты (мед. страховка и др.) — если клиент спрашивает о точной стоимости, используй actualize_tour."
+            _result_hint = (
+                "Карточки с фото, ценами, датами, питанием, звёздами УЖЕ отображены фронтендом. "
+                "НЕ перечисляй отели, цены, описания, даты, питание, звёзды в тексте! "
+                "Напиши ТОЛЬКО краткий комментарий (1-2 предложения) и спроси клиента. "
+                + self._cards_price_disclaimer(
+                    "Добавь: «Окончательная стоимость — при оформлении тура.» "
+                    "При оформлении возможны незначительные доплаты (мед. страховка и др.) — "
+                    "если клиент спрашивает о точной стоимости, используй actualize_tour."
+                )
+            )
             if _visible_count:
                 _result_hint += (
                     f" Клиент видит {_visible_count} карточек в чате (нумерация 1–{_visible_count}). "

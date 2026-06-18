@@ -206,6 +206,93 @@ def test_cards_hint_constant_present():
     assert "выдели" in lc.LEAD_CATCHER_CARDS_HINT.lower()
 
 
+# ─────────────── #2 Дедуп 💡 у карточек одного курорта ────────────────
+
+def test_assign_recommendations_dedup_same_resort():
+    """Описание курорта — один раз; у второй карточки того же курорта только
+    факты + название (без повтора описания)."""
+    lc = _load_lead_catcher(allow=AID)
+    note = lc.resort_note("Белек")
+    desc = note.split(":", 1)[1].strip()
+    cards = [
+        {"hotel_stars": 5, "meal_description": "AI - Всё включено", "resort": "Белек"},
+        {"hotel_stars": 4, "meal_description": "AI - Всё включено", "resort": "Белек"},
+    ]
+    lc.assign_recommendations(cards)
+    r0, r1 = cards[0]["recommendation"], cards[1]["recommendation"]
+    assert desc in r0, r0
+    assert desc not in r1, r1            # описание не повторяется
+    assert "4★" in r1 and "Белек" in r1   # факты + название остаются
+    assert r0 != r1
+
+
+def test_assign_recommendations_keeps_distinct_resorts():
+    lc = _load_lead_catcher(allow=AID)
+    cards = [
+        {"hotel_stars": 5, "meal_description": "AI - Всё включено", "resort": "Белек"},
+        {"hotel_stars": 4, "meal_description": "AI - Всё включено", "resort": "Хургада"},
+    ]
+    lc.assign_recommendations(cards)
+    assert lc.resort_note("Белек").split(":", 1)[1].strip() in cards[0]["recommendation"]
+    assert lc.resort_note("Хургада").split(":", 1)[1].strip() in cards[1]["recommendation"]
+
+
+def test_build_cards_digest_dedup_same_resort():
+    lc = _load_lead_catcher(allow=AID)
+    desc = lc.resort_note("Белек").split(":", 1)[1].strip()
+    cards = [
+        {"hotel_stars": 5, "meal_description": "AI - Всё включено", "resort": "Белек", "price": 250000},
+        {"hotel_stars": 4, "meal_description": "AI - Всё включено", "resort": "Белек", "price": 150000},
+    ]
+    digest = lc.build_cards_digest(cards)
+    assert digest.count(desc) == 1, digest    # описание курорта один раз
+    lines = digest.splitlines()
+    assert "Белек" in lines[0] and "Белек" in lines[1]   # курорт в каждой строке
+
+
+# ─────────────── #3 Текст↔карточки: только курорты из карточек ────────
+
+def test_cards_hint_only_resorts_from_cards():
+    lc = _load_lead_catcher(allow=AID)
+    h = lc.LEAD_CATCHER_CARDS_HINT.lower()
+    assert "только курорты" in h
+    assert "которого нет в карточках" in h
+
+
+def test_policy_text_must_match_cards():
+    lc = _load_lead_catcher(allow=AID)
+    p = lc.LEAD_CATCHER_POLICY.lower()
+    assert "совпадать с карточками" in p
+    assert "смени регион" in p
+
+
+# ─────────────── #1 Возраст ребёнка в политике ────────────────────────
+
+def test_policy_childage_required_and_not_invented():
+    lc = _load_lead_catcher(allow=AID)
+    p = lc.LEAD_CATCHER_POLICY.lower()
+    assert "возраст" in p
+    assert "обязател" in p
+    assert "нельзя придумывать" in p or "не придумыва" in p
+
+
+# ─────────────── #4 Дисклеймер один раз за диалог ─────────────────────
+
+def test_policy_disclaimer_once():
+    lc = _load_lead_catcher(allow=AID)
+    assert "один раз за весь диалог" in lc.LEAD_CATCHER_POLICY.lower()
+
+
+# ─────────────── #5 Район=субрегион + не терять слоты ─────────────────
+
+def test_policy_subregion_and_no_reask():
+    lc = _load_lead_catcher(allow=AID)
+    p = lc.LEAD_CATCHER_POLICY.lower()
+    assert "субрегион" in p
+    assert "не переспрашивай" in p
+    assert "get_dictionaries" in p
+
+
 # ─────────────────── Гейт каскада (_check_cascade_slots) ──────────────
 # Импорт yandex_handler ленивый: если на хосте нет тяжёлых зависимостей —
 # тест помечается как пропущенный, остальные проходят.
@@ -246,6 +333,68 @@ def test_cascade_lead_catcher_still_requires_departure():
     ok, missing = yh._check_cascade_slots(history, {"country": 4}, lead_catcher=True)
     assert ok is False
     assert any("город вылета" in m for m in missing)
+
+
+# ─────────────── #1 Возраст ребёнка в каскаде (lead-catcher) ──────────
+
+def test_cascade_lc_requires_child_age_in_text():
+    """Lead-catcher: подставленный моделью childageN НЕ засчитывается — нужен
+    возраст в ТЕКСТЕ клиента."""
+    yh = _import_yh()
+    if not hasattr(yh, "_check_cascade_slots"):
+        print("  SKIP cascade test: yandex_handler import failed:", yh)
+        return
+    history = [{"role": "user",
+                "content": "Турция из Москвы, 2 взрослых и ребёнок, 15 августа на 10 ночей"}]
+    args = {"country": 4, "child": 1, "childage1": 7}   # модель «придумала» возраст
+    ok, missing = yh._check_cascade_slots(history, dict(args), lead_catcher=True)
+    assert ok is False
+    assert any("возраст ребёнка" in m for m in missing), missing
+
+
+def test_cascade_non_lc_trusts_childage_args():
+    """Вне lead-catcher поведение прежнее: childageN из аргументов засчитывается."""
+    yh = _import_yh()
+    if not hasattr(yh, "_check_cascade_slots"):
+        print("  SKIP cascade test: yandex_handler import failed:", yh)
+        return
+    history = [{"role": "user",
+                "content": "Турция из Москвы, 2 взрослых и ребёнок, 15 августа на 10 ночей"}]
+    args = {"country": 4, "child": 1, "childage1": 7}
+    _, missing = yh._check_cascade_slots(history, dict(args), lead_catcher=False)
+    assert not any("возраст ребёнка" in m for m in missing), missing
+
+
+def test_cascade_lc_accepts_child_age_in_text():
+    yh = _import_yh()
+    if not hasattr(yh, "_check_cascade_slots"):
+        print("  SKIP cascade test: yandex_handler import failed:", yh)
+        return
+    history = [{"role": "user",
+                "content": "Турция из Москвы, 2 взрослых и ребёнок 5 лет, 15 августа на 10 ночей"}]
+    args = {"country": 4, "child": 1}
+    _, missing = yh._check_cascade_slots(history, dict(args), lead_catcher=True)
+    assert not any("возраст ребёнка" in m for m in missing), missing
+
+
+def test_cascade_lc_early_pass_blocked_without_age():
+    """Даже когда args содержат все слоты и это follow-up, lead-catcher НЕ
+    доверяет раннему trust-проходу, если возраст ребёнка не назван в тексте."""
+    yh = _import_yh()
+    if not hasattr(yh, "_check_cascade_slots"):
+        print("  SKIP cascade test: yandex_handler import failed:", yh)
+        return
+    history = [{"role": "user",
+                "content": "Турция из Москвы, 2 взрослых и ребёнок, 15 августа на 10 ночей"}]
+    args = {"departure": 1, "datefrom": "15.08.2026", "nightsfrom": 10,
+            "adults": 2, "stars": 4, "child": 1, "childage1": 7}
+    # вне lead-catcher ранний trust-pass пропускает (follow-up + полные args)
+    ok_off, _ = yh._check_cascade_slots(history, dict(args), is_follow_up=True, lead_catcher=False)
+    assert ok_off is True
+    # в lead-catcher ранний pass отключён — требуем возраст в тексте
+    ok_on, missing_on = yh._check_cascade_slots(history, dict(args), is_follow_up=True, lead_catcher=True)
+    assert ok_on is False
+    assert any("возраст ребёнка" in m for m in missing_on), missing_on
 
 
 # ─────────────────────────── Standalone runner ───────────────────────
