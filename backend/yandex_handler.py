@@ -2138,6 +2138,25 @@ _LEAD_SUMMARY_SMART_CARDS_ALLOWED_ASSISTANT_IDS = {
 }
 
 
+# ──────────────────────────────────────────────────────────────────────────────
+# LEAD FILTER — не доводить заявки до менеджеров по заблокированным направлениям
+# (РФ/Абхазия) и/или дешевле порога суммы тура. Запрос Павла (Anytour) 2026-06-20:
+# «менеджеров с РФ/Абхазией не трогать», «туры менее 150к не интересны».
+#
+# ⚠️ ВКЛЮЧАЕТСЯ ТОЛЬКО наличием ключа widget_config.lead_filter у тенанта — для
+# всех остальных ассистентов поведение НЕ меняется (фича инертна). Подавляются
+# ВСЕ менеджерские каналы (Telegram/CRM/email); сам диалог остаётся в БД/ЛК, и
+# ассистент продолжает вести клиента (без ложного обещания звонка менеджера).
+#
+# Двойной откат: (1) LEAD_FILTER_ENABLED=false — мастер-выключатель (без
+# передеплоя), ИЛИ (2) убрать ключ lead_filter из widget_config тенанта.
+_LEAD_FILTER_ENABLED = os.getenv(
+    "LEAD_FILTER_ENABLED", "true"
+).strip().lower() in ("1", "true", "yes", "on")
+# Чистая логика решения живёт в lead_catcher.lead_suppression_decision()
+# (без Flask/DB — юнит-тестируется изолированно).
+
+
 # ── Manager-handoff communication policy (подставляется в {{MANAGER_HANDOFF_POLICY}}) ──
 # CURT — историческое поведение (handoff ВЫКЛ): один ответ-телефон, без обещаний
 # связаться с менеджером (ассистент этого не умел). GRACEFUL — для ассистентов с
@@ -6762,6 +6781,24 @@ class YandexGPTHandler:
             else:
                 logger.warning("📧 BOOKING: no card found for tourid=%s tour_pos=%s cache_size=%d", tourid, tour_pos, len(self._booking_cards_cache))
 
+            # ── LEAD FILTER (Pavel/Anytour): РФ/Абхазия и/или дешёвые туры не
+            # доводим до менеджеров — пропускаем email/Telegram уведомление. ──
+            _suppress = self._lead_suppression_reason(booking_card=card)
+            if _suppress:
+                logger.info(
+                    "🚫 BOOKING-FILTER: suppressed manager delivery reason=%s tourid=%s price=%s country=%s",
+                    _suppress, tourid, card.get("price"), card.get("country"),
+                )
+                return {
+                    "status": "success",
+                    "request_number": 0,
+                    "message": (
+                        "Заявка зафиксирована. Поблагодари клиента за обращение, "
+                        "предложи продолжить подбор или ответить на вопросы. "
+                        "НЕ обещай звонок менеджера."
+                    ),
+                }
+
             from database import get_db, is_db_available
             request_number = 1
             if is_db_available():
@@ -7142,6 +7179,60 @@ class YandexGPTHandler:
                         "подходящий или подешевеет вариант. Не дублируй критерии списком."),
         }
 
+    def _best_known_tour_price(self, booking_card: Optional[Dict] = None) -> Optional[int]:
+        """Лучшая известная цена тура, с которым работал клиент (для lead-filter).
+
+        Приоритет: явная карточка брони → актуализированный тур →
+        минимальная цена среди показанных карточек. None, если цены нет.
+        """
+        if booking_card:
+            p = _safe_int(booking_card.get("price"), None)
+            if p:
+                return p
+        cache = getattr(self, "_booking_cards_cache", None) or {}
+        act = getattr(self, "_tour_actualized_id", None)
+        if act and str(act) in cache:
+            p = _safe_int(cache[str(act)].get("price"), None)
+            if p:
+                return p
+        prices = [_safe_int(c.get("price"), None) for c in cache.values()]
+        prices = [p for p in prices if p]
+        return min(prices) if prices else None
+
+    def _dialogue_country_code(self) -> Optional[int]:
+        """Код страны направления диалога для lead-filter.
+
+        Приоритет совпадает с логикой подписки (см. subscribe-хендлер):
+        обычный поиск (`_last_search_params`) → фолбэк на «горящие»
+        (`_hot_subscribe_ctx`). None, если поиска не было.
+        """
+        c = _safe_int((self._last_search_params or {}).get("_country"), None)
+        if c:
+            return c
+        hot = getattr(self, "_hot_subscribe_ctx", None) or {}
+        return _safe_int(hot.get("_country"), None)
+
+    def _lead_suppression_reason(self, booking_card: Optional[Dict] = None) -> Optional[str]:
+        """Pavel-scoped: причина НЕ доводить лид до менеджеров, либо None.
+
+        Инертно (None), пока у тенанта нет widget_config.lead_filter и пока
+        не выключен мастер-флаг LEAD_FILTER_ENABLED.
+        """
+        if not _LEAD_FILTER_ENABLED:
+            return None
+        wc = getattr(self.runtime_config, "widget_config", None) or {}
+        lf = wc.get("lead_filter") if isinstance(wc, dict) else None
+        if not (isinstance(lf, dict) and lf):
+            return None
+        try:
+            import lead_catcher as _LC
+        except ImportError:  # pragma: no cover
+            from backend import lead_catcher as _LC  # type: ignore
+        country = self._dialogue_country_code()
+        price = self._best_known_tour_price(booking_card)
+        name = (booking_card or {}).get("country") or ""
+        return _LC.lead_suppression_decision(lf, country, price, name)
+
     async def _handle_submit_client_request(self, args: Dict) -> Dict:
         """Validate, dedup, and route to lead or request creation in U-ON CRM."""
         client_name = (args.get("client_name") or "").strip()
@@ -7187,6 +7278,31 @@ class YandexGPTHandler:
                     "message": "Контакт уже передан менеджеру. Скажи клиенту, что менеджер свяжется в ближайшее время.",
                 }
             logger.info("CRM: correction detected — prev phone=%s, new phone=%s", prev_phone, client_phone)
+
+        # ── LEAD FILTER (Pavel/Anytour): РФ/Абхазия и/или дешёвые туры не
+        # доводим до менеджеров — пропускаем CRM/Telegram/email. Диалог
+        # остаётся в БД/ЛК; ассистент мягко завершает без обещания звонка.
+        _suppress = self._lead_suppression_reason()
+        if _suppress:
+            crm_type = "request" if self._tour_actualized_id else "lead"
+            logger.info(
+                "🚫 LEAD-FILTER: suppressed manager delivery reason=%s phone=***%s country=%s",
+                _suppress, digits[-4:], (self._last_search_params or {}).get("_country"),
+            )
+            self._crm_submitted = {
+                "phone": client_phone,
+                "email": client_email,
+                "type": crm_type,
+            }
+            return {
+                "status": "success",
+                "type": crm_type,
+                "message": (
+                    "Заявка зафиксирована. Поблагодари клиента за обращение, "
+                    "предложи продолжить подбор или ответить на вопросы. "
+                    "НЕ обещай звонок менеджера."
+                ),
+            }
 
         has_actualized = bool(self._tour_actualized_id)
 

@@ -30,6 +30,57 @@ def _split_csv(raw: str) -> List[str]:
     return [item.strip() for item in (raw or "").split(",") if item.strip()]
 
 
+# ──────────────────────────────────────────────────────────────────────────────
+# LEAD FILTER — чистая логика: доводить ли заявку до менеджеров.
+# Запрос Павла (Anytour) 2026-06-20: не отправлять менеджерам заявки по РФ/Абхазии
+# и/или дешевле порога суммы тура. Здесь — только решение (без БД/сети); вызов и
+# гейт (widget_config.lead_filter, LEAD_FILTER_ENABLED) — в yandex_handler.
+# ──────────────────────────────────────────────────────────────────────────────
+
+# Названия стран → код TourVisor (бэкап-детекция: в карточке брони страна
+# приходит строкой, а не кодом). РФ=47, Абхазия=46.
+_LEAD_FILTER_NAME2CODE = {
+    "россия": 47, "russia": 47, "рф": 47,
+    "абхазия": 46, "abkhazia": 46,
+}
+
+
+def lead_suppression_decision(
+    lead_filter: Optional[Dict],
+    country_code: Optional[int],
+    tour_price: Optional[int],
+    dest_country_name: str = "",
+) -> Optional[str]:
+    """Причина НЕ доводить заявку до менеджеров, либо None.
+
+      • 'blocked_country' — направление диалога в block_countries (РФ/Абхазия);
+      • 'below_min_price' — известная цена тура ниже min_tour_price.
+
+    Любой пустой/некорректный конфиг → None (фича выключена для тенанта).
+    Цена неизвестна (None) → по порогу НЕ подавляем (не теряем потенциальный лид).
+    """
+    if not isinstance(lead_filter, dict) or not lead_filter:
+        return None
+    try:
+        block_set = {int(x) for x in (lead_filter.get("block_countries") or [])}
+    except (TypeError, ValueError):
+        block_set = set()
+    if block_set:
+        if country_code in block_set:
+            return "blocked_country"
+        code = _LEAD_FILTER_NAME2CODE.get((dest_country_name or "").strip().lower())
+        if code in block_set:
+            return "blocked_country"
+    raw_floor = lead_filter.get("min_tour_price")
+    try:
+        floor = int(raw_floor) if raw_floor else None
+    except (TypeError, ValueError):
+        floor = None
+    if floor and tour_price is not None and tour_price < floor:
+        return "below_min_price"
+    return None
+
+
 def is_lead_catcher(assistant_id: Optional[str]) -> bool:
     """Активен ли режим «ловца лидов» для данного assistant_id.
 
