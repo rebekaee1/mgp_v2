@@ -2252,6 +2252,16 @@ class YandexGPTHandler:
         # Заполняется в _dispatch_function при get_search_results / get_hot_tours
         # Считывается и очищается в /api/v1/chat после завершения chat()
         self._pending_tour_cards: List[Dict] = []
+        # Lead-catcher (П.2): ценовой ориентир под ПЕРВОЙ выдачей. Вычисляется
+        # детерминированно из пула в get_search_results (page=1), добавляется к
+        # тексту ответа в OpenAIHandler.chat(). Инертно для не-lead-catcher.
+        self._pending_price_anchor: str = ""
+        self._anchor_shown_countries: set = set()   # дедуп: один якорь на страну
+        # Lead-catcher (П.3/П.4): счётчики для кнопок 2-й выдачи и эскалации.
+        self._cards_batch_count: int = 0            # сколько порций карточек показано
+        self._continue_count: int = 0               # сколько раз «показать ещё»
+        self._searched_countries: set = set()       # сколько разных направлений
+        self._escalation_offered: bool = False      # мягкий оффер менеджера — один раз
         self._booking_cards_cache: Dict[str, Dict] = {}  # tourid → full card (survives across turns)
         self._last_departure_city: str = "Москва"
         self._last_departure_id: int = 1
@@ -2769,6 +2779,8 @@ class YandexGPTHandler:
             if _cid:
                 self._booking_cards_cache[_cid] = _c
         self._apply_lead_catcher_recommendations()
+        # Lead-catcher (П.3): «показать ещё» — это тоже порция карточек.
+        self._cards_batch_count += 1
         logger.info("🎴 Built %d tour cards from pool cache", len(self._pending_tour_cards))
 
         ai_hotels = []
@@ -3507,6 +3519,139 @@ class YandexGPTHandler:
         if not digest:
             return ""
         return f" {_LC.LEAD_CATCHER_CARDS_HINT}\nФАКТЫ ПО КАРТОЧКАМ (для тебя, не повторяй дословно):\n{digest}"
+
+    def _build_price_anchor(self) -> str:
+        """Ценовой ориентир под ПЕРВОЙ выдачей (только lead-catcher, П.2).
+
+        Детерминированно из пула результатов — ТОЧНЫЕ числа, без выдумок модели.
+        Подача зависит от архетипа направления:
+          • пляж (AI/BB/экзотика) — лестница по звёздности «4★ от X · 5★ от Y»
+            (3★ НЕ показываем по умолчанию — тянем средний чек; только если в
+            пуле нет 4★/5★);
+          • экскурсионные — ось формата (программа/уровень), общий «от X»;
+          • СНГ/прочее — общий «от X».
+        Цены округляются ВНИЗ до 1000. Возвращает '' для не-lead-catcher,
+        пустого пула или отсутствия цен. Любая осечка → '' (инертно).
+        """
+        if not self._is_lead_catcher():
+            return ""
+        pool = getattr(self, "_results_pool", None) or []
+        if not pool:
+            return ""
+        try:
+            import lead_catcher as _LC
+        except Exception:
+            try:
+                from backend import lead_catcher as _LC  # type: ignore
+            except Exception:
+                return ""
+        by_star: Dict[int, int] = {}
+        overall_min: Optional[int] = None
+        for it in pool:
+            try:
+                price = int(it[1] or 0)
+                stars = int((it[2] or {}).get("hotelstars") or 0)
+            except (TypeError, ValueError, IndexError, AttributeError):
+                continue
+            if price <= 0:
+                continue
+            if overall_min is None or price < overall_min:
+                overall_min = price
+            if stars > 0 and (stars not in by_star or price < by_star[stars]):
+                by_star[stars] = price
+        if overall_min is None:
+            return ""
+
+        def _fmt(p: int) -> str:
+            v = (int(p) // 1000) * 1000
+            return f"{v:,}".replace(",", "\u00a0") + "\u00a0₽"
+
+        country = (self._last_search_params or {}).get("_country")
+        arch = _LC.destination_archetype(country)
+
+        if arch in ("beach_ai", "beach_bb", "exotic"):
+            tiers = [s for s in (4, 5) if s in by_star] or sorted(by_star.keys())[:2]
+            if tiers:
+                parts = [
+                    (f"{s}★ (премиум)" if s == 5 else f"{s}★") + f" от {_fmt(by_star[s])}"
+                    for s in tiers
+                ]
+                prefix = "Ориентир по вашим датам"
+                if arch == "beach_ai":
+                    prefix += " (всё включено)"
+                return f"{prefix}: " + " · ".join(parts) + "."
+        if arch == "excursion":
+            return (
+                f"Ориентир по программе — от {_fmt(overall_min)}. "
+                "Можно комфортнее (отели выше уровнем) или индивидуальный "
+                "формат — что ближе?"
+            )
+        return f"Ориентир по вашим датам: от {_fmt(overall_min)}."
+
+    def _lead_catcher_should_escalate(self) -> bool:
+        """Пора ли мягко предложить менеджера (П.4) — чистое условие, без сайд-эффектов.
+
+        True, когда lead-catcher, ещё НЕ предлагали, в этом ходу есть карточки,
+        лид ещё не зафиксирован, и клиент либо 3+ раза «показать ещё», либо
+        смотрел 3+ направления. Инертно для остальных тенантов.
+        """
+        if not self._is_lead_catcher():
+            return False
+        if getattr(self, "_escalation_offered", False):
+            return False
+        if not self._pending_tour_cards:
+            return False
+        if getattr(self, "_crm_submitted", False):
+            return False
+        return (
+            getattr(self, "_continue_count", 0) >= 3
+            or len(getattr(self, "_searched_countries", set())) >= 3
+        )
+
+    def lead_catcher_quick_replies(self) -> List[Dict]:
+        """Кнопки проактивного шага со 2-й порции карточек (только lead-catcher, MAX).
+
+        Возвращает список {text,payload} для MAX-клавиатуры, либо [].
+        Условия: lead-catcher + канал MAX + в этом ходу показаны карточки +
+        это уже ВТОРАЯ (или дальше) порция карточек в диалоге. payload'ы
+        совпадают с распознаваемыми фразами: «покажи ещё» → continue_search,
+        «позовите менеджера» → хендофф; «сузить под бюджет» → правило в
+        LEAD_CATCHER_POLICY. Инертно для остальных тенантов/каналов.
+        """
+        if not self._is_lead_catcher():
+            return []
+        if (getattr(self, "_channel", "widget") or "widget") != "max":
+            return []
+        if not self._pending_tour_cards:
+            return []
+        if getattr(self, "_cards_batch_count", 0) < 2:
+            return []
+        return [
+            {"text": "📋 Ещё варианты", "payload": "покажи ещё"},
+            {"text": "💰 Сузить под бюджет", "payload": "сузить под бюджет"},
+            {"text": "👤 Передать менеджеру", "payload": "позовите менеджера"},
+        ]
+
+    def _maybe_set_price_anchor(self, page: int) -> None:
+        """Вычислить и запомнить ценовой якорь для ПЕРВОЙ выдачи (page==1).
+
+        Дедуп: один якорь на страну за диалог (повторный поиск той же страны,
+        напр. при сужении бюджета, якорь не дублирует). Инертно вне lead-catcher.
+        """
+        if not self._is_lead_catcher():
+            return
+        try:
+            if int(page or 1) != 1:
+                return
+        except (TypeError, ValueError):
+            return
+        country = (self._last_search_params or {}).get("_country")
+        if country in self._anchor_shown_countries:
+            return
+        anchor = self._build_price_anchor()
+        if anchor:
+            self._pending_price_anchor = anchor
+            self._anchor_shown_countries.add(country)
 
     def _disclaimer_already_shown(self) -> bool:
         """Был ли дисклеймер про окончательную стоимость уже произнесён в диалоге.
@@ -4788,6 +4933,13 @@ class YandexGPTHandler:
             # Запоминаем страну, регион и hideregular для детекции смены направления / подсказок
             self._last_search_params["_country"] = args.get("country")
             self._last_search_params["_regions"] = args.get("regions")
+            # Lead-catcher (П.4): учёт разных направлений в диалоге (для эскалации).
+            try:
+                _c_esc = int(args.get("country") or 0)
+                if _c_esc > 0:
+                    self._searched_countries.add(_c_esc)
+            except (TypeError, ValueError):
+                pass
             if args.get("hideregular") is not None:
                 self._last_search_params["_hideregular"] = args["hideregular"]
             if args.get("hotels"):
@@ -5699,6 +5851,10 @@ class YandexGPTHandler:
                 if _cid:
                     self._booking_cards_cache[_cid] = _c
             self._apply_lead_catcher_recommendations()
+            # Lead-catcher (П.2): ценовой ориентир под ПЕРВОЙ выдачей (page==1).
+            self._maybe_set_price_anchor(int(args.get("page", 1)))
+            # Lead-catcher (П.3): счётчик показанных порций карточек (для кнопок 2-й выдачи).
+            self._cards_batch_count += 1
             logger.info("🎴 Built %d tour cards for frontend", len(self._pending_tour_cards))
             
             status = full_results.get("status", {})
@@ -6933,6 +7089,8 @@ class YandexGPTHandler:
                 }
 
         elif name == "continue_search":
+            # Lead-catcher (П.4): учёт «показать ещё» в диалоге (для эскалации).
+            self._continue_count += 1
             # ── P1: Валидация requestid ──
             _rid = str(args.get("requestid", ""))
             if not _rid.replace(" ", "").isdigit():

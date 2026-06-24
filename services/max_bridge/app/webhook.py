@@ -50,6 +50,8 @@ from .observability import new_correlation_id
 from .renderers import (
     render_final_menu_keyboard,
     render_final_menu_text,
+    render_lead_catcher_menu_text,
+    render_quick_replies_keyboard,
     render_subscription_keyboard,
     render_tour_card_caption,
     render_tour_card_keyboard,
@@ -595,6 +597,7 @@ async def _process_message(
                     user_id=user_id,
                     cards=chat_response.tour_cards,
                     log=log,
+                    quick_replies=getattr(chat_response, "quick_replies", None),
                 )
             elif chat_response.tour_cards:
                 log.info(
@@ -671,6 +674,7 @@ async def _send_tour_cards(
     user_id: int,
     cards: list[dict[str, Any]],
     log: structlog.stdlib.BoundLogger,
+    quick_replies: Optional[list[dict[str, Any]]] = None,
 ) -> None:
     """Render the first N tour cards in parallel, then a final menu.
 
@@ -702,13 +706,22 @@ async def _send_tour_cards(
     log.info("tour_cards_render_done", successes=successes, attempted=len(selected))
 
     # Always send the final menu — even if some cards failed to render — so
-    # the user has a clear next-step affordance.
+    # the user has a clear next-step affordance. Lead-catcher (П.3): со 2-й
+    # порции карточек backend присылает quick_replies — показываем проактивное
+    # меню (Ещё / Сузить под бюджет / Передать менеджеру) вместо обычного.
+    _lc_kb = render_quick_replies_keyboard(quick_replies) if quick_replies else None
+    if _lc_kb is not None:
+        _menu_text = render_lead_catcher_menu_text()
+        _menu_kb = _lc_kb
+    else:
+        _menu_text = render_final_menu_text()
+        _menu_kb = render_final_menu_keyboard()
     try:
         await max_client.send_message(
             chat_id=chat_id,
             user_id=user_id if chat_id is None else None,
-            text=render_final_menu_text(),
-            attachments=[render_final_menu_keyboard()],
+            text=_menu_text,
+            attachments=[_menu_kb],
         )
     except MaxApiError as exc:
         log.error(

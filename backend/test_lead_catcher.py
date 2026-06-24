@@ -83,6 +83,51 @@ def test_smart_defaults_unknown_country():
     assert lc.smart_qc_defaults(999) == {"stars": 3, "starsbetter": 1, "meal": 3, "mealbetter": 1}
 
 
+# ─────────────────── Архетипы направлений (П.2) ───────────────────
+
+def test_destination_archetype_mapping():
+    lc = _load_lead_catcher(allow=AID)
+    assert lc.destination_archetype(4) == "beach_ai"      # Турция
+    assert lc.destination_archetype(1) == "beach_ai"      # Египет
+    assert lc.destination_archetype(16) == "beach_bb"     # Вьетнам
+    assert lc.destination_archetype(2) == "beach_bb"      # Таиланд
+    assert lc.destination_archetype(9) == "beach_bb"      # ОАЭ
+    assert lc.destination_archetype(8) == "exotic"        # Мальдивы
+    assert lc.destination_archetype(27) == "exotic"       # Маврикий
+    assert lc.destination_archetype(28) == "exotic"       # Сейшелы
+    assert lc.destination_archetype(13) == "excursion"    # Китай
+    assert lc.destination_archetype(49) == "excursion"    # Япония
+    assert lc.destination_archetype(70) == "excursion"    # Южная Корея
+    assert lc.destination_archetype(47) == "cis"          # Россия
+    assert lc.destination_archetype(54) == "cis"          # Грузия
+    assert lc.destination_archetype(0) == "generic"
+    assert lc.destination_archetype(None) == "generic"
+
+
+def test_smart_defaults_nonai_beach_raised_to_4star():
+    """П.2: пляж-завтраки подняли с 3★ до 4★ (рост чека)."""
+    lc = _load_lead_catcher(allow=AID)
+    for code in (16, 2, 12, 6, 15, 21, 20, 22, 41, 51, 3):  # Вьетнам, Таиланд, ...
+        d = lc.smart_qc_defaults(code)
+        assert d["stars"] == 4, f"country {code} → stars={d.get('stars')}"
+        assert d["meal"] == 3 and d["mealbetter"] == 1
+
+
+def test_smart_defaults_exotic_premium_5star():
+    lc = _load_lead_catcher(allow=AID)
+    for code in (8, 27, 28):  # Мальдивы, Маврикий, Сейшелы
+        d = lc.smart_qc_defaults(code)
+        assert d["stars"] == 5, f"country {code} → stars={d.get('stars')}"
+
+
+def test_smart_defaults_excursion_stays_3star():
+    """Экскурсионные НЕ раздуваем — ось формата, а не звёзды."""
+    lc = _load_lead_catcher(allow=AID)
+    for code in (13, 49, 70, 24, 32, 14, 44):  # Китай, Япония, ..., Европа-города
+        d = lc.smart_qc_defaults(code)
+        assert d["stars"] == 3, f"country {code} → stars={d.get('stars')}"
+
+
 def test_apply_smart_defaults_fills_only_absent():
     lc = _load_lead_catcher(allow=AID)
     args = {"country": 4}

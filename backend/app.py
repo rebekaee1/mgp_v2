@@ -2775,6 +2775,13 @@ def chat_v1():
             'crm_submitted': bool(getattr(handler, '_crm_submitted', None)),
             'offer_subscription': bool(_offer_sub)
         }
+        # Lead-catcher (П.3): кнопки проактивного шага со 2-й выдачи (MAX-only).
+        try:
+            _qr = handler.lead_catcher_quick_replies()
+        except Exception:
+            _qr = []
+        if _qr:
+            _resp['quick_replies'] = _qr
         # Manager-handoff: если на этом ходе жёсткий триггер поставил ИИ на паузу,
         # просим мост отправить клиенту анонс «менеджер подключается» ПОСЛЕ ответа.
         _announce = getattr(g, '_handoff_announce', '')

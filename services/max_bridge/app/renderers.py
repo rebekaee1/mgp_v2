@@ -345,6 +345,41 @@ def render_welcome_after_reset() -> str:
     return "🆕 Готово, начинаем с чистого листа! Куда хотите поехать?"
 
 
+def render_lead_catcher_menu_text() -> str:
+    """Проактивная подводка под 2-й порцией карточек (lead-catcher)."""
+    return (
+        "Если пока ничего не зацепило — подберу дешевле, покажу ещё "
+        "или передам менеджеру. Что удобнее? 👇"
+    )
+
+
+def render_quick_replies_keyboard(
+    buttons: list[dict[str, Any]], per_row: int = 2
+) -> Optional[dict[str, Any]]:
+    """Клавиатура из произвольных ``message``-кнопок (lead-catcher, П.3).
+
+    ``buttons`` — список ``{"text","payload"}``. Раскладываем по ``per_row`` в
+    ряд. Возвращает None при пустом/некорректном списке (тогда вызывающий код
+    откатывается на обычное меню).
+    """
+    rows: list[list[dict[str, Any]]] = []
+    cur: list[dict[str, Any]] = []
+    for b in buttons or []:
+        text = (b.get("text") or "").strip()
+        payload = (b.get("payload") or "").strip()
+        if not text or not payload:
+            continue
+        cur.append({"type": "message", "text": text, "payload": payload})
+        if len(cur) >= max(1, per_row):
+            rows.append(cur)
+            cur = []
+    if cur:
+        rows.append(cur)
+    if not rows:
+        return None
+    return {"type": "inline_keyboard", "payload": {"buttons": rows}}
+
+
 def render_final_menu_keyboard() -> dict[str, Any]:
     """Final menu under the cards (v2: card-anchored).
 

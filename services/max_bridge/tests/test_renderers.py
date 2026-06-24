@@ -8,10 +8,45 @@ from app.renderers import (
     _md_escape,
     render_final_menu_keyboard,
     render_final_menu_text,
+    render_lead_catcher_menu_text,
+    render_quick_replies_keyboard,
     render_tour_card_caption,
     render_tour_card_keyboard,
     render_welcome_after_reset,
 )
+
+
+# ── lead-catcher quick replies (П.3) ───────────────────────────────────
+
+def test_quick_replies_keyboard_shape_and_payloads():
+    btns = [
+        {"text": "📋 Ещё варианты", "payload": "покажи ещё"},
+        {"text": "💰 Сузить под бюджет", "payload": "сузить под бюджет"},
+        {"text": "👤 Передать менеджеру", "payload": "позовите менеджера"},
+    ]
+    kb = render_quick_replies_keyboard(btns)
+    assert kb is not None
+    assert kb["type"] == "inline_keyboard"
+    rows = kb["payload"]["buttons"]
+    # per_row=2 → 2 ряда (2 + 1)
+    assert len(rows) == 2
+    assert rows[0][0]["type"] == "message"
+    flat = [b for row in rows for b in row]
+    assert {b["payload"] for b in flat} == {
+        "покажи ещё", "сузить под бюджет", "позовите менеджера"
+    }
+
+
+def test_quick_replies_keyboard_empty_returns_none():
+    assert render_quick_replies_keyboard([]) is None
+    assert render_quick_replies_keyboard(None) is None
+    # некорректные элементы (без text/payload) отбрасываются
+    assert render_quick_replies_keyboard([{"text": "", "payload": ""}]) is None
+
+
+def test_lead_catcher_menu_text_nonempty():
+    t = render_lead_catcher_menu_text()
+    assert isinstance(t, str) and len(t) > 0
 
 
 # ── helpers ────────────────────────────────────────────────────────────

@@ -65,6 +65,29 @@ _RE_FUNC_NAMES = re.compile(
     re.IGNORECASE
 )
 
+# Lead-catcher FORCE-SEARCH: если последнее сообщение клиента — вопрос-консультация
+# (виза/погода/сезон/документы…), НЕ форсируем поиск (сначала отвечаем, потом ищем).
+# Намеренно НЕ ловим ценовые вопросы («сколько стоит») — на них как раз ПОЛЕЗНО
+# показать карточки. Затрагивает только тенантов lead-catcher (Павел).
+_LC_CONSULT_RE = re.compile(
+    r"виз[аыуео]"
+    r"|загранпаспорт"
+    r"|погод"
+    r"|какой\s+сезон|когда\s+(?:лучше|сезон)"
+    r"|температур"
+    r"|дожд"
+    r"|шторм"
+    r"|безопасн"
+    r"|прививк"
+    r"|страховк"
+    r"|валют"
+    r"|что\s+вз[яи]ть"
+    r"|разниц[аеуы]\s+во\s+времени"
+    r"|сколько\s+лет[еи]ть"
+    r"|перел[её]т\s+сколько",
+    re.IGNORECASE,
+)
+
 
 class OpenAIHandler(YandexGPTHandler):
     """
@@ -519,7 +542,47 @@ class OpenAIHandler(YandexGPTHandler):
 
     # ─── OpenAI API Call ──────────────────────────────────────────────────
 
-    def _call_openai_sync(self, messages: List[Dict]):
+    def _lead_catcher_force_ready(self, user_message: str) -> bool:
+        """Lead-catcher: пора ли ФОРСИРОВАТЬ search_tours (через tool_choice).
+
+        Цель — убрать «анкету» (бюджет/звёзды/питание) ДО первого подбора: как
+        только собраны 4 интейк-слота, модель ОБЯЗАНА вызвать search_tours в этом
+        же ответе, а не задавать лишние вопросы.
+
+        Срабатывает ТОЛЬКО для lead-catcher (Павел) и ТОЛЬКО до первого поиска в
+        диалоге. Инвариант безопасности:
+          • не-lead-catcher → False (поведение байт-в-байт прежнее);
+          • дети без возраста → False (возраст обязателен; каскад всё равно
+            блокирует поиск без возраста — но мы и не форсим, чтобы модель сама
+            мягко спросила возраст);
+          • вопрос-консультация (виза/погода/сезон…) → False (сначала ответ).
+        Любая осечка → False (форс инертен).
+        """
+        try:
+            if not self._is_lead_catcher():
+                return False
+            # Только ПЕРВЫЙ поиск в диалоге (после него модель ведёт себя корректно).
+            if getattr(self, "_last_search_params", None):
+                return False
+            # Карточки уже показаны в этом ходу — форсить нечего.
+            if getattr(self, "_pending_tour_cards", None):
+                return False
+            slots = self._collected_slots or {}
+            required = ("Направление", "Город вылета", "Даты", "Длительность", "Состав")
+            if not all(k in slots for k in required):
+                return False
+            # Дети есть, но возраст не назван → не форсим (нужен возраст ребёнка).
+            kids = (slots.get("Дети") or "")
+            if kids and "без" not in kids.lower() and "Возраст ребёнка" not in slots:
+                return False
+            # Вопрос-консультация → сначала ответить, поиск не форсим.
+            if _LC_CONSULT_RE.search(user_message or ""):
+                return False
+            return True
+        except Exception:
+            return False
+
+    def _call_openai_sync(self, messages: List[Dict], force_search: bool = False):
         """
         Synchronous OpenAI API call.
         Run in thread via asyncio.to_thread() to avoid blocking the event loop.
@@ -529,6 +592,11 @@ class OpenAIHandler(YandexGPTHandler):
         проксирующих провайдеров, у которых per-account context limit
         искусственно занижен до 107k tokens). У нативного OpenAI gpt-5-mini
         контекст 400k токенов.
+
+        ``force_search`` — lead-catcher FORCE-SEARCH: жёстко требуем у модели
+        вызов search_tours (tool_choice), чтобы она не спрашивала бюджет/звёзды
+        до первого подбора. Для остальных тенантов всегда False → запрос
+        байт-в-байт прежний.
         """
         extra = {
             "reasoning_effort": "low",
@@ -537,7 +605,7 @@ class OpenAIHandler(YandexGPTHandler):
                 "allow_fallbacks": os.getenv("OPENROUTER_ALLOW_FALLBACKS", "false").lower() == "true",
             },
         }
-        return self.openai_client.chat.completions.create(
+        kwargs = dict(
             model=self.model,
             messages=messages,
             tools=self.openai_tools,
@@ -546,6 +614,12 @@ class OpenAIHandler(YandexGPTHandler):
             extra_body=extra,
             timeout=60.0,
         )
+        if force_search:
+            kwargs["tool_choice"] = {
+                "type": "function",
+                "function": {"name": "search_tours"},
+            }
+        return self.openai_client.chat.completions.create(**kwargs)
 
     # ─── Main Chat Loop ──────────────────────────────────────────────────
 
@@ -561,6 +635,9 @@ class OpenAIHandler(YandexGPTHandler):
         """
         # Reset tour cards for this message
         self._pending_tour_cards = []
+        # Lead-catcher (П.2): сбрасываем ценовой якорь — выставится заново, если
+        # в этом ходу будет ПЕРВАЯ выдача по новому направлению.
+        self._pending_price_anchor = ""
         # Новое сообщение клиента — снимаем блокировку показа карточек после
         # smart-alt (теперь клиент мог выбрать вариант → get_search_results разрешён).
         self._smart_alt_awaiting_pick = False
@@ -605,6 +682,16 @@ class OpenAIHandler(YandexGPTHandler):
 
             messages = self._build_openai_messages()
 
+            # Lead-catcher FORCE-SEARCH: на ПЕРВОЙ итерации хода, если собраны 4
+            # слота, жёстко форсируем search_tours (модель не сможет вместо этого
+            # спросить бюджет/звёзды). Возраст ребёнка и каскад не обходятся —
+            # форсированный вызов всё равно проходит _check_cascade_slots.
+            _force_search = bool(
+                iteration == 1 and self._lead_catcher_force_ready(user_message)
+            )
+            if _force_search:
+                logger.info("🎯 LC FORCE-SEARCH: 4 слота собраны → tool_choice=search_tours")
+
             logger.info(
                 "🔄 ITERATION %d/%d  messages=%d  model=%s",
                 iteration, max_iterations, len(messages), self.model
@@ -613,7 +700,7 @@ class OpenAIHandler(YandexGPTHandler):
             t0 = time.perf_counter()
             try:
                 response = await asyncio.to_thread(
-                    self._call_openai_sync, messages
+                    self._call_openai_sync, messages, _force_search
                 )
                 api_ms = int((time.perf_counter() - t0) * 1000)
 
@@ -1322,6 +1409,33 @@ class OpenAIHandler(YandexGPTHandler):
                 'не удалось выполнить поиск',
                 final_text, flags=re.IGNORECASE
             )
+
+            # ── Lead-catcher (П.2): ценовой ориентир под ПЕРВОЙ выдачей ──
+            # Детерминированная строка (точные числа из пула). Добавляем только
+            # когда в этом ходу реально показаны карточки и якорь вычислен.
+            # Инертно для остальных тенантов (_pending_price_anchor всегда "").
+            if getattr(self, "_pending_price_anchor", "") and self._pending_tour_cards:
+                final_text = f"{final_text}\n\n{self._pending_price_anchor}".strip()
+                self._pending_price_anchor = ""
+
+            # ── Lead-catcher (П.4): мягкая эскалация к менеджеру ──
+            # Триггер: клиент 3+ раза «показать ещё» ИЛИ смотрел 3+ направления
+            # без заявки. Один раз за диалог; только в ход с карточками. Контакт
+            # собирается через submit_client_request → РФ/Абхазия-подавление
+            # наследуется автоматически (лид по РФ менеджеру не уйдёт).
+            if self._lead_catcher_should_escalate():
+                final_text += (
+                    "\n\n---\n"
+                    "Вижу, вы выбираете между несколькими вариантами — это нормально! "
+                    "Хотите, передам менеджеру: он быстро сравнит и подберёт лучшее "
+                    "под вас. Оставьте имя и телефон — перезвонит в удобное время."
+                )
+                self._escalation_offered = True
+                logger.info(
+                    "🤝 LC ESCALATION offered (continue=%d, countries=%d)",
+                    getattr(self, "_continue_count", 0),
+                    len(getattr(self, "_searched_countries", set())),
+                )
 
             # Save to history
             assistant_entry = {"role": "assistant", "content": final_text}

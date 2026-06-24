@@ -42,6 +42,9 @@ class ChatResponse:
     # поставил ИИ на паузу на ЭТОМ ходе. Мост отправляет его ОТДЕЛЬНЫМ сообщением
     # ПОСЛЕ обычного ответа ИИ, чтобы не нарушить порядок. Старый backend → "".
     handoff_announce: str = ""
+    # Lead-catcher (П.3): проактивные кнопки со 2-й выдачи (MAX). Каждый элемент —
+    # {"text","payload"}. Пусто → мост рисует обычное меню под карточками.
+    quick_replies: list[dict[str, Any]] = field(default_factory=list)
     raw: dict[str, Any] = field(default_factory=dict)
 
 
@@ -139,5 +142,6 @@ class ChatProxy:
             offer_subscription=bool(payload.get("offer_subscription")),
             suppressed=bool(payload.get("suppressed")),
             handoff_announce=str(payload.get("handoff_announce") or ""),
+            quick_replies=list(payload.get("quick_replies") or []),
             raw=payload,
         )
